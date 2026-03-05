@@ -80,26 +80,40 @@ pub async fn build_image(
             }
         }
     }
-    let mut client = client.unwrap();
+    let _client = client.unwrap();
 
     // Step 3: Resolve context path.
     let abs_context = std::fs::canonicalize(context)
         .map_err(AppleContainerError::Io)?;
 
     // Step 4: Build via PerformBuild bidirectional stream.
+    // All build config goes as gRPC metadata headers, matching the Swift reference client.
     let build_id = uuid::Uuid::new_v4().to_string();
     let dockerfile_b64 = base64_encode(dockerfile.as_bytes());
     let context_str = abs_context.to_string_lossy().to_string();
 
-    // Set up the client→server stream.
+    eprintln!("[build] build_id: {build_id}");
+
+    // Dial a FRESH connection for PerformBuild (the info() connection goes stale).
+    eprintln!("[build] dialing fresh vsock for PerformBuild...");
+    let fd2 = dial_container(conn, BUILDER_CONTAINER_ID, 8088).await?;
+    eprintln!("[build] got fresh vsock fd: {fd2}");
+    let ch2 = dial_builder_channel(fd2).await?;
+    let mut build_client = BuilderClient::new(ch2);
+
+    // Warm up the connection (completes HTTP/2 SETTINGS exchange).
+    match build_client.info(proto::InfoRequest {}).await {
+        Ok(_) => eprintln!("[build] fresh connection info() OK"),
+        Err(e) => {
+            return Err(AppleContainerError::XpcError(
+                format!("fresh connection info() failed: {e}"),
+            ));
+        }
+    }
+
+    // PerformBuild with all headers on the fresh warmed connection.
     let (client_tx, client_rx) = tokio::sync::mpsc::channel::<ClientStream>(64);
     let client_stream = tokio_stream::wrappers::ReceiverStream::new(client_rx);
-
-    // Build gRPC metadata headers (matching the Swift client).
-    eprintln!("[build] build_id: {build_id}");
-    eprintln!("[build] context: {context_str}");
-    eprintln!("[build] dockerfile_b64 len: {}", dockerfile_b64.len());
-    eprintln!("[build] tag: {tag}");
 
     let mut request = tonic::Request::new(client_stream);
     let md = request.metadata_mut();
@@ -115,8 +129,8 @@ pub async fn build_image(
 
     eprintln!("[build] calling PerformBuild...");
     let response = match tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        client.perform_build(request),
+        std::time::Duration::from_secs(300),
+        build_client.perform_build(request),
     ).await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
@@ -140,9 +154,7 @@ pub async fn build_image(
     let mut server_stream = response.into_inner();
 
     // Process the bidirectional stream.
-    let result = process_build_stream(&mut server_stream, client_tx, &abs_context, verbose).await;
-
-    result
+    process_build_stream(&mut server_stream, client_tx, &build_id, &abs_context, verbose).await
 }
 
 /// Process the PerformBuild bidirectional stream.
@@ -152,6 +164,7 @@ pub async fn build_image(
 async fn process_build_stream(
     server_stream: &mut tonic::Streaming<ServerStream>,
     client_tx: tokio::sync::mpsc::Sender<ClientStream>,
+    build_id: &str,
     context: &Path,
     verbose: bool,
 ) -> Result<(), AppleContainerError> {
@@ -175,7 +188,7 @@ async fn process_build_stream(
                 // A RUN command completed, continue.
             }
             Some(server_stream::PacketType::BuildTransfer(transfer)) => {
-                handle_build_transfer(&transfer, &client_tx, &msg.build_id, context).await?;
+                handle_build_transfer(&transfer, &client_tx, build_id, context).await?;
             }
             Some(server_stream::PacketType::ImageTransfer(_)) => {
                 // Image transfer — handled by the server side.
@@ -605,6 +618,7 @@ async fn dial_builder_channel(
         .map_err(|e| AppleContainerError::ConnectionFailed(format!("tonic endpoint: {e}")))?
         .initial_stream_window_size(16 << 10) // 16 KB — match Swift httpTargetWindowSize
         .initial_connection_window_size(16 << 10)
+        .http2_max_header_list_size(512 * 1024) // allow large header blocks (dockerfile)
         .http2_keep_alive_interval(std::time::Duration::from_secs(600))
         .keep_alive_timeout(std::time::Duration::from_secs(500))
         .connect_with_connector(tower::service_fn({
