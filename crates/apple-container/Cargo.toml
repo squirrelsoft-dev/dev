@@ -19,5 +19,8 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 tokio-stream = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
+# OCI registry client (for image resolution during builds)
+oci-client = "0.14"
+
 [build-dependencies]
 tonic-build = "0.12"

@@ -14,7 +14,7 @@ pub mod proto {
 
 use proto::builder_client::BuilderClient;
 use proto::{
-    BuildTransfer, ClientStream, ServerStream, TransferDirection,
+    BuildTransfer, ClientStream, ImageTransfer, ServerStream, TransferDirection,
     client_stream, server_stream,
 };
 
@@ -87,31 +87,26 @@ pub async fn build_image(
         .map_err(AppleContainerError::Io)?;
 
     // Step 4: Build via PerformBuild bidirectional stream.
-    // All build config goes as gRPC metadata headers, matching the Swift reference client.
     let build_id = uuid::Uuid::new_v4().to_string();
-    let dockerfile_b64 = base64_encode(dockerfile.as_bytes());
     let context_str = abs_context.to_string_lossy().to_string();
 
     eprintln!("[build] build_id: {build_id}");
 
-    // Dial a FRESH connection for PerformBuild (the info() connection goes stale).
+    // Dial a fresh connection for PerformBuild. The info() call completes
+    // the HTTP/2 handshake — every successful test had this warmup.
+    let dockerfile_b64 = base64_encode(dockerfile.as_bytes());
+
     eprintln!("[build] dialing fresh vsock for PerformBuild...");
     let fd2 = dial_container(conn, BUILDER_CONTAINER_ID, 8088).await?;
     eprintln!("[build] got fresh vsock fd: {fd2}");
     let ch2 = dial_builder_channel(fd2).await?;
     let mut build_client = BuilderClient::new(ch2);
 
-    // Warm up the connection (completes HTTP/2 SETTINGS exchange).
-    match build_client.info(proto::InfoRequest {}).await {
-        Ok(_) => eprintln!("[build] fresh connection info() OK"),
-        Err(e) => {
-            return Err(AppleContainerError::XpcError(
-                format!("fresh connection info() failed: {e}"),
-            ));
-        }
-    }
+    build_client.info(proto::InfoRequest {}).await
+        .map_err(|e| AppleContainerError::XpcError(format!("fresh info() failed: {e}")))?;
+    eprintln!("[build] fresh connection info() OK");
 
-    // PerformBuild with all headers on the fresh warmed connection.
+    // All headers matching the Swift reference client.
     let (client_tx, client_rx) = tokio::sync::mpsc::channel::<ClientStream>(64);
     let client_stream = tokio_stream::wrappers::ReceiverStream::new(client_rx);
 
@@ -123,6 +118,10 @@ pub async fn build_image(
     md.insert("target", "".parse().unwrap());
     md.insert("context", context_str.parse().unwrap());
     md.insert("dockerfile", dockerfile_b64.parse().unwrap());
+    // The Go server panics with "assignment to entry in nil map" if no outputs
+    // header is sent — the default ExportEntry has a nil Attrs map. Sending
+    // this forces the parseOutputCSV path which initialises the map properly.
+    md.insert("outputs", "type=oci".parse().unwrap());
     if no_cache {
         md.insert("no-cache", "".parse().unwrap());
     }
@@ -190,8 +189,12 @@ async fn process_build_stream(
             Some(server_stream::PacketType::BuildTransfer(transfer)) => {
                 handle_build_transfer(&transfer, &client_tx, build_id, context).await?;
             }
-            Some(server_stream::PacketType::ImageTransfer(_)) => {
-                // Image transfer — handled by the server side.
+            Some(server_stream::PacketType::ImageTransfer(ref transfer)) => {
+                let stage = transfer.metadata.get("stage").map(|s| s.as_str()).unwrap_or("");
+                let method = transfer.metadata.get("method").map(|s| s.as_str()).unwrap_or("");
+                if stage == "resolver" && method == "/resolve" {
+                    handle_image_resolve(transfer, &client_tx, build_id).await?;
+                }
             }
             None => {}
         }
@@ -323,6 +326,7 @@ async fn handle_read(
     build_id: &str,
     context: &Path,
 ) -> Result<(), AppleContainerError> {
+    eprintln!("[fssync] read request: source={:?}", transfer.source);
     let source = transfer.source.as_deref().unwrap_or("");
     let path = resolve_path(context, source);
 
@@ -402,6 +406,68 @@ async fn handle_info(
             data,
             complete: true,
             is_directory: false,
+            metadata,
+        })),
+    };
+    let _ = client_tx.send(response).await;
+
+    Ok(())
+}
+
+/// Handle an image resolve request from the builder.
+///
+/// The server sends an `ImageTransfer` with `stage: "resolver"` and
+/// `method: "/resolve"`. We pull the OCI image manifest and config from
+/// the registry on the host side (fast) and send the config back so the
+/// builder doesn't have to pull through the slow vsock network.
+async fn handle_image_resolve(
+    transfer: &ImageTransfer,
+    client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
+    build_id: &str,
+) -> Result<(), AppleContainerError> {
+    // The image reference is in metadata "ref" or the tag field.
+    let reference = transfer.metadata.get("ref")
+        .or_else(|| if transfer.tag.is_empty() { None } else { Some(&transfer.tag) })
+        .ok_or_else(|| AppleContainerError::XpcError("image resolve: missing ref".into()))?;
+    let platform_str = transfer.metadata.get("platform").map(|s| s.as_str()).unwrap_or("linux/arm64");
+
+    eprintln!("[build] resolving image: {reference} for {platform_str}");
+
+    let oci_ref: oci_client::Reference = reference.parse()
+        .map_err(|e: oci_client::ParseError| AppleContainerError::XpcError(format!("invalid image ref: {e}")))?;
+
+    let client = oci_client::Client::default();
+    let auth = oci_client::secrets::RegistryAuth::Anonymous;
+
+    client.auth(&oci_ref, &auth, oci_client::RegistryOperation::Pull).await
+        .map_err(|e| AppleContainerError::XpcError(format!("registry auth failed: {e}")))?;
+
+    let (manifest, digest) = client.pull_image_manifest(&oci_ref, &auth).await
+        .map_err(|e| AppleContainerError::XpcError(format!("failed to pull manifest for {reference}: {e}")))?;
+
+    // Pull the OCI image config blob.
+    let mut config_data = Vec::new();
+    client.pull_blob(&oci_ref, manifest.config.digest.as_str(), &mut config_data).await
+        .map_err(|e| AppleContainerError::XpcError(format!("failed to pull config for {reference}: {e}")))?;
+
+    eprintln!("[build] resolved {reference} -> {digest} (config {} bytes)", config_data.len());
+
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert("os".to_string(), "linux".to_string());
+    metadata.insert("stage".to_string(), "resolver".to_string());
+    metadata.insert("method".to_string(), "/resolve".to_string());
+    metadata.insert("ref".to_string(), reference.clone());
+    metadata.insert("platform".to_string(), platform_str.to_string());
+
+    let response = ClientStream {
+        build_id: build_id.to_string(),
+        packet_type: Some(client_stream::PacketType::ImageTransfer(ImageTransfer {
+            id: transfer.id.clone(),
+            direction: TransferDirection::Into as i32,
+            tag: digest,
+            descriptor: None,
+            data: config_data,
+            complete: true,
             metadata,
         })),
     };
