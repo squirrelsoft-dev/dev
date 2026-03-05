@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebSearch",
+      "WebFetch(domain:code.visualstudio.com)",
+      "WebFetch(domain:containers.dev)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:distribution.github.io)",
+      "Bash(cargo init:*)",
+      "Bash(cargo check:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo run:*)",
+      "Bash(cargo:*)",
+      "Bash(container run:*)",
+      "WebFetch(domain:api.github.com)",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:pypi.org)",
+      "Bash(pip3 install:*)",
+      "Bash(container builder:*)",
+      "Bash(CONTAINER_DEBUG=1 container builder:*)",
+      "Bash(container exec:*)",
+      "WebFetch(domain:files.pythonhosted.org)",
+      "WebFetch(domain:addozhang.medium.com)",
+      "WebFetch(domain:anil.recoil.org)",
+      "WebFetch(domain:pyobjc.readthedocs.io)",
+      "Bash(container inspect:*)",
+      "Bash(/usr/bin/log show:*)",
+      "Bash(container image:*)",
+      "Bash(container list:*)",
+      "Bash(container build:*)"
+    ]
+  }
+}

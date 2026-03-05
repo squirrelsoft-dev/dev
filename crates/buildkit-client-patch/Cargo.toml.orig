@@ -1,0 +1,107 @@
+[workspace]
+members = [".", "crates/bkit", "crates/filemode"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.4"
+edition = "2021"
+authors = ["AprilNEA <dev@aprilnea.me>"]
+description = "A Rust client library and CLI for interacting with BuildKit via gRPC, implementing the complete BuildKit session protocol"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/AprilNEA/buildkit-client"
+homepage = "https://github.com/AprilNEA/buildkit-client"
+documentation = "https://docs.rs/buildkit-client"
+readme = "README.md"
+keywords = ["buildkit", "docker", "container", "grpc", "build"]
+categories = ["api-bindings", "development-tools", "command-line-utilities"]
+
+[package]
+name = "buildkit-client"
+include = [
+    "src/**/*",
+    "tests/**/*",
+    "examples/**/*",
+    "benches/**/*",
+    "build.rs",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE*",
+    "proto/**/*.proto",
+]
+version = { workspace = true }
+edition = { workspace = true }
+authors = { workspace = true }
+description = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+documentation = { workspace = true }
+readme = { workspace = true }
+keywords = { workspace = true }
+categories = { workspace = true }
+
+[package.metadata.docs.rs]
+# Configuration for docs.rs
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+
+[dependencies]
+# Internal crates
+filemode = { path = "crates/filemode", version = "0.1" }
+
+# gRPC and async runtime
+tonic = "0.12"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+
+# Serialization
+prost = "0.13"
+prost-types = "0.13"
+bytes = "1.0"
+
+# Error handling
+thiserror = "1.0"
+# Keep anyhow for the CLI binary
+anyhow = { version = "1.0", optional = true }
+
+# CLI and logging
+clap = { version = "4.5", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.0", features = ["v4"] }
+async-stream = "0.3"
+rand = "0.8"
+
+# HTTP/2 and gRPC frame parsing
+h2 = "0.4"
+http = "1.0"
+
+[dev-dependencies]
+# Testing
+criterion = { version = "0.5", features = ["async_tokio"] }
+tempfile = "3.0"
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+rand = "0.8"
+dotenv = "0.15"
+
+[features]
+default = ["cli"]
+cli = ["anyhow"]
+
+[[bin]]
+name = "buildkit-client"
+required-features = ["cli"]
+
+[build-dependencies]
+# For potential custom proto compilation if needed
+tonic-build = "0.12"
+# HTTP client for downloading proto files
+reqwest = { version = "0.12", features = ["blocking"] }
+
+[[bench]]
+name = "build_bench"
+harness = false

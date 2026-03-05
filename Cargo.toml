@@ -1,0 +1,62 @@
+[workspace]
+members = [".", "crates/apple-container"]
+
+[package]
+name = "dev"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Apple Containers (native XPC)
+apple-container = { path = "crates/apple-container" }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# Container runtime
+bollard = "0.18"
+
+# OCI registry
+oci-client = "0.14"
+
+# HTTP
+reqwest = { version = "0.12", features = ["json"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+json_comments = "0.2"
+
+# TUI
+dialoguer = { version = "0.11", features = ["fuzzy-select"] }
+indicatif = "0.17"
+console = "0.15"
+
+# Archive
+flate2 = "1"
+tar = "0.4"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Async streams
+futures-util = "0.3"
+
+# Platform
+libc = "0.2"
+
+# Pipes
+os_pipe = "1"
+
+# Utility
+dirs = "6"
+sha2 = "0.10"
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
