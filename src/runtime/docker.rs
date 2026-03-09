@@ -12,6 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::error::DevError;
 use crate::runtime::{
     BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ContainerState, ExecResult,
+    ImageMetadata,
 };
 
 /// RAII guard that puts the terminal into raw mode and restores it on drop.
@@ -111,7 +112,10 @@ impl BollardRuntime {
             from_image: image,
             ..Default::default()
         };
-        let mut stream = self.client.create_image(Some(opts), None, None);
+        // Pass a default (empty) DockerCredentials instead of None. When None
+        // is passed, bollard sends an empty X-Registry-Auth header value which
+        // Podman rejects as invalid JSON.
+        let mut stream = self.client.create_image(Some(opts), None, Some(bollard::auth::DockerCredentials::default()));
         while let Some(result) = stream.next().await {
             result?;
         }
@@ -163,7 +167,10 @@ impl BollardRuntime {
             ..Default::default()
         };
 
-        let mut stream = self.client.build_image(opts, None, Some(compressed.into()));
+        // Pass an empty credentials map instead of None. When None is passed,
+        // bollard sends an empty X-Registry-Config header value which Podman
+        // rejects as invalid JSON.
+        let mut stream = self.client.build_image(opts, Some(HashMap::new()), Some(compressed.into()));
         while let Some(result) = stream.next().await {
             let info = result.map_err(|e| {
                 DevError::BuildFailed(format!("Docker stream error: {e}"))
@@ -188,7 +195,7 @@ impl BollardRuntime {
         Ok(())
     }
 
-    async fn create_container_impl(&self, config: &ContainerConfig) -> Result<String, DevError> {
+    pub(crate) async fn create_container_impl(&self, config: &ContainerConfig) -> Result<String, DevError> {
         let mut binds = Vec::new();
         for m in &config.mounts {
             let ro = if m.readonly { ":ro" } else { "" };
@@ -385,7 +392,7 @@ impl BollardRuntime {
             // Shift+Enter escape sequences into a plain carriage return so they
             // don't print garbage in shells that don't understand them.
             let mut stdin_writer = input;
-            tokio::spawn(async move {
+            let stdin_handle = tokio::spawn(async move {
                 let mut stdin = tokio::io::stdin();
                 let mut buf = [0u8; 1024];
                 loop {
@@ -417,6 +424,10 @@ impl BollardRuntime {
                     Err(_) => break,
                 }
             }
+
+            // Abort the stdin forwarding task so it doesn't keep blocking on
+            // stdin after the container shell has exited.
+            stdin_handle.abort();
         }
 
         // _raw_guard is dropped here, restoring the terminal.
@@ -498,6 +509,60 @@ impl BollardRuntime {
 
         Ok(result)
     }
+
+    async fn inspect_image_metadata_impl(&self, image: &str) -> Result<ImageMetadata, DevError> {
+        let inspect = match self.client.inspect_image(image).await {
+            Ok(v) => v,
+            Err(_) => return Ok(ImageMetadata::default()),
+        };
+
+        let config = match inspect.config {
+            Some(c) => c,
+            None => return Ok(ImageMetadata::default()),
+        };
+
+        let mut remote_user: Option<String> = None;
+        let mut container_user: Option<String> = None;
+
+        // Parse the devcontainer.metadata label (JSON array or single object).
+        if let Some(ref labels) = config.labels {
+            if let Some(raw) = labels.get("devcontainer.metadata") {
+                if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(raw) {
+                    // Later entries win.
+                    for entry in &arr {
+                        if let Some(u) = entry.get("remoteUser").and_then(|v| v.as_str()) {
+                            remote_user = Some(u.to_string());
+                        }
+                        if let Some(u) = entry.get("containerUser").and_then(|v| v.as_str()) {
+                            container_user = Some(u.to_string());
+                        }
+                    }
+                } else if let Ok(obj) = serde_json::from_str::<serde_json::Value>(raw) {
+                    if let Some(u) = obj.get("remoteUser").and_then(|v| v.as_str()) {
+                        remote_user = Some(u.to_string());
+                    }
+                    if let Some(u) = obj.get("containerUser").and_then(|v| v.as_str()) {
+                        container_user = Some(u.to_string());
+                    }
+                }
+            }
+        }
+
+        // Fall back to the Dockerfile USER instruction for container_user.
+        if container_user.is_none() {
+            if let Some(ref user) = config.user {
+                let user = user.trim();
+                if !user.is_empty() {
+                    container_user = Some(user.to_string());
+                }
+            }
+        }
+
+        Ok(ImageMetadata {
+            remote_user,
+            container_user,
+        })
+    }
 }
 
 impl ContainerRuntime for BollardRuntime {
@@ -563,6 +628,18 @@ impl ContainerRuntime for BollardRuntime {
         let label_filter = label_filter.to_string();
         Box::pin(async move { self.list_containers_impl(&label_filter).await })
     }
+
+    fn image_exists(&self, image: &str) -> BoxFut<'_, bool> {
+        let image = image.to_string();
+        Box::pin(async move {
+            Ok(self.client.inspect_image(&image).await.is_ok())
+        })
+    }
+
+    fn inspect_image_metadata(&self, image: &str) -> BoxFut<'_, ImageMetadata> {
+        let image = image.to_string();
+        Box::pin(async move { self.inspect_image_metadata_impl(&image).await })
+    }
 }
 
 /// Docker-specific runtime (uses default Docker socket).
@@ -571,6 +648,21 @@ pub struct DockerRuntime(pub(crate) BollardRuntime);
 impl DockerRuntime {
     pub fn connect() -> Result<Self, DevError> {
         Ok(Self(BollardRuntime::connect_default()?))
+    }
+
+    /// Try additional Docker Desktop socket paths (macOS puts the real socket
+    /// at ~/.docker/run/docker.sock while /var/run/docker.sock may be a
+    /// symlink to a different runtime).
+    pub fn connect_fallback() -> Option<Self> {
+        if cfg!(target_os = "macos") {
+            if let Ok(home) = std::env::var("HOME") {
+                let path = format!("{home}/.docker/run/docker.sock");
+                if std::path::Path::new(&path).exists() {
+                    return BollardRuntime::connect_to_socket(&path).ok().map(Self);
+                }
+            }
+        }
+        None
     }
 
     pub async fn ping(&self) -> Result<(), DevError> {
@@ -624,5 +716,13 @@ impl ContainerRuntime for DockerRuntime {
 
     fn list_containers(&self, label_filter: &str) -> BoxFut<'_, Vec<ContainerInfo>> {
         self.0.list_containers(label_filter)
+    }
+
+    fn image_exists(&self, image: &str) -> BoxFut<'_, bool> {
+        self.0.image_exists(image)
+    }
+
+    fn inspect_image_metadata(&self, image: &str) -> BoxFut<'_, ImageMetadata> {
+        self.0.inspect_image_metadata(image)
     }
 }

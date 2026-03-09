@@ -4,11 +4,12 @@ use std::path::{Path, PathBuf};
 use crate::devcontainer::{
     DevcontainerConfig, download_features, generate_feature_dockerfile, resolve_features,
     run_lifecycle_hooks, stage_feature_context, substitute_variables,
+    substitute_variables_with_user,
 };
 use crate::devcontainer::features::order_features;
 use crate::runtime::{
     BindMount, ContainerConfig, ContainerState, PortMapping, WorkspaceMount,
-    detect_runtime,
+    detect_runtime, resolve_remote_user,
 };
 use crate::util::{
     container_name, find_devcontainer_config, workspace_folder_name, workspace_label,
@@ -40,8 +41,12 @@ pub async fn run(
                 println!("Starting existing container '{}'...", container.name);
                 runtime.start_container(&container.id).await?;
                 if config.post_start_command.is_some() {
-                    let user = config.remote_user.as_deref();
-                    run_lifecycle_hooks(runtime.as_ref(), &container.id, &config, user).await?;
+                    let user = resolve_remote_user(
+                        runtime.as_ref(),
+                        &container.image,
+                        config.remote_user.as_deref(),
+                    ).await?;
+                    run_lifecycle_hooks(runtime.as_ref(), &container.id, &config, user.as_deref()).await?;
                 }
                 println!("Container '{}' started.", container.name);
                 return Ok(());
@@ -57,37 +62,60 @@ pub async fn run(
         }
     }
 
-    // Determine base image
-    let base_image = if let Some(ref image) = config.image {
+    // Use the same image tag that `dev build` produces so we can reuse it.
+    let has_features = resolve_features(&config)?.iter().count() > 0;
+    let needs_build = config.build.is_some() || has_features;
+    let final_tag = format!("dev-build-{}", container_name(workspace));
+
+    let final_image = if !needs_build {
+        // Image-based config with no features — use the remote image directly.
+        let image = config.image.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("devcontainer.json must specify either 'image' or 'build.dockerfile'"))?;
         eprintln!("Pulling image '{image}'...");
         runtime.pull_image(image).await?;
         image.clone()
-    } else if let Some(ref build) = config.build {
-        let context_dir = config_path
-            .parent()
-            .unwrap()
-            .join(build.context.as_deref().unwrap_or("."));
-        let tag = format!("dev-build-{}", container_name(workspace));
-        let dockerfile_path = config_path
-            .parent()
-            .unwrap()
-            .join(&build.dockerfile);
-        let dockerfile_content = std::fs::read_to_string(&dockerfile_path)?;
-        eprintln!("Building image from Dockerfile...");
-        runtime
-            .build_image(&dockerfile_content, &context_dir, &tag, no_cache, verbose)
-            .await?;
-        tag
+    } else if !rebuild && !no_cache && runtime.image_exists(&final_tag).await? {
+        // Image already built (e.g. by `dev build`), skip rebuild.
+        eprintln!("Image '{final_tag}' already exists, skipping build.");
+        final_tag
     } else {
-        anyhow::bail!("devcontainer.json must specify either 'image' or 'build.dockerfile'");
-    };
-
-    // Handle features
-    let final_image = {
-        let mut features = resolve_features(&config)?;
-        if features.is_empty() {
-            base_image
+        // Determine base image
+        let base_image = if let Some(ref image) = config.image {
+            eprintln!("Pulling image '{image}'...");
+            runtime.pull_image(image).await?;
+            image.clone()
+        } else if let Some(ref build) = config.build {
+            let context_dir = config_path
+                .parent()
+                .unwrap()
+                .join(build.context.as_deref().unwrap_or("."));
+            let dockerfile_path = config_path
+                .parent()
+                .unwrap()
+                .join(&build.dockerfile);
+            let dockerfile_content = std::fs::read_to_string(&dockerfile_path)?;
+            if !has_features {
+                // No features — build directly with the final tag.
+                eprintln!("Building image from Dockerfile...");
+                runtime
+                    .build_image(&dockerfile_content, &context_dir, &final_tag, no_cache, verbose)
+                    .await?;
+                final_tag.clone()
+            } else {
+                let base_tag = format!("{final_tag}-base");
+                eprintln!("Building image from Dockerfile...");
+                runtime
+                    .build_image(&dockerfile_content, &context_dir, &base_tag, no_cache, verbose)
+                    .await?;
+                base_tag
+            }
         } else {
+            anyhow::bail!("devcontainer.json must specify either 'image' or 'build.dockerfile'");
+        };
+
+        // Handle features
+        if has_features {
+            let mut features = resolve_features(&config)?;
             eprintln!("Downloading {} feature(s)...", features.len());
             if verbose {
                 for f in &features {
@@ -103,19 +131,24 @@ pub async fn run(
                 }
             }
             let staging_dir = stage_feature_context(&ordered)?;
-            let dockerfile = generate_feature_dockerfile(&base_image, &ordered, config.remote_user.as_deref());
+            let feature_user = resolve_remote_user(
+                runtime.as_ref(),
+                &base_image,
+                config.remote_user.as_deref(),
+            ).await?;
+            let dockerfile = generate_feature_dockerfile(&base_image, &ordered, feature_user.as_deref());
             if verbose {
                 eprintln!("Features Dockerfile:\n{dockerfile}");
             }
-            let tag = format!("{}-features", container_name(workspace));
             eprintln!("Building features image...");
             let result = runtime
-                .build_image(&dockerfile, &staging_dir, &tag, no_cache, verbose)
+                .build_image(&dockerfile, &staging_dir, &final_tag, no_cache, verbose)
                 .await;
             let _ = std::fs::remove_dir_all(&staging_dir);
             result?;
-            tag
         }
+
+        final_tag
     };
 
     // Build container config
@@ -149,13 +182,19 @@ pub async fn run(
         })
         .collect();
 
-    // Substitute devcontainer variables in mounts and run_args
+    // Resolve the effective remote user from config or image metadata.
+    let effective_user = resolve_remote_user(
+        runtime.as_ref(),
+        &final_image,
+        config.remote_user.as_deref(),
+    ).await?;
+    let remote_user = effective_user.as_deref();
     let mounts: Vec<String> = config
         .mounts
         .as_deref()
         .unwrap_or(&[])
         .iter()
-        .map(|s| substitute_variables(s, workspace))
+        .map(|s| substitute_variables_with_user(s, workspace, remote_user))
         .collect();
 
     let extra_args: Vec<String> = config
@@ -163,7 +202,7 @@ pub async fn run(
         .as_deref()
         .unwrap_or(&[])
         .iter()
-        .map(|s| substitute_variables(s, workspace))
+        .map(|s| substitute_variables_with_user(s, workspace, remote_user))
         .collect();
 
     let container_config = ContainerConfig {
@@ -195,8 +234,7 @@ pub async fn run(
     runtime.start_container(&container_id).await?;
 
     // Run lifecycle hooks
-    let user = config.remote_user.as_deref();
-    run_lifecycle_hooks(runtime.as_ref(), &container_id, &config, user).await?;
+    run_lifecycle_hooks(runtime.as_ref(), &container_id, &config, remote_user).await?;
 
     println!("Container '{name}' is ready.");
     Ok(())

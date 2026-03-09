@@ -23,6 +23,6 @@ pub async fn auth_anonymous(client: &Client, reference: &Reference) -> Result<()
     client
         .auth(reference, &RegistryAuth::Anonymous, RegistryOperation::Pull)
         .await
-        .map_err(|e| DevError::Registry(format!("authentication failed: {e}")))?;
+        .map_err(|e| DevError::Registry(format!("authentication failed for {reference}: {e}")))?;
     Ok(())
 }

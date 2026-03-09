@@ -5,7 +5,7 @@ use dialoguer::{Input, Select};
 use serde_json::Value;
 
 use crate::cli::ConfigAction;
-use crate::collection::{fetch_collection_index, fetch_features};
+use crate::collection::{fetch_all_features, fetch_collection_index};
 use crate::tui::prompts;
 use crate::util::workspace::find_devcontainer_config;
 
@@ -470,7 +470,7 @@ fn interactive_image(config_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn interactive_features(config_path: &Path, verbose: u8) -> anyhow::Result<()> {
+async fn interactive_features(config_path: &Path, _verbose: u8) -> anyhow::Result<()> {
     let actions = ["Add features", "Remove features"];
     let selection = Select::new()
         .with_prompt("Action")
@@ -484,57 +484,43 @@ async fn interactive_features(config_path: &Path, verbose: u8) -> anyhow::Result
             // Add features — reuse multi_select_features
             eprintln!("Fetching feature catalog...");
             let collections = fetch_collection_index(false).await?;
-            let features_collection = collections
-                .iter()
-                .find(|c| c.oci_ref.starts_with("ghcr.io/devcontainers/features"))
-                .cloned();
+            let features = fetch_all_features(&collections, false).await;
 
-            if let Some(collection) = features_collection {
-                let features = fetch_features(&collection, false).await?;
-                if features.is_empty() {
-                    println!("No features available.");
-                    return Ok(());
-                }
+            if features.is_empty() {
+                println!("No features available.");
+                return Ok(());
+            }
 
-                // Get currently selected features for pre-selection
-                let json = read_config(config_path)?;
-                let preselected: Vec<String> = json
-                    .get("features")
-                    .and_then(|v| v.as_object())
-                    .map(|m| m.keys().cloned().collect())
-                    .unwrap_or_default();
+            // Get currently selected features for pre-selection
+            let json = read_config(config_path)?;
+            let preselected: Vec<String> = json
+                .get("features")
+                .and_then(|v| v.as_object())
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default();
 
-                let selected = prompts::multi_select_features(
-                    &features,
-                    &collection.oci_ref,
-                    &preselected,
-                )?;
+            let selected = prompts::multi_select_features(&features, &preselected)?;
 
-                // Re-read and write all features
-                let mut json = read_config(config_path)?;
-                let obj = json
-                    .as_object_mut()
-                    .ok_or_else(|| anyhow::anyhow!("devcontainer.json is not a JSON object"))?;
+            // Re-read and write all features
+            let mut json = read_config(config_path)?;
+            let obj = json
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("devcontainer.json is not a JSON object"))?;
 
-                let features_val = obj
-                    .entry("features")
-                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            let features_val = obj
+                .entry("features")
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
 
-                if let Some(fmap) = features_val.as_object_mut() {
-                    // Add newly selected features (keep existing ones)
-                    for feature_ref in &selected {
-                        fmap.entry(feature_ref.clone())
-                            .or_insert_with(|| serde_json::json!({}));
-                    }
-                }
-
-                write_config(config_path, &json)?;
-                println!("Features updated.");
-            } else {
-                if verbose > 0 {
-                    eprintln!("No features collection found.");
+            if let Some(fmap) = features_val.as_object_mut() {
+                // Add newly selected features (keep existing ones)
+                for feature_ref in &selected {
+                    fmap.entry(feature_ref.clone())
+                        .or_insert_with(|| serde_json::json!({}));
                 }
             }
+
+            write_config(config_path, &json)?;
+            println!("Features updated.");
         }
         1 => {
             // Remove features
@@ -550,9 +536,15 @@ async fn interactive_features(config_path: &Path, verbose: u8) -> anyhow::Result
                 return Ok(());
             }
 
+            let dims = crate::tui::term_dimensions();
+            let display: Vec<String> = features
+                .iter()
+                .map(|f| crate::tui::truncate_to_width(f, dims.max_width))
+                .collect();
             let selections = dialoguer::MultiSelect::new()
                 .with_prompt("Select features to remove (space to toggle, enter to confirm)")
-                .items(&features)
+                .items(&display)
+                .max_length(dims.max_length)
                 .interact_opt()?
                 .unwrap_or_default();
 

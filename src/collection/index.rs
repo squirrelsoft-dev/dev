@@ -1,3 +1,4 @@
+use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 
 use crate::error::DevError;
@@ -53,6 +54,86 @@ pub struct OptionDef {
     pub default: String,
     #[serde(default, rename = "enum")]
     pub enum_values: Option<Vec<String>>,
+    #[serde(default)]
+    pub proposals: Option<Vec<String>>,
+}
+
+// --- Collection classification ---
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectionKind {
+    Template,
+    Feature,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateTier {
+    Official,
+    Microsoft,
+    Community,
+}
+
+/// Classify a collection by whether its name contains "feature" or "template".
+pub fn classify_collection(c: &Collection) -> Option<CollectionKind> {
+    let lower = c.name.to_lowercase();
+    if lower.contains("feature") {
+        Some(CollectionKind::Feature)
+    } else if lower.contains("template") {
+        Some(CollectionKind::Template)
+    } else {
+        None
+    }
+}
+
+/// Filter to template-kind collections.
+pub fn template_collections(collections: &[Collection]) -> Vec<&Collection> {
+    collections
+        .iter()
+        .filter(|c| classify_collection(c) == Some(CollectionKind::Template))
+        .collect()
+}
+
+/// Filter to feature-kind collections.
+pub fn feature_collections(collections: &[Collection]) -> Vec<&Collection> {
+    collections
+        .iter()
+        .filter(|c| classify_collection(c) == Some(CollectionKind::Feature))
+        .collect()
+}
+
+/// Categorize a template collection into Official, Microsoft, or Community.
+pub fn template_tier(c: &Collection) -> TemplateTier {
+    if c.oci_ref.starts_with("ghcr.io/devcontainers/templates") {
+        TemplateTier::Official
+    } else if c.oci_ref.starts_with("ghcr.io/microsoft") {
+        TemplateTier::Microsoft
+    } else {
+        TemplateTier::Community
+    }
+}
+
+/// Fetch features from all feature collections in parallel.
+/// Returns each feature paired with the OCI ref of its collection.
+pub async fn fetch_all_features(
+    collections: &[Collection],
+    force_refresh: bool,
+) -> Vec<(String, FeatureMetadata)> {
+    let feature_cols = feature_collections(collections);
+    let fetches: Vec<_> = feature_cols
+        .iter()
+        .map(|c| fetch_features(c, force_refresh))
+        .collect();
+    let results = join_all(fetches).await;
+
+    let mut all = Vec::new();
+    for (col, result) in feature_cols.iter().zip(results) {
+        if let Ok(features) = result {
+            for f in features {
+                all.push((col.oci_ref.clone(), f));
+            }
+        }
+    }
+    all
 }
 
 // --- Raw YAML structure for parsing the collection index ---
@@ -285,6 +366,13 @@ fn parse_options(value: &serde_json::Value) -> Vec<OptionDef> {
                 None => String::new(),
             },
             enum_values: v.get("enum").and_then(|e| {
+                e.as_array().map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+            }),
+            proposals: v.get("proposals").and_then(|e| {
                 e.as_array().map(|arr| {
                     arr.iter()
                         .filter_map(|v| v.as_str().map(|s| s.to_string()))

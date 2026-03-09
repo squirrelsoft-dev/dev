@@ -3,7 +3,8 @@ use std::fs;
 use std::path::Path;
 
 use crate::collection::{
-    fetch_collection_index, fetch_features, fetch_templates, Collection, TemplateMetadata,
+    fetch_all_features, fetch_collection_index, fetch_templates, Collection, TemplateMetadata,
+    template_collections, template_tier, TemplateTier,
 };
 use crate::devcontainer::apply_template;
 use crate::oci::download_artifact;
@@ -52,11 +53,7 @@ pub async fn run(
     };
 
     // Feature multi-select
-    let features_collection = collections
-        .iter()
-        .find(|c| c.oci_ref.starts_with("ghcr.io/devcontainers/features"))
-        .cloned();
-    let selected_features = select_features(&features_collection, &[], verbose).await?;
+    let selected_features = select_features(&collections, &[], verbose).await?;
 
     // Scope picker
     let scope = picker::pick_scope()?;
@@ -144,12 +141,8 @@ async fn apply_global_template(
     // Feature multi-select with existing features pre-checked
     eprintln!("Fetching feature catalog...");
     let collections = fetch_collection_index(false).await?;
-    let features_collection = collections
-        .iter()
-        .find(|c| c.oci_ref.starts_with("ghcr.io/devcontainers/features"))
-        .cloned();
     let selected_features =
-        select_features(&features_collection, &existing_features, verbose).await?;
+        select_features(&collections, &existing_features, verbose).await?;
 
     let scope = picker::pick_scope()?;
     let opts = parse_option_args(options);
@@ -201,26 +194,19 @@ async fn fetch_templates_for_source(
     collections: &[Collection],
     verbose: u8,
 ) -> anyhow::Result<Vec<(String, TemplateMetadata)>> {
-    let filtered: Vec<&Collection> = match source {
-        picker::TemplateSource::Official => collections
-            .iter()
-            .filter(|c| c.oci_ref.starts_with("ghcr.io/devcontainers/templates"))
-            .collect(),
-        picker::TemplateSource::Microsoft => collections
-            .iter()
-            .filter(|c| c.oci_ref.starts_with("ghcr.io/microsoft"))
-            .collect(),
-        picker::TemplateSource::Community => collections
-            .iter()
-            .filter(|c| {
-                !c.oci_ref.starts_with("ghcr.io/devcontainers")
-                    && !c.oci_ref.starts_with("ghcr.io/microsoft")
-            })
-            .collect(),
+    let all_template_cols = template_collections(collections);
+    let target_tier = match source {
+        picker::TemplateSource::Official => TemplateTier::Official,
+        picker::TemplateSource::Microsoft => TemplateTier::Microsoft,
+        picker::TemplateSource::Community => TemplateTier::Community,
         picker::TemplateSource::ExistingGlobal => {
             unreachable!("handled before this function is called");
         }
     };
+    let filtered: Vec<&&Collection> = all_template_cols
+        .iter()
+        .filter(|c| template_tier(c) == target_tier)
+        .collect();
 
     let mut templates = Vec::new();
     for c in &filtered {
@@ -240,16 +226,17 @@ async fn fetch_templates_for_source(
     Ok(templates)
 }
 
-/// Fetch all templates from all collections.
+/// Fetch all templates from template collections.
 async fn fetch_all_templates(
     collections: &[Collection],
     verbose: u8,
 ) -> anyhow::Result<Vec<(String, TemplateMetadata)>> {
-    let fetches: Vec<_> = collections.iter().map(|c| fetch_templates(c, false)).collect();
+    let template_cols = template_collections(collections);
+    let fetches: Vec<_> = template_cols.iter().map(|c| fetch_templates(c, false)).collect();
     let results = futures_util::future::join_all(fetches).await;
 
     let mut all = Vec::new();
-    for (collection, result) in collections.iter().zip(results) {
+    for (collection, result) in template_cols.iter().zip(results) {
         match result {
             Ok(templates) => {
                 for t in templates {
@@ -266,29 +253,18 @@ async fn fetch_all_templates(
     Ok(all)
 }
 
-/// Fetch features from the official features collection and present multi-select.
+/// Fetch features from all feature collections and present multi-select.
 /// `preselected` contains feature refs already in the template (pre-checked in the list).
 async fn select_features(
-    features_collection: &Option<Collection>,
+    collections: &[Collection],
     preselected: &[String],
-    verbose: u8,
+    _verbose: u8,
 ) -> anyhow::Result<Vec<String>> {
-    let Some(collection) = features_collection else {
+    let features = fetch_all_features(collections, false).await;
+    if features.is_empty() {
         return Ok(Vec::new());
-    };
-
-    match fetch_features(collection, false).await {
-        Ok(features) if !features.is_empty() => {
-            prompts::multi_select_features(&features, &collection.oci_ref, preselected)
-        }
-        Ok(_) => Ok(Vec::new()),
-        Err(e) => {
-            if verbose > 0 {
-                eprintln!("Warning: failed to fetch features: {e}");
-            }
-            Ok(Vec::new())
-        }
     }
+    prompts::multi_select_features(&features, preselected)
 }
 
 /// Get the list of global template names from ~/.dev/global/.

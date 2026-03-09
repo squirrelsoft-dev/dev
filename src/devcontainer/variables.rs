@@ -5,10 +5,16 @@ use std::path::Path;
 /// Supported variables:
 /// - `${localEnv:VAR}` — value of host env var, empty string if unset
 /// - `${localEnv:VAR:default}` — value of host env var, `default` if unset
-/// - `${containerEnv:VAR}` — left as-is (resolved at container runtime)
+/// - `${containerEnv:VAR}` / `${remoteEnv:VAR}` — expanded using `remote_user`
 /// - `${localWorkspaceFolder}` — workspace path on host
 /// - `${localWorkspaceFolderBasename}` — basename of workspace path
 pub fn substitute_variables(s: &str, workspace: &Path) -> String {
+    substitute_variables_with_user(s, workspace, None)
+}
+
+/// Like [`substitute_variables`] but also expands `containerEnv` / `remoteEnv`
+/// variables that depend on the remote user (e.g. `HOME`).
+pub fn substitute_variables_with_user(s: &str, workspace: &Path, remote_user: Option<&str>) -> String {
     let mut result = String::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -18,7 +24,7 @@ pub fn substitute_variables(s: &str, workspace: &Path) -> String {
             // Find the closing brace
             if let Some(close) = s[i..].find('}') {
                 let expr = &s[i + 2..i + close]; // content between ${ and }
-                if let Some(expanded) = expand_variable(expr, workspace) {
+                if let Some(expanded) = expand_variable(expr, workspace, remote_user) {
                     result.push_str(&expanded);
                     i += close + 1;
                     continue;
@@ -32,9 +38,18 @@ pub fn substitute_variables(s: &str, workspace: &Path) -> String {
     result
 }
 
+/// Derive the home directory for a given user name.
+fn home_for_user(user: &str) -> String {
+    if user == "root" {
+        "/root".to_string()
+    } else {
+        format!("/home/{user}")
+    }
+}
+
 /// Try to expand a single variable expression (the content between `${` and `}`).
 /// Returns `None` if the expression is not a recognised variable (leave as-is).
-fn expand_variable(expr: &str, workspace: &Path) -> Option<String> {
+fn expand_variable(expr: &str, workspace: &Path, remote_user: Option<&str>) -> Option<String> {
     if let Some(rest) = expr.strip_prefix("localEnv:") {
         // rest is either "VAR" or "VAR:default"
         let (var_name, default) = match rest.find(':') {
@@ -42,9 +57,12 @@ fn expand_variable(expr: &str, workspace: &Path) -> Option<String> {
             None => (rest, ""),
         };
         Some(std::env::var(var_name).unwrap_or_else(|_| default.to_string()))
-    } else if expr.starts_with("containerEnv:") {
-        // Leave containerEnv variables as-is — they are resolved at runtime
-        None
+    } else if let Some(var_name) = expr.strip_prefix("containerEnv:").or_else(|| expr.strip_prefix("remoteEnv:")) {
+        // Expand known container/remote env vars based on remoteUser.
+        match var_name {
+            "HOME" => Some(home_for_user(remote_user.unwrap_or("root"))),
+            _ => None,
+        }
     } else if expr == "localWorkspaceFolder" {
         Some(workspace.to_string_lossy().into_owned())
     } else if expr == "localWorkspaceFolderBasename" {
@@ -114,11 +132,38 @@ mod tests {
     }
 
     #[test]
-    fn test_container_env_left_as_is() {
+    fn test_container_env_home_with_user() {
+        let workspace = PathBuf::from("/home/user/project");
+        assert_eq!(
+            substitute_variables_with_user("${containerEnv:HOME}/scripts", &workspace, Some("vscode")),
+            "/home/vscode/scripts"
+        );
+    }
+
+    #[test]
+    fn test_container_env_home_root() {
+        let workspace = PathBuf::from("/home/user/project");
+        assert_eq!(
+            substitute_variables_with_user("${containerEnv:HOME}/scripts", &workspace, Some("root")),
+            "/root/scripts"
+        );
+    }
+
+    #[test]
+    fn test_container_env_unknown_left_as_is() {
         let workspace = PathBuf::from("/home/user/project");
         assert_eq!(
             substitute_variables("${containerEnv:PATH}", &workspace),
             "${containerEnv:PATH}"
+        );
+    }
+
+    #[test]
+    fn test_remote_env_home() {
+        let workspace = PathBuf::from("/home/user/project");
+        assert_eq!(
+            substitute_variables_with_user("${remoteEnv:HOME}/.config", &workspace, Some("dev")),
+            "/home/dev/.config"
         );
     }
 

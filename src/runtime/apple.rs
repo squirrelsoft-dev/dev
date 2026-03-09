@@ -10,6 +10,7 @@ use apple_container::AppleContainerClient;
 use crate::error::DevError;
 use crate::runtime::{
     BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ContainerState, ExecResult,
+    ImageMetadata,
 };
 
 /// Apple Containers runtime using native XPC.
@@ -415,5 +416,16 @@ impl ContainerRuntime for AppleRuntime {
 
             Ok(result)
         })
+    }
+
+    fn image_exists(&self, _image: &str) -> BoxFut<'_, bool> {
+        // Apple Containers doesn't have a local image store to query;
+        // always return false so the build path runs.
+        Box::pin(async { Ok(false) })
+    }
+
+    fn inspect_image_metadata(&self, _image: &str) -> BoxFut<'_, ImageMetadata> {
+        // Apple Containers doesn't have a local image store to query.
+        Box::pin(async { Ok(ImageMetadata::default()) })
     }
 }

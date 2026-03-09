@@ -53,9 +53,26 @@ pub fn resolve_features(config: &DevcontainerConfig) -> Result<Vec<ResolvedFeatu
 }
 
 /// Download OCI artifacts for each feature, populating `install_script_path` and `install_after`.
+/// On download failure, prompts the user to skip the feature or abort.
 pub async fn download_features(features: &mut [ResolvedFeature]) -> Result<(), DevError> {
     for feature in features.iter_mut() {
-        let extracted_dir = download_artifact(&feature.oci_ref, &feature.version).await?;
+        let result = download_artifact(&feature.oci_ref, &feature.version).await;
+
+        let extracted_dir = match result {
+            Ok(dir) => dir,
+            Err(e) => {
+                eprintln!("Warning: failed to download feature '{}': {e}", feature.id);
+                let skip = dialoguer::Confirm::new()
+                    .with_prompt(format!("Skip feature '{}' and continue?", feature.id))
+                    .default(true)
+                    .interact()
+                    .unwrap_or(false);
+                if skip {
+                    continue;
+                }
+                return Err(DevError::Registry(format!("feature '{}': {e}", feature.id)));
+            }
+        };
 
         // Verify install.sh exists
         let install_sh = extracted_dir.join("install.sh");

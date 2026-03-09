@@ -1,6 +1,7 @@
 use dialoguer::{FuzzySelect, Select};
 
 use crate::collection::TemplateMetadata;
+use crate::tui::{term_dimensions, truncate_to_width};
 
 /// Where the user wants to source the template from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,10 +38,12 @@ pub fn pick_source(has_globals: bool) -> anyhow::Result<TemplateSource> {
     items.push("Community templates");
     sources.push(TemplateSource::Community);
 
+    let dims = term_dimensions();
     let selection = Select::new()
         .with_prompt("Where to get the template")
         .items(&items)
         .default(0)
+        .max_length(dims.max_length)
         .interact_opt()?
         .ok_or_else(|| anyhow::anyhow!("No source selected"))?;
 
@@ -49,10 +52,16 @@ pub fn pick_source(has_globals: bool) -> anyhow::Result<TemplateSource> {
 
 /// Present a picker to select one of the user's global templates by name.
 pub fn pick_global_template(names: &[String]) -> anyhow::Result<String> {
+    let dims = term_dimensions();
+    let display: Vec<String> = names
+        .iter()
+        .map(|n| truncate_to_width(n, dims.max_width))
+        .collect();
     let selection = Select::new()
         .with_prompt("Select global template")
-        .items(names)
+        .items(&display)
         .default(0)
+        .max_length(dims.max_length)
         .interact_opt()?
         .ok_or_else(|| anyhow::anyhow!("No template selected"))?;
 
@@ -85,14 +94,16 @@ pub fn pick_scope() -> anyhow::Result<Scope> {
 pub fn pick_template<'a>(
     templates: &'a [(String, TemplateMetadata)],
 ) -> anyhow::Result<(String, &'a TemplateMetadata)> {
+    let dims = term_dimensions();
     let display_items: Vec<String> = templates
         .iter()
         .map(|(_, t)| {
-            if t.description.is_empty() {
+            let raw = if t.description.is_empty() {
                 t.id.clone()
             } else {
                 format!("{} - {}", t.id, t.description)
-            }
+            };
+            truncate_to_width(&raw, dims.max_width)
         })
         .collect();
 
@@ -100,6 +111,7 @@ pub fn pick_template<'a>(
         .with_prompt("Select a template")
         .items(&display_items)
         .default(0)
+        .max_length(dims.max_length)
         .interact_opt()?
         .ok_or_else(|| anyhow::anyhow!("No template selected"))?;
 

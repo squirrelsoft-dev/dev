@@ -9,4 +9,4 @@ pub use config::DevcontainerConfig;
 pub use features::{download_features, generate_feature_dockerfile, resolve_features, stage_feature_context};
 pub use lifecycle::run_lifecycle_hooks;
 pub use templates::apply_template;
-pub use variables::substitute_variables;
+pub use variables::{substitute_variables, substitute_variables_with_user};

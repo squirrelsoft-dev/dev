@@ -21,6 +21,32 @@ use proto::{
 /// Container ID for the Apple Containers builder VM.
 const BUILDER_CONTAINER_ID: &str = "buildkit";
 
+/// Get DNS nameservers for the builder VM.
+///
+/// Reads the host's /etc/resolv.conf to find nameservers. Falls back to
+/// well-known public DNS if none are found.
+fn get_dns_nameservers() -> Vec<String> {
+    if let Ok(contents) = std::fs::read_to_string("/etc/resolv.conf") {
+        let servers: Vec<String> = contents
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.starts_with("nameserver") {
+                    line.split_whitespace().nth(1).map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !servers.is_empty() {
+            eprintln!("[build] using DNS nameservers from /etc/resolv.conf: {:?}", servers);
+            return servers;
+        }
+    }
+    eprintln!("[build] no nameservers found in /etc/resolv.conf, using 8.8.8.8");
+    vec!["8.8.8.8".to_string()]
+}
+
 /// Build an image using the Apple Containers builder VM.
 ///
 /// 1. Ensure a builder VM is running.
@@ -163,43 +189,78 @@ pub async fn build_image(
 async fn process_build_stream(
     server_stream: &mut tonic::Streaming<ServerStream>,
     client_tx: tokio::sync::mpsc::Sender<ClientStream>,
-    build_id: &str,
+    _build_id: &str,
     context: &Path,
     verbose: bool,
 ) -> Result<(), AppleContainerError> {
     use tokio_stream::StreamExt;
 
+    let mut packet_count: u64 = 0;
+    eprintln!("[stream] waiting for packets from builder...");
+
     while let Some(msg) = server_stream.next().await {
+        packet_count += 1;
         let msg = msg.map_err(|e| {
+            eprintln!("[stream] error on packet #{packet_count}: {e}");
             AppleContainerError::XpcError(format!("build stream error: {e}"))
         })?;
+
+        let ptype = match &msg.packet_type {
+            Some(server_stream::PacketType::Io(_)) => "IO",
+            Some(server_stream::PacketType::BuildError(_)) => "BuildError",
+            Some(server_stream::PacketType::CommandComplete(_)) => "CommandComplete",
+            Some(server_stream::PacketType::BuildTransfer(_)) => "BuildTransfer",
+            Some(server_stream::PacketType::ImageTransfer(_)) => "ImageTransfer",
+            None => "None",
+        };
+        eprintln!("[stream] packet #{packet_count}: {ptype} build_id={}", msg.build_id);
+
+        // CRITICAL: The server registers a demux handler keyed by
+        // ServerStream.build_id (a per-request UUID, NOT the overall build ID).
+        // Our responses must echo this value back as ClientStream.build_id
+        // or the server drops the response with "no matching handler".
+        let reply_id = &msg.build_id;
 
         match msg.packet_type {
             Some(server_stream::PacketType::Io(io)) => {
                 handle_io(&io, verbose);
+                // The Go StdioProxy.Write() calls Request() which blocks until
+                // the client sends an ack response. Without this, the entire
+                // build pipeline stalls (clog() never returns, resolver never runs).
+                send_io_ack(&client_tx, reply_id).await?;
             }
             Some(server_stream::PacketType::BuildError(err)) => {
+                eprintln!("[stream] BuildError on packet #{packet_count}: {}", err.message);
                 return Err(AppleContainerError::XpcError(
                     format!("Build failed: {}", err.message)
                 ));
             }
-            Some(server_stream::PacketType::CommandComplete(_)) => {
-                // A RUN command completed, continue.
+            Some(server_stream::PacketType::CommandComplete(ref cmd)) => {
+                eprintln!("[stream] CommandComplete: id={}", cmd.id);
             }
             Some(server_stream::PacketType::BuildTransfer(transfer)) => {
-                handle_build_transfer(&transfer, &client_tx, build_id, context).await?;
+                handle_build_transfer(&transfer, &client_tx, reply_id, context, verbose).await?;
             }
             Some(server_stream::PacketType::ImageTransfer(ref transfer)) => {
                 let stage = transfer.metadata.get("stage").map(|s| s.as_str()).unwrap_or("");
                 let method = transfer.metadata.get("method").map(|s| s.as_str()).unwrap_or("");
+                eprintln!("[stream] ImageTransfer #{packet_count}: id={} stage={:?} method={:?} tag={:?} data_len={} metadata={:?}",
+                    transfer.id, stage, method, transfer.tag, transfer.data.len(), transfer.metadata);
                 if stage == "resolver" && method == "/resolve" {
-                    handle_image_resolve(transfer, &client_tx, build_id).await?;
+                    handle_image_resolve(transfer, &client_tx, reply_id).await?;
+                } else if stage == "content-store" {
+                    handle_content_store(transfer, method, &client_tx, reply_id).await?;
+                } else {
+                    eprintln!("[stream] unhandled ImageTransfer stage={:?} method={:?}", stage, method);
                 }
             }
-            None => {}
+            None => {
+                eprintln!("[stream] packet #{packet_count} has no packet_type (empty oneof)");
+            }
         }
     }
 
+    eprintln!("[stream] server stream ended after {packet_count} packets");
     Ok(())
 }
 
@@ -219,6 +280,33 @@ fn handle_io(io: &proto::Io, verbose: bool) {
     }
 }
 
+/// Send an IO ack response.
+///
+/// The Go builder shim's StdioProxy.Write() blocks until the client sends a
+/// `Run` command containing a base64-encoded `{"command_type":"terminal","code":"ack"}`
+/// JSON payload.  Without this ack the entire build pipeline deadlocks.
+async fn send_io_ack(
+    client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
+    build_id: &str,
+) -> Result<(), AppleContainerError> {
+    const ACK_JSON: &str = r#"{"command_type":"terminal","code":"ack","rows":0,"cols":0}"#;
+    let ack_b64 = base64_encode(ACK_JSON.as_bytes())
+        .trim_end_matches('=')
+        .to_string();
+
+    let response = ClientStream {
+        build_id: build_id.to_string(),
+        packet_type: Some(client_stream::PacketType::Command(proto::Run {
+            id: build_id.to_string(),
+            command: ack_b64,
+        })),
+    };
+
+    client_tx.send(response).await.map_err(|e| {
+        AppleContainerError::XpcError(format!("failed to send IO ack: {e}"))
+    })
+}
+
 /// Handle BuildTransfer packets — the server asking for file data (fssync).
 ///
 /// The server sends BuildTransfer with metadata keys:
@@ -231,22 +319,29 @@ async fn handle_build_transfer(
     client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
     build_id: &str,
     context: &Path,
+    verbose: bool,
 ) -> Result<(), AppleContainerError> {
     let stage = transfer.metadata.get("stage").map(|s| s.as_str()).unwrap_or("");
     let method = transfer.metadata.get("method").map(|s| s.as_str()).unwrap_or("");
+
+    if verbose {
+        eprintln!("[build] BuildTransfer: id={} stage={:?} method={:?} source={:?}",
+            transfer.id, stage, method, transfer.source);
+    }
 
     if stage != "fssync" {
         return Ok(());
     }
 
+    // The builder shim sends capitalized method names (Walk, Read, Info).
     match method {
-        "walk" => {
+        "walk" | "Walk" => {
             handle_walk(transfer, client_tx, build_id, context).await?;
         }
-        "read" => {
+        "read" | "Read" => {
             handle_read(transfer, client_tx, build_id, context).await?;
         }
-        "info" => {
+        "info" | "Info" => {
             handle_info(transfer, client_tx, build_id, context).await?;
         }
         _ => {
@@ -431,26 +526,44 @@ async fn handle_image_resolve(
         .ok_or_else(|| AppleContainerError::XpcError("image resolve: missing ref".into()))?;
     let platform_str = transfer.metadata.get("platform").map(|s| s.as_str()).unwrap_or("linux/arm64");
 
-    eprintln!("[build] resolving image: {reference} for {platform_str}");
+    eprintln!("[resolver] >>> resolving image: {reference} for platform {platform_str}");
 
+    eprintln!("[resolver] parsing reference...");
     let oci_ref: oci_client::Reference = reference.parse()
-        .map_err(|e: oci_client::ParseError| AppleContainerError::XpcError(format!("invalid image ref: {e}")))?;
+        .map_err(|e: oci_client::ParseError| {
+            eprintln!("[resolver] FAILED to parse ref: {e}");
+            AppleContainerError::XpcError(format!("invalid image ref: {e}"))
+        })?;
+    eprintln!("[resolver] parsed ref: registry={} repository={} tag={:?}",
+        oci_ref.registry(), oci_ref.repository(), oci_ref.tag());
 
+    eprintln!("[resolver] authenticating with registry...");
     let client = oci_client::Client::default();
     let auth = oci_client::secrets::RegistryAuth::Anonymous;
-
     client.auth(&oci_ref, &auth, oci_client::RegistryOperation::Pull).await
-        .map_err(|e| AppleContainerError::XpcError(format!("registry auth failed: {e}")))?;
+        .map_err(|e| {
+            eprintln!("[resolver] FAILED auth: {e}");
+            AppleContainerError::XpcError(format!("registry auth failed: {e}"))
+        })?;
+    eprintln!("[resolver] auth OK");
 
+    eprintln!("[resolver] pulling manifest...");
     let (manifest, digest) = client.pull_image_manifest(&oci_ref, &auth).await
-        .map_err(|e| AppleContainerError::XpcError(format!("failed to pull manifest for {reference}: {e}")))?;
+        .map_err(|e| {
+            eprintln!("[resolver] FAILED to pull manifest: {e}");
+            AppleContainerError::XpcError(format!("failed to pull manifest for {reference}: {e}"))
+        })?;
+    eprintln!("[resolver] manifest OK: digest={digest} config_digest={} layers={}",
+        manifest.config.digest, manifest.layers.len());
 
-    // Pull the OCI image config blob.
+    eprintln!("[resolver] pulling config blob ({})...", manifest.config.digest);
     let mut config_data = Vec::new();
     client.pull_blob(&oci_ref, manifest.config.digest.as_str(), &mut config_data).await
-        .map_err(|e| AppleContainerError::XpcError(format!("failed to pull config for {reference}: {e}")))?;
-
-    eprintln!("[build] resolved {reference} -> {digest} (config {} bytes)", config_data.len());
+        .map_err(|e| {
+            eprintln!("[resolver] FAILED to pull config blob: {e}");
+            AppleContainerError::XpcError(format!("failed to pull config for {reference}: {e}"))
+        })?;
+    eprintln!("[resolver] config blob OK: {} bytes", config_data.len());
 
     let mut metadata = std::collections::HashMap::new();
     metadata.insert("os".to_string(), "linux".to_string());
@@ -464,14 +577,84 @@ async fn handle_image_resolve(
         packet_type: Some(client_stream::PacketType::ImageTransfer(ImageTransfer {
             id: transfer.id.clone(),
             direction: TransferDirection::Into as i32,
-            tag: digest,
+            tag: digest.clone(),
             descriptor: None,
             data: config_data,
             complete: true,
             metadata,
         })),
     };
-    let _ = client_tx.send(response).await;
+    eprintln!("[resolver] sending response: digest={digest} id={}", transfer.id);
+    match client_tx.send(response).await {
+        Ok(()) => eprintln!("[resolver] <<< response sent OK"),
+        Err(e) => eprintln!("[resolver] FAILED to send response: {e}"),
+    }
+
+    Ok(())
+}
+
+/// Handle content-store requests from the builder (BuildRemoteContentProxy).
+///
+/// The builder sends `ImageTransfer` with `stage: "content-store"` when it
+/// needs to read content (blobs/layers) from the host. Supported methods:
+///   - `/containerd.services.content.v1.Content/Info` — get content size
+///   - `/containerd.services.content.v1.Content/ReaderAt` — read content bytes
+///
+/// We pull the requested blob from the OCI registry on the host side and
+/// serve it back to the builder.
+async fn handle_content_store(
+    transfer: &ImageTransfer,
+    method: &str,
+    client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
+    build_id: &str,
+) -> Result<(), AppleContainerError> {
+    let digest = if !transfer.tag.is_empty() {
+        &transfer.tag
+    } else if transfer.descriptor.as_ref().map_or(true, |d| d.digest.is_empty()) {
+        eprintln!("[content-store] no digest in request, tag={:?} descriptor={:?}",
+            transfer.tag, transfer.descriptor);
+        return Ok(());
+    } else {
+        &transfer.descriptor.as_ref().unwrap().digest
+    };
+
+    let offset = transfer.metadata.get("offset").map(|s| s.as_str()).unwrap_or("0");
+    let length = transfer.metadata.get("length").map(|s| s.as_str()).unwrap_or("0");
+    eprintln!("[content-store] method={method} digest={digest} offset={offset} length={length} data_len={}",
+        transfer.data.len());
+
+    match method {
+        "/containerd.services.content.v1.Content/Info" => {
+            eprintln!("[content-store] Info request for {digest} — sending empty response (no local content store)");
+            let mut metadata = std::collections::HashMap::new();
+            metadata.insert("os".to_string(), "linux".to_string());
+            metadata.insert("stage".to_string(), "content-store".to_string());
+            metadata.insert("method".to_string(), method.to_string());
+
+            let response = ClientStream {
+                build_id: build_id.to_string(),
+                packet_type: Some(client_stream::PacketType::ImageTransfer(ImageTransfer {
+                    id: transfer.id.clone(),
+                    direction: TransferDirection::Into as i32,
+                    tag: digest.to_string(),
+                    descriptor: None,
+                    data: Vec::new(),
+                    complete: true,
+                    metadata,
+                })),
+            };
+            match client_tx.send(response).await {
+                Ok(()) => eprintln!("[content-store] Info response sent OK"),
+                Err(e) => eprintln!("[content-store] FAILED to send Info response: {e}"),
+            }
+        }
+        "/containerd.services.content.v1.Content/ReaderAt" => {
+            eprintln!("[content-store] ReaderAt: digest={digest} offset={offset} length={length} — NOT IMPLEMENTED");
+        }
+        _ => {
+            eprintln!("[content-store] unknown method: {method}");
+        }
+    }
 
     Ok(())
 }
@@ -868,6 +1051,12 @@ pub async fn ensure_builder(
         ],
         "labels": {
             "com.apple.container.resource.role": "builder"
+        },
+        "dns": {
+            "nameservers": get_dns_nameservers(),
+            "domain": null,
+            "searchDomains": [],
+            "options": []
         },
         "rosetta": true,
         "publishedPorts": [],

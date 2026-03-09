@@ -5,7 +5,7 @@ use crate::devcontainer::{
     stage_feature_context,
 };
 use crate::devcontainer::features::order_features;
-use crate::runtime::detect_runtime;
+use crate::runtime::{detect_runtime, resolve_remote_user};
 use crate::util::{container_name, find_devcontainer_config};
 
 pub async fn run(
@@ -57,7 +57,12 @@ pub async fn run(
         download_features(&mut features).await?;
         let ordered = order_features(&features);
         let staging_dir = stage_feature_context(&ordered)?;
-        let dockerfile = generate_feature_dockerfile(&base_tag, &ordered, config.remote_user.as_deref());
+        let feature_user = resolve_remote_user(
+            runtime.as_ref(),
+            &base_tag,
+            config.remote_user.as_deref(),
+        ).await?;
+        let dockerfile = generate_feature_dockerfile(&base_tag, &ordered, feature_user.as_deref());
         eprintln!("Building features image...");
         let result = runtime
             .build_image(&dockerfile, &staging_dir, final_tag, no_cache, verbose)
@@ -81,7 +86,12 @@ pub async fn run(
     download_features(&mut features).await?;
     let ordered = order_features(&features);
     let staging_dir = stage_feature_context(&ordered)?;
-    let dockerfile = generate_feature_dockerfile(&base_image, &ordered, config.remote_user.as_deref());
+    let feature_user = resolve_remote_user(
+        runtime.as_ref(),
+        &base_image,
+        config.remote_user.as_deref(),
+    ).await?;
+    let dockerfile = generate_feature_dockerfile(&base_image, &ordered, feature_user.as_deref());
     eprintln!("Building features image...");
     let result = runtime
         .build_image(&dockerfile, &staging_dir, final_tag, no_cache, verbose)

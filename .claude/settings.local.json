@@ -29,7 +29,11 @@
       "Bash(/usr/bin/log show:*)",
       "Bash(container image:*)",
       "Bash(container list:*)",
-      "Bash(container build:*)"
+      "Bash(container build:*)",
+      "Bash(curl:*)",
+      "Bash(python3:*)",
+      "WebFetch(domain:docs.podman.io)",
+      "Bash(git add:*)"
     ]
   }
 }

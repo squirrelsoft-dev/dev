@@ -27,6 +27,7 @@ pub struct ContainerConfig {
     pub mounts: Vec<BindMount>,
     pub ports: Vec<PortMapping>,
     pub workspace_mount: Option<WorkspaceMount>,
+    #[allow(dead_code)]
     pub extra_args: Vec<String>,
     pub entrypoint: Option<String>,
 }
@@ -69,6 +70,13 @@ pub struct ExecResult {
     pub stderr: String,
 }
 
+/// Metadata extracted from a container image's labels and config.
+#[derive(Debug, Clone, Default)]
+pub struct ImageMetadata {
+    pub remote_user: Option<String>,
+    pub container_user: Option<String>,
+}
+
 /// A boxed future that is Send.
 type BoxFut<'a, T> = Pin<Box<dyn Future<Output = Result<T, DevError>> + Send + 'a>>;
 
@@ -101,6 +109,24 @@ pub trait ContainerRuntime: Send + Sync {
     fn inspect_container(&self, id: &str) -> BoxFut<'_, ContainerInfo>;
 
     fn list_containers(&self, label_filter: &str) -> BoxFut<'_, Vec<ContainerInfo>>;
+
+    fn image_exists(&self, image: &str) -> BoxFut<'_, bool>;
+
+    fn inspect_image_metadata(&self, image: &str) -> BoxFut<'_, ImageMetadata>;
+}
+
+/// Resolve the effective remote user by checking the devcontainer config first,
+/// then falling back to the image's embedded metadata.
+pub async fn resolve_remote_user(
+    runtime: &dyn ContainerRuntime,
+    image: &str,
+    config_user: Option<&str>,
+) -> Result<Option<String>, DevError> {
+    if let Some(u) = config_user {
+        return Ok(Some(u.to_string()));
+    }
+    let meta = runtime.inspect_image_metadata(image).await?;
+    Ok(meta.remote_user.or(meta.container_user))
 }
 
 /// Detect which container runtime is available, or use an explicit override.
@@ -126,28 +152,40 @@ pub async fn detect_runtime(
         };
     }
 
-    // Auto-detect: try Apple Containers first (macOS-native), then Docker, then Podman.
-    if cfg!(target_os = "macos") {
-        if let Ok(rt) = apple::AppleRuntime::connect() {
+    // Auto-detect: check which runtimes are actually running.
+    // Apple Containers disabled for now — use --runtime apple to opt in.
+    let docker_running = {
+        let mut found = None;
+        // Try default socket (DOCKER_HOST or /var/run/docker.sock)
+        if let Ok(rt) = docker::DockerRuntime::connect() {
             if rt.ping().await.is_ok() {
-                return Ok(Box::new(rt));
+                found = Some(rt);
             }
         }
-    }
-
-    if let Ok(rt) = docker::DockerRuntime::connect() {
-        if rt.ping().await.is_ok() {
-            return Ok(Box::new(rt));
+        // Fallback: Docker Desktop on macOS uses ~/.docker/run/docker.sock
+        // while /var/run/docker.sock may point to a different runtime.
+        if found.is_none() {
+            if let Some(rt) = docker::DockerRuntime::connect_fallback() {
+                if rt.ping().await.is_ok() {
+                    found = Some(rt);
+                }
+            }
         }
-    }
+        found
+    };
 
-    if let Ok(rt) = podman::PodmanRuntime::connect() {
-        if rt.ping().await.is_ok() {
-            return Ok(Box::new(rt));
-        }
-    }
+    let podman_running = if let Ok(rt) = podman::PodmanRuntime::connect() {
+        if rt.ping().await.is_ok() { Some(rt) } else { None }
+    } else {
+        None
+    };
 
-    Err(diagnose_no_runtime().await)
+    // Prefer Podman if both are running, otherwise use whichever is running.
+    match (podman_running, docker_running) {
+        (Some(rt), _) => Ok(Box::new(rt)),
+        (None, Some(rt)) => Ok(Box::new(rt)),
+        (None, None) => Err(diagnose_no_runtime().await),
+    }
 }
 
 async fn command_exists(cmd: &str) -> bool {
@@ -171,72 +209,51 @@ async fn run_command(cmd: &str, args: &[&str]) -> Option<String> {
         None
     }
 }
-
-/// Like run_command but returns combined stdout+stderr regardless of exit code.
-async fn run_command_any(cmd: &str, args: &[&str]) -> Option<String> {
-    let output = tokio::process::Command::new(cmd)
-        .args(args)
-        .output()
-        .await
-        .ok()?;
-    let mut combined = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !stderr.is_empty() {
-        if !combined.is_empty() {
-            combined.push('\n');
-        }
-        combined.push_str(&stderr);
-    }
-    Some(combined)
-}
-
 async fn diagnose_no_runtime() -> DevError {
-    // Check Apple Containers
-    if command_exists("container").await {
-        let container_not_running = run_command_any("container", &["system", "status"])
-            .await
-            .map(|s| s.to_lowercase().contains("not running"))
-            .unwrap_or(true);
+    // Apple Containers diagnostic disabled for now.
+    let has_docker = command_exists("docker").await;
+    let has_podman = command_exists("podman").await;
 
-        if container_not_running {
-            return DevError::NoRuntime(
-                "Apple Containers is installed but not running.\n\nRun:\n  container system start\n\nThen try `dev <subcommand>` again.".to_string(),
-            );
-        }
-    }
-
-    // Check Podman
-    if command_exists("podman").await {
+    let podman_hint = if has_podman {
         if let Some(json) = run_command("podman", &["machine", "list", "--format", "json"]).await {
             if let Ok(machines) = serde_json::from_str::<serde_json::Value>(&json) {
                 if let Some(arr) = machines.as_array() {
                     if arr.is_empty() {
-                        return DevError::NoRuntime(
-                            "Podman is installed but no machine exists.\n\nRun:\n  podman machine init && podman machine start\n\nThen try `dev <subcommand>` again.".to_string(),
-                        );
+                        Some("  podman machine init && podman machine start")
+                    } else {
+                        Some("  podman machine start")
                     }
-                    let any_running = arr.iter().any(|m| {
-                        m.get("Running").and_then(|r| r.as_bool()).unwrap_or(false)
-                    });
-                    if !any_running {
-                        return DevError::NoRuntime(
-                            "Podman is installed but no machine is running.\n\nRun:\n  podman machine start\n\nThen try `dev <subcommand>` again.".to_string(),
-                        );
-                    }
+                } else {
+                    Some("  podman machine start")
                 }
+            } else {
+                Some("  podman machine start")
             }
+        } else {
+            Some("  podman machine start")
         }
-    }
+    } else {
+        None
+    };
 
-    // Check Docker
-    if command_exists("docker").await {
-        return DevError::NoRuntime(
-            "Docker is installed but the daemon is not running.\n\nStart Docker Desktop or the Docker daemon, then try `dev <subcommand>` again.".to_string(),
-        );
-    }
+    let docker_hint = if has_docker {
+        Some("  Start Docker Desktop (or the Docker daemon)")
+    } else {
+        None
+    };
 
-    // Nothing installed
-    DevError::NoRuntime(
-        "No container runtime found. Install Docker, Podman, or Apple Containers.".to_string(),
-    )
+    match (podman_hint, docker_hint) {
+        (Some(podman), Some(docker)) => DevError::NoRuntime(format!(
+            "Both Podman and Docker are installed but neither is running.\n\nStart one of them:\n{podman}\n  — or —\n{docker}\n\nThen try `dev <subcommand>` again."
+        )),
+        (Some(podman), None) => DevError::NoRuntime(format!(
+            "Podman is installed but not running.\n\nRun:\n{podman}\n\nThen try `dev <subcommand>` again."
+        )),
+        (None, Some(docker)) => DevError::NoRuntime(format!(
+            "Docker is installed but the daemon is not running.\n\n{docker}, then try `dev <subcommand>` again."
+        )),
+        (None, None) => DevError::NoRuntime(
+            "No container runtime found. Install Docker or Podman.".to_string(),
+        ),
+    }
 }

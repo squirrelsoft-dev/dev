@@ -3,8 +3,9 @@ use std::path::Path;
 use crate::error::DevError;
 use crate::runtime::docker::BollardRuntime;
 use crate::runtime::{
-    BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ExecResult,
+    BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ExecResult, ImageMetadata,
 };
+use std::os::unix::process::CommandExt;
 
 /// Podman runtime backed by the same bollard client, connecting to the Podman socket.
 pub struct PodmanRuntime(pub(crate) BollardRuntime);
@@ -89,7 +90,26 @@ impl ContainerRuntime for PodmanRuntime {
     }
 
     fn exec_interactive(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, ()> {
-        self.0.exec_interactive(id, cmd, user)
+        // Podman's HTTP API doesn't reliably support interactive TTY exec via
+        // bollard. Shell out to `podman exec -it` instead.
+        let id = id.to_string();
+        let cmd = cmd.to_vec();
+        let user = user.map(|u| u.to_string());
+        Box::pin(async move {
+            let mut args = vec!["exec".to_string(), "-it".to_string()];
+            if let Some(ref u) = user {
+                args.push("--user".to_string());
+                args.push(u.clone());
+            }
+            args.push(id);
+            args.extend(cmd);
+
+            let err = std::process::Command::new("podman")
+                .args(&args)
+                .exec();
+            // exec() only returns on error
+            Err(DevError::Runtime(format!("Failed to exec into container: {err}")))
+        })
     }
 
     fn inspect_container(&self, id: &str) -> BoxFut<'_, ContainerInfo> {
@@ -98,5 +118,13 @@ impl ContainerRuntime for PodmanRuntime {
 
     fn list_containers(&self, label_filter: &str) -> BoxFut<'_, Vec<ContainerInfo>> {
         self.0.list_containers(label_filter)
+    }
+
+    fn image_exists(&self, image: &str) -> BoxFut<'_, bool> {
+        self.0.image_exists(image)
+    }
+
+    fn inspect_image_metadata(&self, image: &str) -> BoxFut<'_, ImageMetadata> {
+        self.0.inspect_image_metadata(image)
     }
 }
