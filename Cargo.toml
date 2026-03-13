@@ -7,9 +7,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# Apple Containers (native XPC)
-apple-container = { path = "crates/apple-container" }
-
 # CLI
 clap = { version = "4", features = ["derive"] }
 
@@ -57,6 +54,10 @@ os_pipe = "1"
 dirs = "6"
 sha2 = "0.10"
 hex = "0.4"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Apple Containers (native XPC)
+apple-container = { path = "crates/apple-container" }
 
 [dev-dependencies]
 tempfile = "3"

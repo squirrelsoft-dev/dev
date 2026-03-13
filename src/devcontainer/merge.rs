@@ -28,6 +28,48 @@ const MAP_FIELDS: &[&str] = &["remoteEnv", "containerEnv"];
 /// Fields that are feature maps (special merge: union of keys).
 const FEATURE_FIELDS: &[&str] = &["features"];
 
+/// Merge a single overlay layer on top of a base value, using field-type strategies:
+/// - Scalar fields: overlay overrides base
+/// - Array fields: concatenate (overlay appended to base, skipping duplicates)
+/// - Map fields: merge (overlay keys override base keys)
+/// - Feature fields: union (overlay features added to base features)
+/// - Unknown fields: overlay wins
+pub fn merge_layer(base: &mut Value, overlay: &Value) {
+    let overlay_obj = match overlay.as_object() {
+        Some(obj) if !obj.is_empty() => obj,
+        _ => return,
+    };
+
+    let base_obj = match base.as_object_mut() {
+        Some(obj) => obj,
+        None => return,
+    };
+
+    for (key, overlay_val) in overlay_obj {
+        if SCALAR_FIELDS.contains(&key.as_str()) {
+            base_obj.insert(key.clone(), overlay_val.clone());
+        } else if FEATURE_FIELDS.contains(&key.as_str()) {
+            merge_feature_map(base_obj, key, overlay_val);
+        } else if ARRAY_FIELDS.contains(&key.as_str()) {
+            merge_array(base_obj, key, overlay_val);
+        } else if MAP_FIELDS.contains(&key.as_str()) {
+            merge_map(base_obj, key, overlay_val);
+        } else {
+            base_obj.insert(key.clone(), overlay_val.clone());
+        }
+    }
+}
+
+/// Compose N layers in order (first = lowest priority, last = highest priority).
+/// Returns the merged result.
+pub fn merge_layers(layers: &[Value]) -> Value {
+    let mut result = Value::Object(serde_json::Map::new());
+    for layer in layers {
+        merge_layer(&mut result, layer);
+    }
+    result
+}
+
 /// Merge the user's base config (`~/.dev/base/devcontainer.json`) into a destination
 /// devcontainer.json file. Returns `true` if a merge was performed, `false` if no
 /// base config exists.
@@ -47,38 +89,16 @@ pub fn merge_base_config(dest: &Path) -> anyhow::Result<bool> {
     let base_stripped = json_comments::StripComments::new(base_raw.as_bytes());
     let base: Value = serde_json::from_reader(base_stripped)?;
 
+    if base.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+        return Ok(false);
+    }
+
     // Read dest config
     let dest_raw = fs::read_to_string(&dest_config_path)?;
     let dest_stripped = json_comments::StripComments::new(dest_raw.as_bytes());
     let mut dest_json: Value = serde_json::from_reader(dest_stripped)?;
 
-    let base_obj = match base.as_object() {
-        Some(obj) if !obj.is_empty() => obj,
-        _ => return Ok(false),
-    };
-
-    let dest_obj = dest_json
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("devcontainer.json is not a JSON object"))?;
-
-    for (key, base_val) in base_obj {
-        if SCALAR_FIELDS.contains(&key.as_str()) {
-            // Base overrides template only if base sets it
-            dest_obj.insert(key.clone(), base_val.clone());
-        } else if FEATURE_FIELDS.contains(&key.as_str()) {
-            // Union: base features added to template features
-            merge_feature_map(dest_obj, key, base_val);
-        } else if ARRAY_FIELDS.contains(&key.as_str()) {
-            // Concatenate: base appended to template
-            merge_array(dest_obj, key, base_val);
-        } else if MAP_FIELDS.contains(&key.as_str()) {
-            // Merge: base keys override template keys
-            merge_map(dest_obj, key, base_val);
-        } else {
-            // Unknown fields: base wins (copy over as-is)
-            dest_obj.insert(key.clone(), base_val.clone());
-        }
-    }
+    merge_layer(&mut dest_json, &base);
 
     let formatted = serde_json::to_string_pretty(&dest_json)?;
     fs::write(&dest_config_path, formatted)?;

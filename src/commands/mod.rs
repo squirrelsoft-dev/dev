@@ -10,3 +10,4 @@ pub mod new;
 pub mod shell;
 pub mod status;
 pub mod up;
+pub mod vscode;

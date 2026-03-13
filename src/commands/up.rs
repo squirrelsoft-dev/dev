@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::devcontainer::{
-    DevcontainerConfig, download_features, generate_feature_dockerfile, resolve_features,
+    DevcontainerConfig, Recipe, compose_and_write, download_features,
+    generate_feature_dockerfile, resolve_features,
     run_lifecycle_hooks, stage_feature_context, substitute_variables,
     substitute_variables_with_user,
 };
@@ -12,7 +13,7 @@ use crate::runtime::{
     detect_runtime, resolve_remote_user,
 };
 use crate::util::{
-    container_name, find_devcontainer_config, workspace_folder_name, workspace_label,
+    container_name, find_config_source, workspace_folder_name, workspace_label, ConfigSource,
 };
 
 pub async fn run(
@@ -22,9 +23,15 @@ pub async fn run(
     no_cache: bool,
     verbose: bool,
 ) -> anyhow::Result<()> {
-    let config_path = find_devcontainer_config(workspace)?;
-    let config = DevcontainerConfig::from_path(&config_path)?;
     let runtime = detect_runtime(runtime_override).await?;
+    let config_path = match find_config_source(workspace)? {
+        ConfigSource::Direct(path) => path,
+        ConfigSource::Recipe(recipe_path) => {
+            let recipe = Recipe::from_path(&recipe_path)?;
+            compose_and_write(&recipe, runtime.runtime_name())?
+        }
+    };
+    let config = DevcontainerConfig::from_path(&config_path)?;
 
     let (label_key, label_val) = workspace_label(workspace);
     let filter = format!("{label_key}={label_val}");
@@ -65,7 +72,7 @@ pub async fn run(
     // Use the same image tag that `dev build` produces so we can reuse it.
     let has_features = resolve_features(&config)?.iter().count() > 0;
     let needs_build = config.build.is_some() || has_features;
-    let final_tag = format!("dev-build-{}", container_name(workspace));
+    let final_tag = format!("{}-features", container_name(workspace));
 
     let final_image = if !needs_build {
         // Image-based config with no features — use the remote image directly.

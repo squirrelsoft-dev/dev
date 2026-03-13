@@ -154,6 +154,10 @@ fn to_apple_config(config: &ContainerConfig) -> ContainerConfiguration {
 }
 
 impl ContainerRuntime for AppleRuntime {
+    fn runtime_name(&self) -> &'static str {
+        "apple"
+    }
+
     fn pull_image(&self, _image: &str) -> BoxFut<'_, ()> {
         // Apple Containers pulls images automatically during containerCreate.
         Box::pin(async { Ok(()) })

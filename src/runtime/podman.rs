@@ -54,6 +54,10 @@ fn podman_socket_path() -> Result<String, DevError> {
 }
 
 impl ContainerRuntime for PodmanRuntime {
+    fn runtime_name(&self) -> &'static str {
+        "podman"
+    }
+
     fn pull_image(&self, image: &str) -> BoxFut<'_, ()> {
         self.0.pull_image(image)
     }

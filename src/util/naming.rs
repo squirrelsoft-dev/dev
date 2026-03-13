@@ -3,7 +3,10 @@ use std::path::Path;
 
 /// Generate a deterministic container name for a workspace.
 ///
-/// Format: `dev-<first 8 chars of SHA-256 of absolute path>-<dirname>`
+/// Format: `vsc-<dirname>-<SHA-256 hex of absolute path>`
+///
+/// This matches the naming convention used by VS Code's Dev Containers extension
+/// so that containers are interoperable between the two tools.
 pub fn container_name(workspace: &Path) -> String {
     let abs_path = workspace
         .canonicalize()
@@ -13,14 +16,13 @@ pub fn container_name(workspace: &Path) -> String {
     let mut hasher = Sha256::new();
     hasher.update(path_str.as_bytes());
     let hash = hex::encode(hasher.finalize());
-    let short_hash = &hash[..8];
 
     let dirname = abs_path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "workspace".to_string());
 
-    format!("dev-{short_hash}-{}", dirname.to_lowercase())
+    format!("vsc-{}-{hash}", dirname.to_lowercase())
 }
 
 /// Return the label key-value pair used to identify containers belonging to a workspace.
@@ -45,9 +47,9 @@ mod tests {
     fn test_container_name_format() {
         // Use a path that won't canonicalize (doesn't exist), so it uses the raw path.
         let name = container_name(Path::new("/tmp/my-project"));
-        assert!(name.starts_with("dev-"));
-        assert!(name.ends_with("-my-project"));
-        assert_eq!(name.len(), 23);
+        assert!(name.starts_with("vsc-my-project-"));
+        // vsc- (4) + my-project (10) + - (1) + 64-char hex hash = 79
+        assert_eq!(name.len(), 79);
         // Verify name is fully lowercase (Docker requirement)
         assert_eq!(name, name.to_lowercase());
     }

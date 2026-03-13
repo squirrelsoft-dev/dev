@@ -22,6 +22,11 @@ pub fn base_config_dir() -> PathBuf {
     dev_home().join("base")
 }
 
+/// Runtime-specific config directory: `~/.dev/<name>/`
+pub fn runtime_config_dir(name: &str) -> PathBuf {
+    dev_home().join(name)
+}
+
 /// VS Code remote-containers configs directory.
 /// `~/Library/Application Support/Code/User/globalStorage/ms-vscode-remote.remote-containers/configs/`
 pub fn vscode_configs_dir() -> PathBuf {

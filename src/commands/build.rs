@@ -1,12 +1,12 @@
 use std::path::Path;
 
 use crate::devcontainer::{
-    DevcontainerConfig, download_features, generate_feature_dockerfile, resolve_features,
-    stage_feature_context,
+    DevcontainerConfig, Recipe, compose_and_write, download_features,
+    generate_feature_dockerfile, resolve_features, stage_feature_context,
 };
 use crate::devcontainer::features::order_features;
 use crate::runtime::{detect_runtime, resolve_remote_user};
-use crate::util::{container_name, find_devcontainer_config};
+use crate::util::{container_name, find_config_source, ConfigSource};
 
 pub async fn run(
     workspace: &Path,
@@ -15,11 +15,17 @@ pub async fn run(
     no_cache: bool,
     verbose: bool,
 ) -> anyhow::Result<()> {
-    let config_path = find_devcontainer_config(workspace)?;
-    let config = DevcontainerConfig::from_path(&config_path)?;
     let runtime = detect_runtime(runtime_override).await?;
+    let config_path = match find_config_source(workspace)? {
+        ConfigSource::Direct(path) => path,
+        ConfigSource::Recipe(recipe_path) => {
+            let recipe = Recipe::from_path(&recipe_path)?;
+            compose_and_write(&recipe, runtime.runtime_name())?
+        }
+    };
+    let config = DevcontainerConfig::from_path(&config_path)?;
 
-    let default_tag = format!("dev-build-{}", container_name(workspace));
+    let default_tag = format!("{}-features", container_name(workspace));
     let final_tag = tag.unwrap_or(&default_tag);
 
     // Build or pull the base image

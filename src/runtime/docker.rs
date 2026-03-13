@@ -2,7 +2,7 @@ use bollard::container::{
     Config, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions,
     StartContainerOptions, StopContainerOptions,
 };
-use bollard::exec::{CreateExecOptions, StartExecResults};
+use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecResults};
 use bollard::image::{BuildImageOptions, CreateImageOptions};
 use bollard::Docker;
 use std::collections::HashMap;
@@ -41,6 +41,19 @@ impl RawModeGuard {
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) };
+    }
+}
+
+/// Query the current terminal size via TIOCGWINSZ ioctl.
+fn terminal_size() -> Option<(u16, u16)> {
+    use std::os::fd::AsRawFd;
+    let fd = std::io::stdout().as_raw_fd();
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0 && ws.ws_row > 0
+    {
+        Some((ws.ws_col, ws.ws_row))
+    } else {
+        None
     }
 }
 
@@ -388,6 +401,45 @@ impl BollardRuntime {
             mut output, input, ..
         } = start
         {
+            // Set the initial terminal size so TUI apps fill the real terminal.
+            if let Some((cols, rows)) = terminal_size() {
+                let _ = self
+                    .client
+                    .resize_exec(
+                        &exec.id,
+                        ResizeExecOptions {
+                            height: rows,
+                            width: cols,
+                        },
+                    )
+                    .await;
+            }
+
+            // Forward SIGWINCH to the container exec so resizes propagate.
+            let resize_client = self.client.clone();
+            let resize_exec_id = exec.id.clone();
+            let sigwinch_handle = tokio::spawn(async move {
+                let mut sig =
+                    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+                    {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    };
+                while sig.recv().await.is_some() {
+                    if let Some((cols, rows)) = terminal_size() {
+                        let _ = resize_client
+                            .resize_exec(
+                                &resize_exec_id,
+                                ResizeExecOptions {
+                                    height: rows,
+                                    width: cols,
+                                },
+                            )
+                            .await;
+                    }
+                }
+            });
+
             // Spawn a task to forward stdin to the container, translating
             // Shift+Enter escape sequences into a plain carriage return so they
             // don't print garbage in shells that don't understand them.
@@ -425,9 +477,9 @@ impl BollardRuntime {
                 }
             }
 
-            // Abort the stdin forwarding task so it doesn't keep blocking on
-            // stdin after the container shell has exited.
+            // Abort the stdin and signal forwarding tasks.
             stdin_handle.abort();
+            sigwinch_handle.abort();
         }
 
         // _raw_guard is dropped here, restoring the terminal.
@@ -566,6 +618,10 @@ impl BollardRuntime {
 }
 
 impl ContainerRuntime for BollardRuntime {
+    fn runtime_name(&self) -> &'static str {
+        "docker"
+    }
+
     fn pull_image(&self, image: &str) -> BoxFut<'_, ()> {
         let image = image.to_string();
         Box::pin(async move { self.pull_image_impl(&image).await })
@@ -671,6 +727,10 @@ impl DockerRuntime {
 }
 
 impl ContainerRuntime for DockerRuntime {
+    fn runtime_name(&self) -> &'static str {
+        "docker"
+    }
+
     fn pull_image(&self, image: &str) -> BoxFut<'_, ()> {
         self.0.pull_image(image)
     }

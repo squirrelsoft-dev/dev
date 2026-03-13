@@ -126,6 +126,18 @@ pub enum Command {
         #[command(subcommand)]
         action: BaseAction,
     },
+
+    /// VS Code integration
+    Vscode {
+        #[command(subcommand)]
+        action: VscodeAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum VscodeAction {
+    /// Repair VS Code symlinks for devcontainer configs
+    Repair,
 }
 
 #[derive(Subcommand, Debug)]

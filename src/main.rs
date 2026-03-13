@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use cli::{Cli, BaseAction, Command, GlobalAction};
+use cli::{Cli, BaseAction, Command, GlobalAction, VscodeAction};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -86,6 +86,11 @@ async fn main() -> anyhow::Result<()> {
             }
             GlobalAction::Config { name, action } => {
                 commands::global::config(&name, action, verbose).await?;
+            }
+        },
+        Command::Vscode { action } => match action {
+            VscodeAction::Repair => {
+                commands::vscode::repair(&workspace)?;
             }
         },
     }

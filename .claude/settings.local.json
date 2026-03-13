@@ -33,7 +33,8 @@
       "Bash(curl:*)",
       "Bash(python3:*)",
       "WebFetch(domain:docs.podman.io)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
     ]
   }
 }

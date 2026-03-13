@@ -1,3 +1,4 @@
+#[cfg(target_os = "macos")]
 pub mod apple;
 pub mod docker;
 pub mod podman;
@@ -83,6 +84,9 @@ type BoxFut<'a, T> = Pin<Box<dyn Future<Output = Result<T, DevError>> + Send + '
 /// Trait abstracting over container runtimes (Docker, Podman, Apple Containers).
 #[allow(dead_code)]
 pub trait ContainerRuntime: Send + Sync {
+    /// Short name identifying this runtime (e.g. "docker", "podman", "apple").
+    fn runtime_name(&self) -> &'static str;
+
     fn pull_image(&self, image: &str) -> BoxFut<'_, ()>;
 
     fn build_image(
@@ -143,6 +147,7 @@ pub async fn detect_runtime(
                 let rt = podman::PodmanRuntime::connect()?;
                 Ok(Box::new(rt))
             }
+            #[cfg(target_os = "macos")]
             "apple" => {
                 let rt = apple::AppleRuntime::connect()?;
                 rt.ping().await?;

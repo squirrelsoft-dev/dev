@@ -7,6 +7,7 @@ use crate::collection::{
     template_collections, template_tier, TemplateTier,
 };
 use crate::devcontainer::apply_template;
+use crate::devcontainer::recipe::Recipe;
 use crate::oci::download_artifact;
 use crate::tui::{picker, prompts};
 use crate::util::paths::{devcontainers_dir, global_dir, vscode_configs_dir};
@@ -90,31 +91,40 @@ pub async fn run(
             workspace.to_path_buf()
         }
         picker::Scope::User => {
+            // Save the template as a global template so the recipe can reference it
+            let global_name = ensure_global_template(&selected.id, &artifact_path)?;
+
             let folder_name = workspace_folder_name(workspace);
             let user_dest = devcontainers_dir().join(&folder_name);
-            fs::create_dir_all(&user_dest)?;
-            apply_template(&artifact_path, &opts, &user_dest)?;
+            let devcontainer_dir = user_dest.join(".devcontainer");
+            fs::create_dir_all(&devcontainer_dir)?;
 
-            // Create .devcontainer-internal.json with rootFolder
-            let internal = user_dest.join(".devcontainer-internal.json");
-            let internal_json = serde_json::json!({
-                "rootFolder": workspace.to_string_lossy()
-            });
-            fs::write(&internal, serde_json::to_string_pretty(&internal_json)?)?;
+            // Write a recipe instead of eagerly generating the config
+            let recipe = Recipe {
+                global_template: global_name,
+                features: selected_features.clone(),
+                options: opts.clone(),
+                root_folder: workspace.to_string_lossy().to_string(),
+            };
+            recipe.write_to(&devcontainer_dir.join("recipe.json"))?;
 
             // Create VS Code symlink if the configs dir exists
             create_vscode_symlink(&folder_name, &user_dest);
 
-            user_dest
+            println!(
+                "Recipe for template '{}' written to {}",
+                selected.id,
+                devcontainer_dir.join("recipe.json").display()
+            );
+            return Ok(());
         }
     };
 
-    // Inject selected features
+    // Workspace scope: inject features and merge base as before
     if !selected_features.is_empty() {
         inject_features_into_config(&dest, &selected_features)?;
     }
 
-    // Merge base config if it exists
     if crate::devcontainer::merge::merge_base_config(&dest)? {
         eprintln!("Merged base config from ~/.dev/base/devcontainer.json");
     }
@@ -147,44 +157,49 @@ async fn apply_global_template(
     let scope = picker::pick_scope()?;
     let opts = parse_option_args(options);
 
-    let dest = match scope {
+    match scope {
         picker::Scope::Workspace => {
             apply_template(&global_path, &opts, workspace)?;
-            workspace.to_path_buf()
+
+            // Replace features with the user's full selection
+            if !selected_features.is_empty() || !existing_features.is_empty() {
+                replace_features_in_config(workspace, &selected_features)?;
+            }
+
+            // Merge base config if it exists
+            if crate::devcontainer::merge::merge_base_config(workspace)? {
+                eprintln!("Merged base config from ~/.dev/base/devcontainer.json");
+            }
+
+            println!(
+                "Global template '{global_name}' applied to {}",
+                workspace.display()
+            );
         }
         picker::Scope::User => {
             let folder_name = workspace_folder_name(workspace);
             let user_dest = devcontainers_dir().join(&folder_name);
-            fs::create_dir_all(&user_dest)?;
-            apply_template(&global_path, &opts, &user_dest)?;
+            let devcontainer_dir = user_dest.join(".devcontainer");
+            fs::create_dir_all(&devcontainer_dir)?;
 
-            let internal = user_dest.join(".devcontainer-internal.json");
-            let internal_json = serde_json::json!({
-                "rootFolder": workspace.to_string_lossy()
-            });
-            fs::write(&internal, serde_json::to_string_pretty(&internal_json)?)?;
+            // Write a recipe referencing the global template
+            let recipe = Recipe {
+                global_template: global_name.to_string(),
+                features: selected_features,
+                options: opts,
+                root_folder: workspace.to_string_lossy().to_string(),
+            };
+            recipe.write_to(&devcontainer_dir.join("recipe.json"))?;
 
             create_vscode_symlink(&folder_name, &user_dest);
 
-            user_dest
+            println!(
+                "Recipe for global template '{global_name}' written to {}",
+                devcontainer_dir.join("recipe.json").display()
+            );
         }
-    };
-
-    // Replace features with the user's full selection (overwrite existing features
-    // since the multi-select already included them as pre-checked defaults)
-    if !selected_features.is_empty() || !existing_features.is_empty() {
-        replace_features_in_config(&dest, &selected_features)?;
     }
 
-    // Merge base config if it exists
-    if crate::devcontainer::merge::merge_base_config(&dest)? {
-        eprintln!("Merged base config from ~/.dev/base/devcontainer.json");
-    }
-
-    println!(
-        "Global template '{global_name}' applied to {}",
-        dest.display()
-    );
     Ok(())
 }
 
@@ -382,6 +397,21 @@ fn replace_features_in_config(dest: &Path, features: &[String]) -> anyhow::Resul
     let formatted = serde_json::to_string_pretty(&json)?;
     fs::write(&config_path, formatted)?;
     Ok(())
+}
+
+/// Ensure a template is saved as a global template at `~/.dev/global/<name>/`.
+/// If it already exists, this is a no-op. Returns the global template name.
+fn ensure_global_template(template_id: &str, artifact_path: &Path) -> anyhow::Result<String> {
+    let name = template_id.to_string();
+    let global_path = global_dir().join(&name);
+    if global_path.join(".devcontainer/devcontainer.json").is_file() {
+        return Ok(name);
+    }
+    fs::create_dir_all(&global_path)?;
+    // Copy the template without substituting options — keep placeholders for reuse
+    apply_template(artifact_path, &HashMap::new(), &global_path)?;
+    eprintln!("Saved as global template '{name}' at {}", global_path.display());
+    Ok(name)
 }
 
 fn parse_option_args(args: &[String]) -> HashMap<String, String> {
