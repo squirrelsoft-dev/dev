@@ -34,11 +34,11 @@ async fn main() -> anyhow::Result<()> {
         Command::New { template, options } => {
             commands::new::run(&workspace, template.as_deref(), &options, verbose).await?;
         }
-        Command::Build { tag, no_cache } => {
-            commands::build::run(&workspace, runtime_override, tag.as_deref(), no_cache, verbose > 0).await?;
+        Command::Build { tag, no_cache, frozen_lockfile, buildkit } => {
+            commands::build::run(&workspace, runtime_override, tag.as_deref(), no_cache, verbose > 0, frozen_lockfile, buildkit).await?;
         }
-        Command::Up { rebuild, no_cache } => {
-            commands::up::run(&workspace, runtime_override, rebuild, no_cache, verbose > 0).await?;
+        Command::Up { rebuild, no_cache, frozen_lockfile, buildkit } => {
+            commands::up::run(&workspace, runtime_override, rebuild, no_cache, verbose > 0, frozen_lockfile, buildkit).await?;
         }
         Command::Down { remove } => {
             commands::down::run(&workspace, runtime_override, remove).await?;

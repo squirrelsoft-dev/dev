@@ -8,6 +8,7 @@ use std::path::Path;
 /// - `${containerEnv:VAR}` / `${remoteEnv:VAR}` — expanded using `remote_user`
 /// - `${localWorkspaceFolder}` — workspace path on host
 /// - `${localWorkspaceFolderBasename}` — basename of workspace path
+/// - `${containerWorkspaceFolder}` — workspace path inside the container
 pub fn substitute_variables(s: &str, workspace: &Path) -> String {
     substitute_variables_with_user(s, workspace, None)
 }
@@ -72,6 +73,12 @@ fn expand_variable(expr: &str, workspace: &Path, remote_user: Option<&str>) -> O
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default(),
         )
+    } else if expr == "containerWorkspaceFolder" {
+        let folder_name = workspace
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        Some(format!("/workspaces/{folder_name}"))
     } else {
         None
     }
@@ -197,6 +204,15 @@ mod tests {
             "source=value,target=/workspaces/project"
         );
         unsafe { std::env::remove_var("DEV_TEST_MULTI") };
+    }
+
+    #[test]
+    fn test_container_workspace_folder() {
+        let workspace = PathBuf::from("/home/user/project");
+        assert_eq!(
+            substitute_variables("${containerWorkspaceFolder}/src", &workspace),
+            "/workspaces/project/src"
+        );
     }
 
     #[test]

@@ -45,6 +45,14 @@ pub enum Command {
         /// Don't use cache when building
         #[arg(long)]
         no_cache: bool,
+
+        /// Error if lockfile is missing or features don't match it
+        #[arg(long)]
+        frozen_lockfile: bool,
+
+        /// Use BuildKit-optimized feature installation
+        #[arg(long)]
+        buildkit: bool,
     },
 
     /// Start devcontainer for current directory
@@ -56,6 +64,14 @@ pub enum Command {
         /// Don't use cache when building
         #[arg(long)]
         no_cache: bool,
+
+        /// Error if lockfile is missing or features don't match it
+        #[arg(long)]
+        frozen_lockfile: bool,
+
+        /// Use BuildKit-optimized feature installation
+        #[arg(long)]
+        buildkit: bool,
     },
 
     /// Stop (optionally remove) container

@@ -43,7 +43,23 @@ pub struct DevcontainerConfig {
     pub post_create_command: Option<LifecycleCommand>,
     pub post_start_command: Option<LifecycleCommand>,
     pub post_attach_command: Option<LifecycleCommand>,
+    pub initialize_command: Option<LifecycleCommand>,
     pub customize: Option<serde_json::Value>,
+    /// Dotfiles configuration for cloning a user's dotfiles repo into the container.
+    pub dotfiles: Option<DotfilesConfig>,
+}
+
+/// Configuration for cloning a dotfiles repository into the container.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct DotfilesConfig {
+    /// Git repository URL to clone (e.g. "https://github.com/user/dotfiles.git").
+    pub repository: String,
+    /// Target path inside the container (default: "~/dotfiles").
+    pub target_path: Option<String>,
+    /// Command to run after cloning (e.g. "~/dotfiles/install.sh").
+    pub install_command: Option<String>,
 }
 
 impl DevcontainerConfig {

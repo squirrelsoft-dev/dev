@@ -1,1 +1,8 @@
 /target
+/external-src
+
+# Claude Code personal files
+CLAUDE.local.md
+.claude/settings.local.json
+.claude/logs/
+.claude/context-snapshots/

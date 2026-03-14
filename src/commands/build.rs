@@ -2,9 +2,10 @@ use std::path::Path;
 
 use crate::devcontainer::{
     DevcontainerConfig, Recipe, compose_and_write, download_features,
-    generate_feature_dockerfile, resolve_features, stage_feature_context,
+    resolve_features, stage_feature_context,
 };
-use crate::devcontainer::features::order_features;
+use crate::devcontainer::features::{generate_feature_dockerfile_with_opts, order_features};
+use crate::devcontainer::lockfile::{handle_lockfile, lockfile_path};
 use crate::runtime::{detect_runtime, resolve_remote_user};
 use crate::util::{container_name, find_config_source, ConfigSource};
 
@@ -14,6 +15,8 @@ pub async fn run(
     tag: Option<&str>,
     no_cache: bool,
     verbose: bool,
+    frozen_lockfile: bool,
+    buildkit: bool,
 ) -> anyhow::Result<()> {
     let runtime = detect_runtime(runtime_override).await?;
     let config_path = match find_config_source(workspace)? {
@@ -27,6 +30,7 @@ pub async fn run(
 
     let default_tag = format!("{}-features", container_name(workspace));
     let final_tag = tag.unwrap_or(&default_tag);
+    let devcontainer_dir = config_path.parent().map(|p| p.to_path_buf());
 
     // Build or pull the base image
     let base_image = if let Some(ref image) = config.image {
@@ -60,7 +64,12 @@ pub async fn run(
             .await?;
         // Fall through to feature layering below
         eprintln!("Downloading {} feature(s)...", features.len());
-        download_features(&mut features).await?;
+        download_features(&mut features, devcontainer_dir.as_deref()).await?;
+
+        if let Some(ref dc_dir) = devcontainer_dir {
+            handle_lockfile(&lockfile_path(dc_dir), &features, frozen_lockfile)?;
+        }
+
         let ordered = order_features(&features);
         let staging_dir = stage_feature_context(&ordered)?;
         let feature_user = resolve_remote_user(
@@ -68,7 +77,7 @@ pub async fn run(
             &base_tag,
             config.remote_user.as_deref(),
         ).await?;
-        let dockerfile = generate_feature_dockerfile(&base_tag, &ordered, feature_user.as_deref());
+        let dockerfile = generate_feature_dockerfile_with_opts(&base_tag, &ordered, feature_user.as_deref(), &config, buildkit);
         eprintln!("Building features image...");
         let result = runtime
             .build_image(&dockerfile, &staging_dir, final_tag, no_cache, verbose)
@@ -89,7 +98,12 @@ pub async fn run(
     }
 
     eprintln!("Downloading {} feature(s)...", features.len());
-    download_features(&mut features).await?;
+    download_features(&mut features, devcontainer_dir.as_deref()).await?;
+
+    if let Some(ref dc_dir) = devcontainer_dir {
+        handle_lockfile(&lockfile_path(dc_dir), &features, frozen_lockfile)?;
+    }
+
     let ordered = order_features(&features);
     let staging_dir = stage_feature_context(&ordered)?;
     let feature_user = resolve_remote_user(
@@ -97,7 +111,7 @@ pub async fn run(
         &base_image,
         config.remote_user.as_deref(),
     ).await?;
-    let dockerfile = generate_feature_dockerfile(&base_image, &ordered, feature_user.as_deref());
+    let dockerfile = generate_feature_dockerfile_with_opts(&base_image, &ordered, feature_user.as_deref(), &config, buildkit);
     eprintln!("Building features image...");
     let result = runtime
         .build_image(&dockerfile, &staging_dir, final_tag, no_cache, verbose)

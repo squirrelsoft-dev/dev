@@ -31,6 +31,14 @@ pub struct ContainerConfig {
     #[allow(dead_code)]
     pub extra_args: Vec<String>,
     pub entrypoint: Option<String>,
+    /// Run an init process inside the container (--init).
+    pub init: bool,
+    /// Run the container in privileged mode (--privileged).
+    pub privileged: bool,
+    /// Additional Linux capabilities to add (--cap-add).
+    pub cap_add: Vec<String>,
+    /// Security options (--security-opt).
+    pub security_opt: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

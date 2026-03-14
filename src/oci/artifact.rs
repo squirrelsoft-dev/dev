@@ -18,7 +18,7 @@ fn blob_cache_dir() -> Result<PathBuf, DevError> {
 }
 
 /// Compute the sha256 hex digest of bytes.
-fn sha256_hex(data: &[u8]) -> String {
+pub fn sha256_hex(data: &[u8]) -> String {
     let hash = Sha256::digest(data);
     hex::encode(hash)
 }
@@ -51,7 +51,7 @@ fn is_gzip(data: &[u8]) -> bool {
 }
 
 /// Extract an archive (tar.gz or plain tar) from bytes into the given directory.
-fn extract_archive(data: &[u8], dest: &Path) -> Result<(), DevError> {
+pub fn extract_archive(data: &[u8], dest: &Path) -> Result<(), DevError> {
     std::fs::create_dir_all(dest)?;
 
     if is_gzip(data) {

@@ -251,6 +251,18 @@ impl BollardRuntime {
         let host_config = bollard::models::HostConfig {
             binds: Some(binds),
             port_bindings: Some(port_bindings),
+            init: if config.init { Some(true) } else { None },
+            privileged: if config.privileged { Some(true) } else { None },
+            cap_add: if config.cap_add.is_empty() {
+                None
+            } else {
+                Some(config.cap_add.clone())
+            },
+            security_opt: if config.security_opt.is_empty() {
+                None
+            } else {
+                Some(config.security_opt.clone())
+            },
             ..Default::default()
         };
 
