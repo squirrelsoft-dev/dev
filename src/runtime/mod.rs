@@ -1,4 +1,4 @@
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "apple"))]
 pub mod apple;
 pub mod docker;
 pub mod podman;
@@ -165,7 +165,7 @@ pub async fn detect_runtime(
                 let rt = podman::PodmanRuntime::connect()?;
                 Ok(Box::new(rt))
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", feature = "apple"))]
             "apple" => {
                 let rt = apple::AppleRuntime::connect()?;
                 rt.ping().await?;
