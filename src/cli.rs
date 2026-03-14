@@ -211,6 +211,9 @@ pub enum GlobalAction {
 
 #[derive(Subcommand, Debug)]
 pub enum BaseAction {
+    /// Interactively create base config with feature selection
+    New,
+
     /// Open base config in $EDITOR
     Edit,
 

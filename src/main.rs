@@ -67,6 +67,9 @@ async fn main() -> anyhow::Result<()> {
             commands::config::run_workspace(&workspace, action, verbose).await?;
         }
         Command::Base { action } => match action {
+            BaseAction::New => {
+                commands::base::new(verbose).await?;
+            }
             BaseAction::Edit => {
                 commands::base::edit()?;
             }
