@@ -281,12 +281,14 @@ pub async fn run(
         .map(|s| substitute_variables_with_user(s, workspace, remote_user))
         .collect();
 
-    let volumes = parse_volumes(
-        config
-            .volumes
-            .as_deref()
-            .unwrap_or(&[]),
-    );
+    let volume_strings: Vec<String> = config
+        .volumes
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|s| substitute_variables_with_user(s, workspace, remote_user))
+        .collect();
+    let volumes = parse_volumes(&volume_strings);
 
     let extra_args: Vec<String> = config
         .run_args

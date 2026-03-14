@@ -60,7 +60,7 @@ fn property_type(name: &str) -> PropertyType {
     match name {
         "features" => PropertyType::FeatureMap,
         "forwardPorts" => PropertyType::Array,
-        "mounts" => PropertyType::Array,
+        "mounts" | "volumes" => PropertyType::Array,
         "remoteEnv" | "containerEnv" => PropertyType::KeyValueMap,
         n if LIFECYCLE_COMMANDS.contains(&n) => PropertyType::Lifecycle,
         _ => PropertyType::Scalar,

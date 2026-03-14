@@ -617,7 +617,7 @@ pub fn generate_feature_dockerfile_with_opts(
 
         // Emit feature's containerEnv as ENV directives (Gap 1).
         for (key, val) in &feature.container_env {
-            let escaped_val = val.replace('\\', "\\\\").replace('"', "\\\"").replace('$', "\\$");
+            let escaped_val = val.replace('\\', "\\\\").replace('"', "\\\"");
             lines.push(format!("ENV {key}=\"{escaped_val}\""));
         }
 

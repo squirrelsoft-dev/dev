@@ -1,9 +1,9 @@
-use bollard::container::{
-    Config, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions,
-    StartContainerOptions, StopContainerOptions,
-};
 use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecResults};
-use bollard::image::{BuildImageOptions, CreateImageOptions};
+use bollard::models::ContainerCreateBody;
+use bollard::query_parameters::{
+    BuildImageOptions, BuilderVersion, CreateContainerOptions, CreateImageOptions,
+    ListContainersOptions, RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
+};
 use bollard::Docker;
 use std::collections::HashMap;
 use std::path::Path;
@@ -122,7 +122,7 @@ impl BollardRuntime {
     async fn pull_image_impl(&self, image: &str) -> Result<(), DevError> {
         use futures_util::StreamExt;
         let opts = CreateImageOptions {
-            from_image: image,
+            from_image: Some(image.to_string()),
             ..Default::default()
         };
         // Pass a default (empty) DockerCredentials instead of None. When None
@@ -174,47 +174,45 @@ impl BollardRuntime {
             .map_err(|e| DevError::BuildFailed(format!("Failed to compress context: {e}")))?;
 
         // When the Dockerfile uses a BuildKit syntax directive (e.g.
-        // `# syntax=docker/dockerfile:1`), request the BuildKit builder.
-        // Bollard defaults to BuilderV1 which explicitly forces the legacy
-        // builder—even on Docker 23+ where BuildKit is otherwise the
-        // default—and the legacy builder cannot handle RUN --mount.
-        let version = if dockerfile.starts_with("# syntax=") {
-            bollard::image::BuilderVersion::BuilderBuildKit
+        // `# syntax=docker/dockerfile:1`) or BuildKit features like
+        // `RUN --mount=`, request the BuildKit builder. Bollard defaults
+        // to BuilderV1 which explicitly forces the legacy builder—even on
+        // Docker 23+ where BuildKit is otherwise the default—and the
+        // legacy builder cannot handle RUN --mount.
+        let needs_buildkit = dockerfile.starts_with("# syntax=")
+            || dockerfile.contains("--mount=");
+        let version = if needs_buildkit {
+            BuilderVersion::BuilderBuildKit
         } else {
-            bollard::image::BuilderVersion::BuilderV1
+            BuilderVersion::BuilderV1
         };
 
-        let opts = BuildImageOptions {
+        let is_buildkit = version == BuilderVersion::BuilderBuildKit;
+
+        let mut opts = BuildImageOptions {
             dockerfile: "Dockerfile".to_string(),
-            t: tag.to_string(),
+            t: Some(tag.to_string()),
             nocache: no_cache,
             rm: true,
-            buildargs: build_args.clone(),
+            buildargs: Some(build_args.clone()),
             version,
             ..Default::default()
         };
 
-        let is_buildkit = version == bollard::image::BuilderVersion::BuilderBuildKit;
+        // BuildKit requires a unique gRPC session ID for client-daemon communication.
+        if is_buildkit {
+            opts.session = Some(format!("dev-{}", std::process::id()));
+        }
 
         // Pass an empty credentials map instead of None. When None is passed,
         // bollard sends an empty X-Registry-Config header value which Podman
         // rejects as invalid JSON.
-        let mut stream = self.client.build_image(opts, Some(HashMap::new()), Some(compressed.into()));
+        let body = bollard::body_full(compressed.into());
+        let mut stream = self.client.build_image(opts, Some(HashMap::new()), Some(body));
         while let Some(result) = stream.next().await {
             let info = match result {
                 Ok(info) => info,
                 Err(e) => {
-                    // BuildKit sends protobuf-encoded trace messages in the
-                    // `aux` field that bollard cannot deserialize (it expects
-                    // an ImageId struct, not a base64 string). These are
-                    // progress updates, not build output, so skip them.
-                    if is_buildkit {
-                        if let bollard::errors::Error::JsonDataError { .. }
-                            | bollard::errors::Error::JsonSerdeError { .. } = &e
-                        {
-                            continue;
-                        }
-                    }
                     return Err(DevError::BuildFailed(format!("Docker stream error: {e}")));
                 }
             };
@@ -223,16 +221,27 @@ impl BollardRuntime {
                     eprint!("{stream_text}");
                 }
             }
-            if let Some(err) = info.error {
-                let detail = info.error_detail
-                    .and_then(|d| d.message)
-                    .unwrap_or_default();
-                let msg = if detail.is_empty() {
-                    err
-                } else {
-                    format!("{err}: {detail}")
-                };
-                return Err(DevError::BuildFailed(msg));
+            // Check for BuildKit trace messages with vertex errors or log output.
+            if is_buildkit {
+                if let Some(bollard::models::BuildInfoAux::BuildKit(ref status)) = info.aux {
+                    for vertex in &status.vertexes {
+                        if !vertex.error.is_empty() {
+                            return Err(DevError::BuildFailed(vertex.error.clone()));
+                        }
+                    }
+                    if verbose {
+                        for log in &status.logs {
+                            let text = String::from_utf8_lossy(&log.msg);
+                            eprint!("{text}");
+                        }
+                    }
+                }
+            }
+            if let Some(ref detail) = info.error_detail {
+                let msg = detail.message.clone().unwrap_or_default();
+                if !msg.is_empty() {
+                    return Err(DevError::BuildFailed(msg));
+                }
             }
         }
         Ok(())
@@ -258,14 +267,10 @@ impl BollardRuntime {
             .map(|(k, v)| format!("{k}={v}"))
             .collect();
 
-        let exposed_ports: HashMap<String, HashMap<(), ()>> = config
+        let exposed_ports: Vec<String> = config
             .ports
             .iter()
-            .map(|p| (format!("{}/tcp", p.container), HashMap::new()))
-            .collect();
-        let exposed_ports: HashMap<&str, HashMap<(), ()>> = exposed_ports
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.clone()))
+            .map(|p| format!("{}/tcp", p.container))
             .collect();
 
         let port_bindings: HashMap<String, Option<Vec<bollard::models::PortBinding>>> = config
@@ -306,16 +311,16 @@ impl BollardRuntime {
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
 
-        let container_config = Config {
-            image: Some(config.image.as_str()),
-            labels: Some(labels),
-            env: Some(env.iter().map(|s| s.as_str()).collect()),
+        let container_config = ContainerCreateBody {
+            image: Some(config.image.clone()),
+            labels: Some(labels.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()),
+            env: Some(env),
             exposed_ports: Some(exposed_ports),
             host_config: Some(host_config),
-            entrypoint: config.entrypoint.as_ref().map(|ep| vec![ep.as_str()]),
+            entrypoint: config.entrypoint.as_ref().map(|ep| vec![ep.clone()]),
             // Keep the container running with a default command if no entrypoint provided.
             cmd: if config.entrypoint.is_none() {
-                Some(vec!["sleep", "infinity"])
+                Some(vec!["sleep".to_string(), "infinity".to_string()])
             } else {
                 None
             },
@@ -323,7 +328,7 @@ impl BollardRuntime {
         };
 
         let opts = CreateContainerOptions {
-            name: config.name.as_str(),
+            name: Some(config.name.clone()),
             ..Default::default()
         };
 
@@ -337,14 +342,14 @@ impl BollardRuntime {
 
     async fn start_container_impl(&self, id: &str) -> Result<(), DevError> {
         self.client
-            .start_container(id, None::<StartContainerOptions<String>>)
+            .start_container(id, None::<StartContainerOptions>)
             .await?;
         Ok(())
     }
 
     async fn stop_container_impl(&self, id: &str) -> Result<(), DevError> {
         self.client
-            .stop_container(id, Some(StopContainerOptions { t: 10 }))
+            .stop_container(id, Some(StopContainerOptions { t: Some(10), ..Default::default() }))
             .await?;
         Ok(())
     }
@@ -572,12 +577,11 @@ impl BollardRuntime {
         &self,
         label_filters: &[String],
     ) -> Result<Vec<ContainerInfo>, DevError> {
-        let filter_refs: Vec<&str> = label_filters.iter().map(|s| s.as_str()).collect();
-        let filters: HashMap<&str, Vec<&str>> =
-            HashMap::from([("label", filter_refs)]);
+        let filters: HashMap<String, Vec<String>> =
+            HashMap::from([("label".to_string(), label_filters.to_vec())]);
         let opts = ListContainersOptions {
             all: true,
-            filters,
+            filters: Some(filters),
             ..Default::default()
         };
 
@@ -585,8 +589,8 @@ impl BollardRuntime {
         let mut result = Vec::new();
 
         for c in containers {
-            let state = match c.state.as_deref() {
-                Some("running") => ContainerState::Running,
+            let state = match c.state {
+                Some(bollard::models::ContainerSummaryStateEnum::RUNNING) => ContainerState::Running,
                 _ => ContainerState::Stopped,
             };
 

@@ -10,7 +10,7 @@ use crate::devcontainer::apply_template;
 use crate::devcontainer::recipe::Recipe;
 use crate::oci::download_artifact;
 use crate::tui::{picker, prompts};
-use crate::util::paths::{devcontainers_dir, global_dir, vscode_configs_dir};
+use crate::util::paths::{create_vscode_symlink, devcontainers_dir, global_dir};
 use crate::util::workspace_folder_name;
 
 pub async fn run(
@@ -298,26 +298,6 @@ fn list_global_template_names() -> Vec<String> {
     }
     names.sort();
     names
-}
-
-/// Create a symlink from VS Code's remote-containers configs dir to the user-scoped config.
-fn create_vscode_symlink(folder_name: &str, target: &Path) {
-    let vscode_dir = vscode_configs_dir();
-    if !vscode_dir.parent().map(|p| p.is_dir()).unwrap_or(false) {
-        // VS Code remote-containers extension not installed
-        return;
-    }
-
-    let _ = fs::create_dir_all(&vscode_dir);
-    let link_path = vscode_dir.join(folder_name);
-    if link_path.exists() {
-        return;
-    }
-
-    #[cfg(unix)]
-    {
-        let _ = std::os::unix::fs::symlink(target, &link_path);
-    }
 }
 
 /// Inject feature references into devcontainer.json's "features" field.

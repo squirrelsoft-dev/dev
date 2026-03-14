@@ -151,6 +151,13 @@ pub enum Command {
         action: BaseAction,
     },
 
+    /// Open VS Code attached to the running devcontainer
+    Open {
+        /// Use VS Code Insiders
+        #[arg(long)]
+        insiders: bool,
+    },
+
     /// VS Code integration
     Vscode {
         #[command(subcommand)]

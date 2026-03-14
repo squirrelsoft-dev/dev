@@ -14,7 +14,7 @@ clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 
 # Container runtime
-bollard = "0.18"
+bollard = { version = "0.20", features = ["buildkit", "chrono"] }
 
 # OCI registry
 oci-client = "0.14"

@@ -57,6 +57,9 @@ async fn main() -> anyhow::Result<()> {
         } => {
             commands::list::run(&kind, query.as_deref(), json, refresh, verbose).await?;
         }
+        Command::Open { insiders } => {
+            commands::open::run(&workspace, runtime_override, insiders).await?;
+        }
         Command::Status { json } => {
             commands::status::run(&workspace, runtime_override, json).await?;
         }
