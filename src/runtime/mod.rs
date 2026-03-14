@@ -102,6 +102,7 @@ pub trait ContainerRuntime: Send + Sync {
         dockerfile: &str,
         context: &Path,
         tag: &str,
+        build_args: &HashMap<String, String>,
         no_cache: bool,
         verbose: bool,
     ) -> BoxFut<'_, ()>;
@@ -120,7 +121,7 @@ pub trait ContainerRuntime: Send + Sync {
 
     fn inspect_container(&self, id: &str) -> BoxFut<'_, ContainerInfo>;
 
-    fn list_containers(&self, label_filter: &str) -> BoxFut<'_, Vec<ContainerInfo>>;
+    fn list_containers(&self, label_filters: &[String]) -> BoxFut<'_, Vec<ContainerInfo>>;
 
     fn image_exists(&self, image: &str) -> BoxFut<'_, bool>;
 

@@ -168,6 +168,7 @@ impl ContainerRuntime for AppleRuntime {
         dockerfile: &str,
         context: &Path,
         tag: &str,
+        _build_args: &std::collections::HashMap<String, String>,
         no_cache: bool,
         verbose: bool,
     ) -> BoxFut<'_, ()> {
@@ -380,8 +381,8 @@ impl ContainerRuntime for AppleRuntime {
         })
     }
 
-    fn list_containers(&self, label_filter: &str) -> BoxFut<'_, Vec<ContainerInfo>> {
-        let label_filter = label_filter.to_string();
+    fn list_containers(&self, label_filters: &[String]) -> BoxFut<'_, Vec<ContainerInfo>> {
+        let label_filters = label_filters.to_vec();
         Box::pin(async move {
             let snapshots = self
                 .client
@@ -389,20 +390,22 @@ impl ContainerRuntime for AppleRuntime {
                 .await
                 .map_err(|e| DevError::Runtime(format!("list failed: {e}")))?;
 
-            // Parse the label filter "key=value" and filter client-side.
-            let (filter_key, filter_value) = label_filter
-                .split_once('=')
-                .unwrap_or((&label_filter, ""));
+            // Parse each "key=value" filter and require all to match (AND semantics).
+            let parsed_filters: Vec<(&str, &str)> = label_filters
+                .iter()
+                .map(|f| f.split_once('=').unwrap_or((f.as_str(), "")))
+                .collect();
 
             let mut result = Vec::new();
             for snap in snapshots {
-                let matches = snap
-                    .configuration
-                    .labels
-                    .get(filter_key)
-                    .is_some_and(|v| filter_value.is_empty() || v == filter_value);
+                let all_match = parsed_filters.iter().all(|(key, value)| {
+                    snap.configuration
+                        .labels
+                        .get(*key)
+                        .is_some_and(|v| value.is_empty() || v == value)
+                });
 
-                if matches {
+                if all_match {
                     let state = match snap.status {
                         RuntimeStatus::Running => ContainerState::Running,
                         _ => ContainerState::Stopped,

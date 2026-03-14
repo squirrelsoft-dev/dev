@@ -140,6 +140,7 @@ impl BollardRuntime {
         dockerfile: &str,
         context: &Path,
         tag: &str,
+        build_args: &HashMap<String, String>,
         no_cache: bool,
         verbose: bool,
     ) -> Result<(), DevError> {
@@ -177,6 +178,7 @@ impl BollardRuntime {
             t: tag.to_string(),
             nocache: no_cache,
             rm: true,
+            buildargs: build_args.clone(),
             ..Default::default()
         };
 
@@ -536,10 +538,11 @@ impl BollardRuntime {
 
     async fn list_containers_impl(
         &self,
-        label_filter: &str,
+        label_filters: &[String],
     ) -> Result<Vec<ContainerInfo>, DevError> {
+        let filter_refs: Vec<&str> = label_filters.iter().map(|s| s.as_str()).collect();
         let filters: HashMap<&str, Vec<&str>> =
-            HashMap::from([("label", vec![label_filter])]);
+            HashMap::from([("label", filter_refs)]);
         let opts = ListContainersOptions {
             all: true,
             filters,
@@ -644,13 +647,15 @@ impl ContainerRuntime for BollardRuntime {
         dockerfile: &str,
         context: &Path,
         tag: &str,
+        build_args: &HashMap<String, String>,
         no_cache: bool,
         verbose: bool,
     ) -> BoxFut<'_, ()> {
         let dockerfile = dockerfile.to_string();
         let context = context.to_path_buf();
         let tag = tag.to_string();
-        Box::pin(async move { self.build_image_impl(&dockerfile, &context, &tag, no_cache, verbose).await })
+        let build_args = build_args.clone();
+        Box::pin(async move { self.build_image_impl(&dockerfile, &context, &tag, &build_args, no_cache, verbose).await })
     }
 
     fn create_container(&self, config: &ContainerConfig) -> BoxFut<'_, String> {
@@ -692,9 +697,9 @@ impl ContainerRuntime for BollardRuntime {
         Box::pin(async move { self.inspect_container_impl(&id).await })
     }
 
-    fn list_containers(&self, label_filter: &str) -> BoxFut<'_, Vec<ContainerInfo>> {
-        let label_filter = label_filter.to_string();
-        Box::pin(async move { self.list_containers_impl(&label_filter).await })
+    fn list_containers(&self, label_filters: &[String]) -> BoxFut<'_, Vec<ContainerInfo>> {
+        let label_filters = label_filters.to_vec();
+        Box::pin(async move { self.list_containers_impl(&label_filters).await })
     }
 
     fn image_exists(&self, image: &str) -> BoxFut<'_, bool> {
@@ -752,10 +757,11 @@ impl ContainerRuntime for DockerRuntime {
         dockerfile: &str,
         context: &Path,
         tag: &str,
+        build_args: &HashMap<String, String>,
         no_cache: bool,
         verbose: bool,
     ) -> BoxFut<'_, ()> {
-        self.0.build_image(dockerfile, context, tag, no_cache, verbose)
+        self.0.build_image(dockerfile, context, tag, build_args, no_cache, verbose)
     }
 
     fn create_container(&self, config: &ContainerConfig) -> BoxFut<'_, String> {
@@ -786,8 +792,8 @@ impl ContainerRuntime for DockerRuntime {
         self.0.inspect_container(id)
     }
 
-    fn list_containers(&self, label_filter: &str) -> BoxFut<'_, Vec<ContainerInfo>> {
-        self.0.list_containers(label_filter)
+    fn list_containers(&self, label_filters: &[String]) -> BoxFut<'_, Vec<ContainerInfo>> {
+        self.0.list_containers(label_filters)
     }
 
     fn image_exists(&self, image: &str) -> BoxFut<'_, bool> {

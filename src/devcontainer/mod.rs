@@ -6,6 +6,7 @@ pub mod lockfile;
 pub mod merge;
 pub mod recipe;
 pub mod templates;
+pub mod uid;
 pub mod variables;
 
 pub use compose::compose_and_write;

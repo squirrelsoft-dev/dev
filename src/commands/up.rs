@@ -9,14 +9,16 @@ use crate::devcontainer::{
 };
 use crate::devcontainer::features::{generate_feature_dockerfile_with_opts, order_features};
 use crate::devcontainer::lockfile::{handle_lockfile, lockfile_path};
+use crate::devcontainer::uid;
 use crate::runtime::{
     BindMount, ContainerConfig, ContainerRuntime, ContainerState, PortMapping, WorkspaceMount,
     detect_runtime, resolve_remote_user,
 };
 use crate::util::{
-    container_name, find_config_source, workspace_folder_name, workspace_label, ConfigSource,
+    container_name, find_config_source, workspace_folder_name, workspace_labels, ConfigSource,
 };
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     workspace: &Path,
     runtime_override: Option<&str>,
@@ -25,6 +27,7 @@ pub async fn run(
     verbose: bool,
     frozen_lockfile: bool,
     buildkit: bool,
+    update_remote_user_uid_default: &str,
 ) -> anyhow::Result<()> {
     let runtime = detect_runtime(runtime_override).await?;
     let config_path = match find_config_source(workspace)? {
@@ -41,9 +44,21 @@ pub async fn run(
         run_initialize_command(init_cmd, workspace).await?;
     }
 
-    let (label_key, label_val) = workspace_label(workspace);
-    let filter = format!("{label_key}={label_val}");
-    let existing = runtime.list_containers(&filter).await?;
+    let labels_list = workspace_labels(workspace, Some(&config_path));
+    let filters: Vec<String> = labels_list.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let mut existing = runtime.list_containers(&filters).await?;
+
+    // Fallback: search by local_folder only for containers without config_file label.
+    // This matches the official CLI's two-step lookup for backward compatibility.
+    if existing.is_empty() && labels_list.len() > 1 {
+        let fallback_filter = vec![format!("{}={}", labels_list[0].0, labels_list[0].1)];
+        let fallback = runtime.list_containers(&fallback_filter).await?;
+        for container in fallback {
+            if !container.labels.contains_key("devcontainer.config_file") {
+                existing.push(container);
+            }
+        }
+    }
 
     // Handle existing container
     if let Some(container) = existing.first() {
@@ -81,7 +96,12 @@ pub async fn run(
     let initial_features = resolve_features(&config)?;
     let has_features = !initial_features.is_empty();
     let needs_build = config.build.is_some() || has_features;
-    let final_tag = format!("{}-features", container_name(workspace));
+    let folder_image = container_name(workspace);
+    let final_tag = if has_features {
+        format!("{folder_image}-features")
+    } else {
+        folder_image.clone()
+    };
 
     // Resolve the .devcontainer directory for local feature paths and lockfile.
     let devcontainer_dir: Option<PathBuf> = config_path.parent().map(|p| p.to_path_buf());
@@ -120,16 +140,15 @@ pub async fn run(
                 // No features — build directly with the final tag.
                 eprintln!("Building image from Dockerfile...");
                 runtime
-                    .build_image(&dockerfile_content, &context_dir, &final_tag, no_cache, verbose)
+                    .build_image(&dockerfile_content, &context_dir, &final_tag, &HashMap::new(), no_cache, verbose)
                     .await?;
                 final_tag.clone()
             } else {
-                let base_tag = format!("{final_tag}-base");
                 eprintln!("Building image from Dockerfile...");
                 runtime
-                    .build_image(&dockerfile_content, &context_dir, &base_tag, no_cache, verbose)
+                    .build_image(&dockerfile_content, &context_dir, &folder_image, &HashMap::new(), no_cache, verbose)
                     .await?;
-                base_tag
+                folder_image.clone()
             }
         } else {
             anyhow::bail!("devcontainer.json must specify either 'image' or 'build.dockerfile'");
@@ -185,7 +204,7 @@ pub async fn run(
             }
             eprintln!("Building features image...");
             let result = runtime
-                .build_image(&dockerfile, &staging_dir, &final_tag, no_cache, verbose)
+                .build_image(&dockerfile, &staging_dir, &final_tag, &HashMap::new(), no_cache, verbose)
                 .await;
             let _ = std::fs::remove_dir_all(&staging_dir);
             result?;
@@ -201,7 +220,9 @@ pub async fn run(
     let folder_name = workspace_folder_name(workspace);
 
     let mut labels = HashMap::new();
-    labels.insert(label_key, label_val);
+    for (k, v) in &labels_list {
+        labels.insert(k.clone(), v.clone());
+    }
 
     // Substitute devcontainer variables in env values
     let mut env = HashMap::new();
@@ -234,6 +255,24 @@ pub async fn run(
         config.remote_user.as_deref(),
     ).await?;
     let remote_user = effective_user.as_deref();
+
+    // Optionally build a UID-remapping layer to match host UID/GID.
+    let final_image = if uid::should_remap_uid(&config, remote_user, update_remote_user_uid_default) {
+        let image_meta = runtime.inspect_image_metadata(&final_image).await?;
+        let image_user = image_meta.container_user.as_deref().unwrap_or("root");
+        uid::build_uid_image(
+            runtime.as_ref(),
+            &final_image,
+            &folder_image,
+            remote_user.unwrap_or("root"),
+            image_user,
+            no_cache,
+            verbose,
+        ).await?
+    } else {
+        final_image
+    };
+
     let mounts: Vec<String> = config
         .mounts
         .as_deref()

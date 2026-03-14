@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::runtime::detect_runtime;
-use crate::util::{find_devcontainer_config, workspace_label};
+use crate::util::{find_devcontainer_config, workspace_labels};
 
 pub async fn run(
     workspace: &Path,
@@ -16,9 +16,9 @@ pub async fn run(
     }
 
     let runtime = detect_runtime(runtime_override).await?;
-    let (label_key, label_val) = workspace_label(workspace);
-    let filter = format!("{label_key}={label_val}");
-    let containers = runtime.list_containers(&filter).await?;
+    let labels = workspace_labels(workspace, None);
+    let filters: Vec<String> = labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let containers = runtime.list_containers(&filters).await?;
 
     if json {
         let items: Vec<serde_json::Value> = containers

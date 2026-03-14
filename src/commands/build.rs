@@ -6,9 +6,11 @@ use crate::devcontainer::{
 };
 use crate::devcontainer::features::{generate_feature_dockerfile_with_opts, order_features};
 use crate::devcontainer::lockfile::{handle_lockfile, lockfile_path};
+use crate::devcontainer::uid;
 use crate::runtime::{detect_runtime, resolve_remote_user};
 use crate::util::{container_name, find_config_source, ConfigSource};
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     workspace: &Path,
     runtime_override: Option<&str>,
@@ -17,6 +19,7 @@ pub async fn run(
     verbose: bool,
     frozen_lockfile: bool,
     buildkit: bool,
+    update_remote_user_uid_default: &str,
 ) -> anyhow::Result<()> {
     let runtime = detect_runtime(runtime_override).await?;
     let config_path = match find_config_source(workspace)? {
@@ -28,7 +31,14 @@ pub async fn run(
     };
     let config = DevcontainerConfig::from_path(&config_path)?;
 
-    let default_tag = format!("{}-features", container_name(workspace));
+    let folder_image = container_name(workspace);
+    let features = resolve_features(&config)?;
+    let has_features = !features.is_empty();
+    let default_tag = if has_features {
+        format!("{folder_image}-features")
+    } else {
+        folder_image.clone()
+    };
     let final_tag = tag.unwrap_or(&default_tag);
     let devcontainer_dir = config_path.parent().map(|p| p.to_path_buf());
 
@@ -48,21 +58,28 @@ pub async fn run(
             .join(&build.dockerfile);
         let dockerfile_content = std::fs::read_to_string(&dockerfile_path)?;
         eprintln!("Building image from Dockerfile...");
-        // If no features, build directly with the final tag
-        let mut features = resolve_features(&config)?;
-        if features.is_empty() {
+        if !has_features {
+            // No features — build directly with the final tag.
             runtime
-                .build_image(&dockerfile_content, &context_dir, final_tag, no_cache, verbose)
+                .build_image(&dockerfile_content, &context_dir, final_tag, &std::collections::HashMap::new(), no_cache, verbose)
                 .await?;
-            println!("{final_tag}");
+            let remote_user = resolve_remote_user(runtime.as_ref(), final_tag, config.remote_user.as_deref()).await?;
+            let output_tag = if uid::should_remap_uid(&config, remote_user.as_deref(), update_remote_user_uid_default) {
+                let meta = runtime.inspect_image_metadata(final_tag).await?;
+                let image_user = meta.container_user.as_deref().unwrap_or("root");
+                uid::build_uid_image(runtime.as_ref(), final_tag, &folder_image, remote_user.as_deref().unwrap_or("root"), image_user, no_cache, verbose).await?
+            } else {
+                final_tag.to_string()
+            };
+            println!("{output_tag}");
             return Ok(());
         }
-        // Otherwise build base with a temporary tag
-        let base_tag = format!("{final_tag}-base");
+        // Features present: tag the base Dockerfile build as the folder image.
         runtime
-            .build_image(&dockerfile_content, &context_dir, &base_tag, no_cache, verbose)
+            .build_image(&dockerfile_content, &context_dir, &folder_image, &std::collections::HashMap::new(), no_cache, verbose)
             .await?;
         // Fall through to feature layering below
+        let mut features = features;
         eprintln!("Downloading {} feature(s)...", features.len());
         download_features(&mut features, devcontainer_dir.as_deref()).await?;
 
@@ -74,29 +91,36 @@ pub async fn run(
         let staging_dir = stage_feature_context(&ordered)?;
         let feature_user = resolve_remote_user(
             runtime.as_ref(),
-            &base_tag,
+            &folder_image,
             config.remote_user.as_deref(),
         ).await?;
-        let dockerfile = generate_feature_dockerfile_with_opts(&base_tag, &ordered, feature_user.as_deref(), &config, buildkit);
+        let dockerfile = generate_feature_dockerfile_with_opts(&folder_image, &ordered, feature_user.as_deref(), &config, buildkit);
         eprintln!("Building features image...");
         let result = runtime
-            .build_image(&dockerfile, &staging_dir, final_tag, no_cache, verbose)
+            .build_image(&dockerfile, &staging_dir, final_tag, &std::collections::HashMap::new(), no_cache, verbose)
             .await;
         let _ = std::fs::remove_dir_all(&staging_dir);
         result?;
-        println!("{final_tag}");
+        let output_tag = if uid::should_remap_uid(&config, feature_user.as_deref(), update_remote_user_uid_default) {
+            let meta = runtime.inspect_image_metadata(final_tag).await?;
+            let image_user = meta.container_user.as_deref().unwrap_or("root");
+            uid::build_uid_image(runtime.as_ref(), final_tag, &folder_image, feature_user.as_deref().unwrap_or("root"), image_user, no_cache, verbose).await?
+        } else {
+            final_tag.to_string()
+        };
+        println!("{output_tag}");
         return Ok(());
     } else {
         anyhow::bail!("devcontainer.json must specify either 'image' or 'build.dockerfile'");
     };
 
     // Image-based config with features
-    let mut features = resolve_features(&config)?;
-    if features.is_empty() {
+    if !has_features {
         println!("{base_image}");
         return Ok(());
     }
 
+    let mut features = features;
     eprintln!("Downloading {} feature(s)...", features.len());
     download_features(&mut features, devcontainer_dir.as_deref()).await?;
 
@@ -114,11 +138,18 @@ pub async fn run(
     let dockerfile = generate_feature_dockerfile_with_opts(&base_image, &ordered, feature_user.as_deref(), &config, buildkit);
     eprintln!("Building features image...");
     let result = runtime
-        .build_image(&dockerfile, &staging_dir, final_tag, no_cache, verbose)
+        .build_image(&dockerfile, &staging_dir, final_tag, &std::collections::HashMap::new(), no_cache, verbose)
         .await;
     let _ = std::fs::remove_dir_all(&staging_dir);
     result?;
 
-    println!("{final_tag}");
+    let output_tag = if uid::should_remap_uid(&config, feature_user.as_deref(), update_remote_user_uid_default) {
+        let meta = runtime.inspect_image_metadata(final_tag).await?;
+        let image_user = meta.container_user.as_deref().unwrap_or("root");
+        uid::build_uid_image(runtime.as_ref(), final_tag, &folder_image, feature_user.as_deref().unwrap_or("root"), image_user, no_cache, verbose).await?
+    } else {
+        final_tag.to_string()
+    };
+    println!("{output_tag}");
     Ok(())
 }

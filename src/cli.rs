@@ -53,6 +53,10 @@ pub enum Command {
         /// Use BuildKit-optimized feature installation
         #[arg(long)]
         buildkit: bool,
+
+        /// Default policy for updating the remote user's UID/GID to match the host
+        #[arg(long, value_parser = ["never", "on", "off"], default_value = "on")]
+        update_remote_user_uid_default: String,
     },
 
     /// Start devcontainer for current directory
@@ -72,6 +76,10 @@ pub enum Command {
         /// Use BuildKit-optimized feature installation
         #[arg(long)]
         buildkit: bool,
+
+        /// Default policy for updating the remote user's UID/GID to match the host
+        #[arg(long, value_parser = ["never", "on", "off"], default_value = "on")]
+        update_remote_user_uid_default: String,
     },
 
     /// Stop (optionally remove) container

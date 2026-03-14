@@ -67,10 +67,11 @@ impl ContainerRuntime for PodmanRuntime {
         dockerfile: &str,
         context: &Path,
         tag: &str,
+        build_args: &std::collections::HashMap<String, String>,
         no_cache: bool,
         verbose: bool,
     ) -> BoxFut<'_, ()> {
-        self.0.build_image(dockerfile, context, tag, no_cache, verbose)
+        self.0.build_image(dockerfile, context, tag, build_args, no_cache, verbose)
     }
 
     fn create_container(&self, config: &ContainerConfig) -> BoxFut<'_, String> {
@@ -120,8 +121,8 @@ impl ContainerRuntime for PodmanRuntime {
         self.0.inspect_container(id)
     }
 
-    fn list_containers(&self, label_filter: &str) -> BoxFut<'_, Vec<ContainerInfo>> {
-        self.0.list_containers(label_filter)
+    fn list_containers(&self, label_filters: &[String]) -> BoxFut<'_, Vec<ContainerInfo>> {
+        self.0.list_containers(label_filters)
     }
 
     fn image_exists(&self, image: &str) -> BoxFut<'_, bool> {

@@ -45,6 +45,9 @@ pub struct DevcontainerConfig {
     pub post_attach_command: Option<LifecycleCommand>,
     pub initialize_command: Option<LifecycleCommand>,
     pub customize: Option<serde_json::Value>,
+    /// Whether to update the remote user's UID/GID to match the host user.
+    #[serde(rename = "updateRemoteUserUID")]
+    pub update_remote_user_uid: Option<bool>,
     /// Dotfiles configuration for cloning a user's dotfiles repo into the container.
     pub dotfiles: Option<DotfilesConfig>,
 }
