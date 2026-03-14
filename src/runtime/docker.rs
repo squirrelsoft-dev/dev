@@ -173,23 +173,51 @@ impl BollardRuntime {
             .finish()
             .map_err(|e| DevError::BuildFailed(format!("Failed to compress context: {e}")))?;
 
+        // When the Dockerfile uses a BuildKit syntax directive (e.g.
+        // `# syntax=docker/dockerfile:1`), request the BuildKit builder.
+        // Bollard defaults to BuilderV1 which explicitly forces the legacy
+        // builder—even on Docker 23+ where BuildKit is otherwise the
+        // default—and the legacy builder cannot handle RUN --mount.
+        let version = if dockerfile.starts_with("# syntax=") {
+            bollard::image::BuilderVersion::BuilderBuildKit
+        } else {
+            bollard::image::BuilderVersion::BuilderV1
+        };
+
         let opts = BuildImageOptions {
             dockerfile: "Dockerfile".to_string(),
             t: tag.to_string(),
             nocache: no_cache,
             rm: true,
             buildargs: build_args.clone(),
+            version,
             ..Default::default()
         };
+
+        let is_buildkit = version == bollard::image::BuilderVersion::BuilderBuildKit;
 
         // Pass an empty credentials map instead of None. When None is passed,
         // bollard sends an empty X-Registry-Config header value which Podman
         // rejects as invalid JSON.
         let mut stream = self.client.build_image(opts, Some(HashMap::new()), Some(compressed.into()));
         while let Some(result) = stream.next().await {
-            let info = result.map_err(|e| {
-                DevError::BuildFailed(format!("Docker stream error: {e}"))
-            })?;
+            let info = match result {
+                Ok(info) => info,
+                Err(e) => {
+                    // BuildKit sends protobuf-encoded trace messages in the
+                    // `aux` field that bollard cannot deserialize (it expects
+                    // an ImageId struct, not a base64 string). These are
+                    // progress updates, not build output, so skip them.
+                    if is_buildkit {
+                        if let bollard::errors::Error::JsonDataError { .. }
+                            | bollard::errors::Error::JsonSerdeError { .. } = &e
+                        {
+                            continue;
+                        }
+                    }
+                    return Err(DevError::BuildFailed(format!("Docker stream error: {e}")));
+                }
+            };
             if verbose {
                 if let Some(ref stream_text) = info.stream {
                     eprint!("{stream_text}");
