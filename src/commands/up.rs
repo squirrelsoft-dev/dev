@@ -11,8 +11,8 @@ use crate::devcontainer::features::{generate_feature_dockerfile_with_opts, order
 use crate::devcontainer::lockfile::{handle_lockfile, lockfile_path};
 use crate::devcontainer::uid;
 use crate::runtime::{
-    BindMount, ContainerConfig, ContainerRuntime, ContainerState, PortMapping, WorkspaceMount,
-    detect_runtime, resolve_remote_user,
+    BindMount, ContainerConfig, ContainerRuntime, ContainerState, PortMapping, VolumeMount,
+    WorkspaceMount, detect_runtime, resolve_remote_user,
 };
 use crate::util::{
     container_name, find_config_source, workspace_folder_name, workspace_labels, ConfigSource,
@@ -281,6 +281,13 @@ pub async fn run(
         .map(|s| substitute_variables_with_user(s, workspace, remote_user))
         .collect();
 
+    let volumes = parse_volumes(
+        config
+            .volumes
+            .as_deref()
+            .unwrap_or(&[]),
+    );
+
     let extra_args: Vec<String> = config
         .run_args
         .as_deref()
@@ -298,6 +305,7 @@ pub async fn run(
         labels,
         env,
         mounts: parse_mounts(&mounts),
+        volumes,
         ports,
         workspace_mount: Some(WorkspaceMount {
             source: workspace.to_path_buf(),
@@ -498,4 +506,26 @@ fn parse_single_mount(s: &str) -> Option<BindMount> {
         }),
         _ => None,
     }
+}
+
+/// Parse volume strings into `VolumeMount` structs.
+///
+/// Format: `volume-name:/container/path[:ro]`
+fn parse_volumes(volume_strings: &[String]) -> Vec<VolumeMount> {
+    let mut volumes = Vec::new();
+    for s in volume_strings {
+        let s = s.trim();
+        let parts: Vec<&str> = s.split(':').collect();
+        if parts.len() >= 2 {
+            let readonly = parts.get(2).is_some_and(|&p| p == "ro");
+            volumes.push(VolumeMount {
+                name: parts[0].to_string(),
+                target: parts[1].to_string(),
+                readonly,
+            });
+        } else {
+            eprintln!("Warning: could not parse volume string (expected name:/path[:ro]): {s}");
+        }
+    }
+    volumes
 }

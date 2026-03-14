@@ -129,6 +129,7 @@ mod tests {
             remote_env: None,
             container_env: None,
             mounts: None,
+            volumes: None,
             run_args: None,
             on_create_command: None,
             update_content_command: None,

@@ -26,6 +26,7 @@ pub struct ContainerConfig {
     pub labels: HashMap<String, String>,
     pub env: HashMap<String, String>,
     pub mounts: Vec<BindMount>,
+    pub volumes: Vec<VolumeMount>,
     pub ports: Vec<PortMapping>,
     pub workspace_mount: Option<WorkspaceMount>,
     #[allow(dead_code)]
@@ -44,6 +45,14 @@ pub struct ContainerConfig {
 #[derive(Debug, Clone)]
 pub struct BindMount {
     pub source: PathBuf,
+    pub target: String,
+    pub readonly: bool,
+}
+
+/// A named Docker volume mounted into the container.
+#[derive(Debug, Clone)]
+pub struct VolumeMount {
+    pub name: String,
     pub target: String,
     pub readonly: bool,
 }

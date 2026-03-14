@@ -37,6 +37,9 @@ pub struct DevcontainerConfig {
     pub remote_env: Option<HashMap<String, String>>,
     pub container_env: Option<HashMap<String, String>>,
     pub mounts: Option<Vec<String>>,
+    /// Named Docker volumes to mount into the container.
+    /// Format: `"volume-name:/container/path"` or `"volume-name:/container/path:ro"`
+    pub volumes: Option<Vec<String>>,
     pub run_args: Option<Vec<String>>,
     pub on_create_command: Option<LifecycleCommand>,
     pub update_content_command: Option<LifecycleCommand>,

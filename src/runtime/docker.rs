@@ -216,6 +216,10 @@ impl BollardRuntime {
             let ro = if m.readonly { ":ro" } else { "" };
             binds.push(format!("{}:{}{ro}", m.source.display(), m.target));
         }
+        for v in &config.volumes {
+            let ro = if v.readonly { ":ro" } else { "" };
+            binds.push(format!("{}:{}{ro}", v.name, v.target));
+        }
         if let Some(ws) = &config.workspace_mount {
             binds.push(format!("{}:{}", ws.source.display(), ws.target));
         }
