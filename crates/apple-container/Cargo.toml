@@ -5,7 +5,6 @@ edition = "2024"
 description = "Rust client for Apple Containers via XPC"
 license = "MIT"
 repository = "https://github.com/squirrelsoft-dev/dev"
-publish = false
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
