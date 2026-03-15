@@ -5,6 +5,7 @@ A devcontainer management CLI built in Rust. Create, build, run, and manage [dev
 ## Features
 
 - **Multiple container runtimes** — Docker, Podman, and Apple Containers (macOS native via XPC)
+- **Docker Compose support** — full lifecycle for `dockerComposeFile`-based configs (build, up, down, shell, features, UID remapping)
 - **Template system** — scaffold `.devcontainer/` configs from the devcontainer template registry or saved global templates
 - **Feature support** — browse, install, and manage devcontainer features with OCI registry integration
 - **BuildKit support** — optional BuildKit-optimized image builds

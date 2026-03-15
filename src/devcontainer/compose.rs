@@ -55,14 +55,13 @@ pub fn compose_config(recipe: &Recipe, runtime_name: &str) -> anyhow::Result<Val
     let global_config_path = global_dir()
         .join(&recipe.global_template)
         .join(".devcontainer/devcontainer.json");
-    let mut global = read_json_file(&global_config_path)?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Global template '{}' not found at {}",
-                recipe.global_template,
-                global_config_path.display()
-            )
-        })?;
+    let mut global = read_json_file(&global_config_path)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Global template '{}' not found at {}",
+            recipe.global_template,
+            global_config_path.display()
+        )
+    })?;
 
     // Apply template option substitutions to the global template
     if !recipe.options.is_empty() {
@@ -110,6 +109,8 @@ pub fn compose_config(recipe: &Recipe, runtime_name: &str) -> anyhow::Result<Val
 }
 
 /// Compose the config and write it to the project's `.devcontainer/devcontainer.json`.
+/// Also copies auxiliary files (Dockerfiles, compose files, scripts) from the
+/// global template directory so that relative paths in the config resolve correctly.
 /// Returns the path to the written file.
 pub fn compose_and_write(recipe: &Recipe, runtime_name: &str) -> anyhow::Result<PathBuf> {
     let composed = compose_config(recipe, runtime_name)?;
@@ -124,11 +125,57 @@ pub fn compose_and_write(recipe: &Recipe, runtime_name: &str) -> anyhow::Result<
         .join(".devcontainer");
     fs::create_dir_all(&dest_dir)?;
 
+    // Copy auxiliary files (Dockerfiles, compose files, etc.) from the global template.
+    let global_devcontainer_dir = global_dir()
+        .join(&recipe.global_template)
+        .join(".devcontainer");
+    copy_auxiliary_files(&global_devcontainer_dir, &dest_dir, &recipe.options)?;
+
     let dest_path = dest_dir.join("devcontainer.json");
     let formatted = serde_json::to_string_pretty(&composed)?;
     fs::write(&dest_path, &formatted)?;
 
     Ok(dest_path)
+}
+
+/// Copy non-config files from a global template's `.devcontainer/` directory to
+/// the destination directory, applying `${templateOption:...}` substitutions to
+/// text files. Skips `devcontainer.json` and `devcontainer-template.json` since
+/// those are handled by the composition pipeline.
+fn copy_auxiliary_files(
+    src_dir: &Path,
+    dest_dir: &Path,
+    options: &HashMap<String, String>,
+) -> anyhow::Result<()> {
+    if !src_dir.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(src_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str == "devcontainer.json" || name_str == "devcontainer-template.json" {
+            continue;
+        }
+        let src_path = entry.path();
+        let dest_path = dest_dir.join(&name);
+        if src_path.is_dir() {
+            fs::create_dir_all(&dest_path)?;
+            copy_auxiliary_files(&src_path, &dest_path, options)?;
+        } else {
+            match fs::read_to_string(&src_path) {
+                Ok(content) => {
+                    let substituted =
+                        crate::devcontainer::templates::substitute_options(&content, options);
+                    fs::write(&dest_path, substituted)?;
+                }
+                Err(_) => {
+                    fs::copy(&src_path, &dest_path)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

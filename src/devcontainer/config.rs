@@ -23,6 +23,24 @@ pub struct BuildConfig {
     pub args: Option<HashMap<String, String>>,
 }
 
+/// The `dockerComposeFile` field can be a single path or an array of paths.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum DockerComposeFile {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+impl DockerComposeFile {
+    /// Return all compose file paths as a Vec.
+    pub fn files(&self) -> Vec<&str> {
+        match self {
+            DockerComposeFile::Single(s) => vec![s.as_str()],
+            DockerComposeFile::Multiple(v) => v.iter().map(|s| s.as_str()).collect(),
+        }
+    }
+}
+
 /// Parsed devcontainer.json configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -31,6 +49,9 @@ pub struct DevcontainerConfig {
     pub name: Option<String>,
     pub image: Option<String>,
     pub build: Option<BuildConfig>,
+    pub docker_compose_file: Option<DockerComposeFile>,
+    pub service: Option<String>,
+    pub workspace_folder: Option<String>,
     pub features: Option<HashMap<String, serde_json::Value>>,
     pub forward_ports: Option<Vec<u16>>,
     pub remote_user: Option<String>,
@@ -79,5 +100,10 @@ impl DevcontainerConfig {
         let stripped = json_comments::StripComments::new(raw.as_bytes());
         let config: DevcontainerConfig = serde_json::from_reader(stripped)?;
         Ok(config)
+    }
+
+    /// Returns true if this config uses Docker Compose rather than image/Dockerfile.
+    pub fn is_compose(&self) -> bool {
+        self.docker_compose_file.is_some()
     }
 }

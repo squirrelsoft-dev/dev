@@ -52,7 +52,7 @@ fn copy_and_substitute(
 }
 
 /// Replace all `${templateOption:optionId}` placeholders in the text.
-fn substitute_options(text: &str, options: &HashMap<String, String>) -> String {
+pub(crate) fn substitute_options(text: &str, options: &HashMap<String, String>) -> String {
     let mut result = text.to_string();
     for (key, value) in options {
         let placeholder = format!("${{templateOption:{key}}}");

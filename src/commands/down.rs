@@ -1,7 +1,8 @@
 use std::path::Path;
 
+use crate::devcontainer::DevcontainerConfig;
 use crate::runtime::{ContainerState, detect_runtime};
-use crate::util::workspace_labels;
+use crate::util::{container_name, find_devcontainer_config, workspace_labels};
 
 pub async fn run(
     workspace: &Path,
@@ -9,6 +10,20 @@ pub async fn run(
     remove: bool,
 ) -> anyhow::Result<()> {
     let runtime = detect_runtime(runtime_override).await?;
+
+    // Try compose-aware teardown first.
+    if let Ok(config_path) = find_devcontainer_config(workspace) {
+        if let Ok(config) = DevcontainerConfig::from_path(&config_path) {
+            if config.is_compose() {
+                return run_compose_down(
+                    workspace, &config, &config_path,
+                    runtime.runtime_name(), remove,
+                ).await;
+            }
+        }
+    }
+
+    // Non-compose: label-based container stop/remove.
     let labels = workspace_labels(workspace, None);
     let filters: Vec<String> = labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
     let containers = runtime.list_containers(&filters).await?;
@@ -31,6 +46,36 @@ pub async fn run(
         } else {
             println!("Container '{}' stopped.", container.name);
         }
+    }
+
+    Ok(())
+}
+
+/// Tear down a Docker Compose-based workspace.
+async fn run_compose_down(
+    workspace: &Path,
+    config: &DevcontainerConfig,
+    config_path: &Path,
+    runtime_name: &str,
+    remove: bool,
+) -> anyhow::Result<()> {
+    let compose_data = config.docker_compose_file.as_ref().unwrap();
+    let compose_files = compose_data.files();
+    let devcontainer_dir = config_path.parent().unwrap();
+    let project_name = container_name(workspace);
+
+    if remove {
+        eprintln!("Removing compose services...");
+        crate::runtime::compose::compose_down(
+            runtime_name, &compose_files, devcontainer_dir, &project_name,
+        ).await?;
+        println!("Compose services removed.");
+    } else {
+        eprintln!("Stopping compose services...");
+        crate::runtime::compose::compose_stop(
+            runtime_name, &compose_files, devcontainer_dir, &project_name,
+        ).await?;
+        println!("Compose services stopped.");
     }
 
     Ok(())

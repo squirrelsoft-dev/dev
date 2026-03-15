@@ -39,6 +39,15 @@ pub async fn run(
     };
     let config = DevcontainerConfig::from_path(&config_path)?;
 
+    // Docker Compose configs take a completely separate code path.
+    if config.is_compose() {
+        return run_compose(
+            workspace, &config, &config_path, runtime.as_ref(),
+            rebuild, no_cache, verbose, frozen_lockfile, buildkit,
+            update_remote_user_uid_default,
+        ).await;
+    }
+
     // Run initializeCommand on the host before anything else (Gap 9).
     if let Some(ref init_cmd) = config.initialize_command {
         run_initialize_command(init_cmd, workspace).await?;
@@ -112,7 +121,7 @@ pub async fn run(
     let final_image = if !needs_build {
         // Image-based config with no features — use the remote image directly.
         let image = config.image.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("devcontainer.json must specify either 'image' or 'build.dockerfile'"))?;
+            .ok_or_else(|| anyhow::anyhow!("devcontainer.json must specify 'image', 'build.dockerfile', or 'dockerComposeFile'"))?;
         eprintln!("Pulling image '{image}'...");
         runtime.pull_image(image).await?;
         image.clone()
@@ -151,7 +160,7 @@ pub async fn run(
                 folder_image.clone()
             }
         } else {
-            anyhow::bail!("devcontainer.json must specify either 'image' or 'build.dockerfile'");
+            anyhow::bail!("devcontainer.json must specify 'image', 'build.dockerfile', or 'dockerComposeFile'");
         };
 
         // Handle features
@@ -441,6 +450,272 @@ async fn install_dotfiles(
         }
     }
 
+    Ok(())
+}
+
+/// Handle a Docker Compose-based devcontainer config.
+///
+/// Full pipeline: build the service, layer features on top, UID-remap,
+/// generate a compose override injecting labels/env/mounts/ports/image,
+/// start services, run lifecycle hooks, install dotfiles.
+#[allow(clippy::too_many_arguments)]
+async fn run_compose(
+    workspace: &Path,
+    config: &DevcontainerConfig,
+    config_path: &Path,
+    runtime: &dyn ContainerRuntime,
+    _rebuild: bool,
+    no_cache: bool,
+    verbose: bool,
+    frozen_lockfile: bool,
+    buildkit: bool,
+    update_remote_user_uid_default: &str,
+) -> anyhow::Result<()> {
+    let compose_data = config.docker_compose_file.as_ref().unwrap();
+    let compose_files = compose_data.files();
+    let devcontainer_dir = config_path.parent().unwrap();
+    let devcontainer_dir_buf: Option<PathBuf> = Some(devcontainer_dir.to_path_buf());
+    let service = config.service.as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Docker Compose config must specify 'service'"))?;
+    let project_name = container_name(workspace);
+    let folder_image = container_name(workspace);
+    let runtime_name = runtime.runtime_name();
+
+    // Workspace-related env vars for Docker Compose variable interpolation.
+    // Compose files use ${localWorkspaceFolder}, ${localWorkspaceFolderBasename},
+    // etc. in volume paths and other settings. These must be set as process env
+    // vars so `docker compose` resolves them when parsing the compose file.
+    let folder_name = workspace_folder_name(workspace);
+    let workspace_source = workspace.canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    let workspace_target = substitute_variables(
+        config.workspace_folder.as_deref()
+            .unwrap_or(&format!("/workspaces/{folder_name}")),
+        workspace,
+    );
+    let mut compose_env = HashMap::new();
+    compose_env.insert(
+        "localWorkspaceFolder".to_string(),
+        workspace_source.to_string_lossy().to_string(),
+    );
+    compose_env.insert(
+        "localWorkspaceFolderBasename".to_string(),
+        folder_name.clone(),
+    );
+    compose_env.insert(
+        "containerWorkspaceFolder".to_string(),
+        workspace_target.clone(),
+    );
+
+    // 1. initializeCommand
+    if let Some(ref init_cmd) = config.initialize_command {
+        run_initialize_command(init_cmd, workspace).await?;
+    }
+
+    // 2. Always build the service (features need the base image).
+    eprintln!("Building compose services...");
+    crate::runtime::compose::compose_build(
+        runtime_name, &compose_files, devcontainer_dir,
+        Some(service), no_cache, verbose, &compose_env,
+    ).await?;
+
+    // 3. Get the built service image name.
+    let base_image = crate::runtime::compose::compose_service_image(
+        runtime_name, &compose_files, devcontainer_dir,
+        &project_name, service, &compose_env,
+    ).await?;
+    if verbose {
+        eprintln!("Service image: {base_image}");
+    }
+
+    // 4. Feature pipeline.
+    let initial_features = resolve_features(config)?;
+    let has_features = !initial_features.is_empty();
+    let mut ordered_features = Vec::new();
+
+    let featured_image = if has_features {
+        let mut features = initial_features;
+        let original_count = features.len();
+        eprintln!("Downloading {} feature(s)...", original_count);
+        if verbose {
+            for f in &features {
+                eprintln!("  Feature: {} ({}:{})", f.id, f.oci_ref, f.version);
+            }
+        }
+        download_features(&mut features, devcontainer_dir_buf.as_deref()).await?;
+
+        if features.len() > original_count {
+            eprintln!(
+                "Resolved {} transitive dependencies",
+                features.len() - original_count
+            );
+        }
+
+        // Lockfile handling.
+        if let Some(ref dc_dir) = devcontainer_dir_buf {
+            let lf_path = lockfile_path(dc_dir);
+            handle_lockfile(&lf_path, &features, frozen_lockfile)?;
+        }
+
+        let ordered = order_features(&features);
+        if verbose {
+            eprintln!("Feature install order:");
+            for (i, f) in ordered.iter().enumerate() {
+                eprintln!("  {}: {}{}", i + 1, f.id, if f.is_dependency { " (dependency)" } else { "" });
+            }
+        }
+
+        let staging_dir = stage_feature_context(&ordered)?;
+        let feature_user = resolve_remote_user(
+            runtime, &base_image, config.remote_user.as_deref(),
+        ).await?;
+        let feature_tag = format!("{folder_image}-features");
+        let dockerfile = generate_feature_dockerfile_with_opts(
+            &base_image, &ordered, feature_user.as_deref(), config, buildkit,
+        );
+        if verbose {
+            eprintln!("Features Dockerfile:\n{dockerfile}");
+        }
+        eprintln!("Building features image...");
+        let result = runtime
+            .build_image(&dockerfile, &staging_dir, &feature_tag, &HashMap::new(), no_cache, verbose)
+            .await;
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        result.map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        ordered_features = ordered;
+        feature_tag
+    } else {
+        base_image.clone()
+    };
+
+    // 5. Resolve remote user from the final image.
+    let effective_user = resolve_remote_user(
+        runtime, &featured_image, config.remote_user.as_deref(),
+    ).await?;
+    let remote_user = effective_user.as_deref();
+
+    // 6. UID remapping.
+    let final_image = if uid::should_remap_uid(config, remote_user, update_remote_user_uid_default) {
+        let image_meta = runtime.inspect_image_metadata(&featured_image).await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let image_user = image_meta.container_user.as_deref().unwrap_or("root");
+        uid::build_uid_image(
+            runtime, &featured_image, &folder_image,
+            remote_user.unwrap_or("root"), image_user,
+            no_cache, verbose,
+        ).await?
+    } else {
+        featured_image
+    };
+
+    let image_override = if final_image != base_image {
+        Some(final_image.as_str())
+    } else {
+        None
+    };
+
+    // 7. Variable substitution on env, mounts, volumes.
+    let mut env = HashMap::new();
+    if let Some(ref container_env) = config.container_env {
+        for (k, v) in container_env {
+            env.insert(k.clone(), substitute_variables_with_user(v, workspace, remote_user));
+        }
+    }
+    if let Some(ref remote_env) = config.remote_env {
+        for (k, v) in remote_env {
+            env.insert(k.clone(), substitute_variables_with_user(v, workspace, remote_user));
+        }
+    }
+
+    let mounts: Vec<String> = config
+        .mounts.as_deref().unwrap_or(&[])
+        .iter()
+        .map(|s| substitute_variables_with_user(s, workspace, remote_user))
+        .collect();
+
+    let volume_strings: Vec<String> = config
+        .volumes.as_deref().unwrap_or(&[])
+        .iter()
+        .map(|s| substitute_variables_with_user(s, workspace, remote_user))
+        .collect();
+
+    let ports: Vec<u16> = config
+        .forward_ports.as_deref().unwrap_or(&[])
+        .to_vec();
+
+    // 8. Labels + merged feature capabilities.
+    let labels_list = workspace_labels(workspace, Some(config_path));
+    let caps = merge_feature_capabilities(&ordered_features);
+
+    // 9. Generate and write compose override file.
+    let override_content = crate::runtime::compose::generate_compose_override(
+        service, &labels_list, &env, &mounts, &volume_strings,
+        &ports, image_override, &caps,
+    );
+    let override_path = crate::runtime::compose::write_override_file(&override_content)?;
+    let override_path_str = override_path.to_string_lossy().to_string();
+    if verbose {
+        eprintln!("Compose override:\n{override_content}");
+    }
+
+    // 10. Rewrite compose file volume sources so `..` resolves to the actual
+    //     workspace instead of ~/.dev/devcontainers/. Use rewritten files for
+    //     compose_up (not compose_build, which needs original paths for Dockerfiles).
+    let mut rewritten_paths = Vec::new();
+    let mut up_files: Vec<String> = Vec::new();
+    for f in &compose_files {
+        let compose_path = if Path::new(f).is_absolute() {
+            PathBuf::from(f)
+        } else {
+            devcontainer_dir.join(f)
+        };
+        match crate::runtime::compose::rewrite_compose_volumes(&compose_path, workspace) {
+            Ok(rewritten) => {
+                up_files.push(rewritten.to_string_lossy().to_string());
+                rewritten_paths.push(rewritten);
+            }
+            Err(_) => {
+                // Fall back to original if rewrite fails.
+                up_files.push(compose_path.to_string_lossy().to_string());
+            }
+        }
+    }
+    up_files.push(override_path_str.clone());
+    let up_file_refs: Vec<&str> = up_files.iter().map(|s| s.as_str()).collect();
+
+    eprintln!("Starting compose services...");
+    crate::runtime::compose::compose_up(
+        runtime_name, &up_file_refs, devcontainer_dir,
+        &project_name, &compose_env, verbose,
+    ).await?;
+
+    // 11. Get container ID.
+    let container_id = crate::runtime::compose::compose_container_id(
+        runtime_name, &up_file_refs, devcontainer_dir,
+        &project_name, service,
+    ).await?;
+
+    // 12. Run lifecycle hooks with feature hooks and correct remote_user.
+    let feature_hooks = if ordered_features.is_empty() {
+        None
+    } else {
+        Some(ordered_features.as_slice())
+    };
+    run_lifecycle_hooks(runtime, &container_id, config, remote_user, feature_hooks).await?;
+
+    // 13. Install dotfiles.
+    if let Some(ref dotfiles) = config.dotfiles {
+        install_dotfiles(runtime, &container_id, dotfiles, remote_user).await?;
+    }
+
+    // Cleanup temp files.
+    let _ = std::fs::remove_file(&override_path);
+    for p in &rewritten_paths {
+        let _ = std::fs::remove_file(p);
+    }
+
+    println!("Compose service '{service}' is ready (container {}).", &container_id[..12.min(container_id.len())]);
     Ok(())
 }
 

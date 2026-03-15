@@ -8,7 +8,8 @@ use crate::devcontainer::features::{generate_feature_dockerfile_with_opts, order
 use crate::devcontainer::lockfile::{handle_lockfile, lockfile_path};
 use crate::devcontainer::uid;
 use crate::runtime::{detect_runtime, resolve_remote_user};
-use crate::util::{container_name, find_config_source, ConfigSource};
+use crate::devcontainer::substitute_variables;
+use crate::util::{container_name, find_config_source, workspace_folder_name, ConfigSource};
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -110,8 +111,91 @@ pub async fn run(
         };
         println!("{output_tag}");
         return Ok(());
+    } else if config.is_compose() {
+        let compose_data = config.docker_compose_file.as_ref().unwrap();
+        let compose_files = compose_data.files();
+        let compose_devcontainer_dir = config_path.parent().unwrap();
+        let service = config.service.as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Docker Compose config must specify 'service'"))?;
+        let project_name = container_name(workspace);
+
+        // Workspace env vars for Docker Compose variable interpolation.
+        let build_folder_name = workspace_folder_name(workspace);
+        let build_workspace_source = workspace.canonicalize()
+            .unwrap_or_else(|_| workspace.to_path_buf());
+        let build_workspace_target = substitute_variables(
+            config.workspace_folder.as_deref()
+                .unwrap_or(&format!("/workspaces/{build_folder_name}")),
+            workspace,
+        );
+        let mut compose_env = std::collections::HashMap::new();
+        compose_env.insert("localWorkspaceFolder".to_string(), build_workspace_source.to_string_lossy().to_string());
+        compose_env.insert("localWorkspaceFolderBasename".to_string(), build_folder_name);
+        compose_env.insert("containerWorkspaceFolder".to_string(), build_workspace_target);
+
+        eprintln!("Building compose services...");
+        crate::runtime::compose::compose_build(
+            runtime.runtime_name(),
+            &compose_files,
+            compose_devcontainer_dir,
+            Some(service),
+            no_cache,
+            verbose,
+            &compose_env,
+        ).await?;
+
+        if !has_features {
+            println!("compose:{service}");
+            return Ok(());
+        }
+
+        // Get the service image for feature layering.
+        let base_image = crate::runtime::compose::compose_service_image(
+            runtime.runtime_name(),
+            &compose_files,
+            compose_devcontainer_dir,
+            &project_name,
+            service,
+            &compose_env,
+        ).await?;
+
+        let feature_tag = format!("{folder_image}-features");
+        let compose_final_tag = tag.unwrap_or(&feature_tag);
+
+        let mut features = features;
+        eprintln!("Downloading {} feature(s)...", features.len());
+        download_features(&mut features, Some(compose_devcontainer_dir)).await?;
+
+        handle_lockfile(&lockfile_path(compose_devcontainer_dir), &features, frozen_lockfile)?;
+
+        let ordered = order_features(&features);
+        let staging_dir = stage_feature_context(&ordered)?;
+        let feature_user = resolve_remote_user(
+            runtime.as_ref(),
+            &base_image,
+            config.remote_user.as_deref(),
+        ).await?;
+        let dockerfile = generate_feature_dockerfile_with_opts(
+            &base_image, &ordered, feature_user.as_deref(), &config, buildkit,
+        );
+        eprintln!("Building features image...");
+        let result = runtime
+            .build_image(&dockerfile, &staging_dir, compose_final_tag, &std::collections::HashMap::new(), no_cache, verbose)
+            .await;
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        result?;
+
+        let output_tag = if uid::should_remap_uid(&config, feature_user.as_deref(), update_remote_user_uid_default) {
+            let meta = runtime.inspect_image_metadata(compose_final_tag).await?;
+            let image_user = meta.container_user.as_deref().unwrap_or("root");
+            uid::build_uid_image(runtime.as_ref(), compose_final_tag, &folder_image, feature_user.as_deref().unwrap_or("root"), image_user, no_cache, verbose).await?
+        } else {
+            compose_final_tag.to_string()
+        };
+        println!("{output_tag}");
+        return Ok(());
     } else {
-        anyhow::bail!("devcontainer.json must specify either 'image' or 'build.dockerfile'");
+        anyhow::bail!("devcontainer.json must specify 'image', 'build.dockerfile', or 'dockerComposeFile'");
     };
 
     // Image-based config with features

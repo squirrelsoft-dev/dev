@@ -1,5 +1,6 @@
 #[cfg(all(target_os = "macos", feature = "apple"))]
 pub mod apple;
+pub mod compose;
 pub mod docker;
 pub mod podman;
 
