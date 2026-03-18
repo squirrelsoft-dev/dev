@@ -658,9 +658,12 @@ pub fn generate_feature_dockerfile_with_opts(
     // Build and emit the devcontainer.metadata label (Gap 4).
     let metadata_label = build_metadata_label(features, config, remote_user);
     // Escape the JSON for use in a Dockerfile LABEL.
+    // Dollar signs must be doubled so Docker's builder treats them as literals
+    // rather than variable substitutions (e.g. ${localEnv:...} would fail).
     let escaped = metadata_label
         .replace('\\', "\\\\")
-        .replace('"', "\\\"");
+        .replace('"', "\\\"")
+        .replace('$', "$$");
     lines.push(format!("LABEL devcontainer.metadata=\"{escaped}\""));
 
     lines.join("\n")

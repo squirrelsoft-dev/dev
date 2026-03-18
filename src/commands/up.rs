@@ -235,6 +235,7 @@ pub async fn run(
 
     // Substitute devcontainer variables in env values
     let mut env = HashMap::new();
+    env.insert("REMOTE_CONTAINERS".to_string(), "true".to_string());
     if let Some(ref container_env) = config.container_env {
         for (k, v) in container_env {
             env.insert(k.clone(), substitute_variables(v, workspace));
@@ -617,6 +618,7 @@ async fn run_compose(
 
     // 7. Variable substitution on env, mounts, volumes.
     let mut env = HashMap::new();
+    env.insert("REMOTE_CONTAINERS".to_string(), "true".to_string());
     if let Some(ref container_env) = config.container_env {
         for (k, v) in container_env {
             env.insert(k.clone(), substitute_variables_with_user(v, workspace, remote_user));
