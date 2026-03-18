@@ -564,23 +564,15 @@ pub fn order_features(features: &[ResolvedFeature]) -> Vec<ResolvedFeature> {
 /// Gap 3 fix: `_REMOTE_USER_HOME` is resolved dynamically via `getent passwd`.
 /// Gap 4 fix: A `LABEL devcontainer.metadata` is appended with merged metadata.
 /// Gap 12 fix: Feature install scripts are wrapped with env sourcing and error context.
-/// Gap 16 fix: When `buildkit` is true, uses `RUN --mount=type=bind` for zero-copy install.
-/// Like [`generate_feature_dockerfile`] but with an option to enable BuildKit optimizations.
 pub fn generate_feature_dockerfile_with_opts(
     base_image: &str,
     features: &[ResolvedFeature],
     remote_user: Option<&str>,
     config: &DevcontainerConfig,
-    buildkit: bool,
 ) -> String {
     let user = remote_user.unwrap_or("root");
 
     let mut lines: Vec<String> = Vec::new();
-
-    // BuildKit syntax directive must be the very first line.
-    if buildkit {
-        lines.push("# syntax=docker/dockerfile:1".to_string());
-    }
 
     lines.push(format!("FROM {base_image}"));
 
@@ -633,26 +625,17 @@ pub fn generate_feature_dockerfile_with_opts(
             }
         }
 
-        if buildkit {
-            // Gap 16: Use BuildKit bind mount for zero-copy feature install.
-            // The feature files are bind-mounted from the build context directly,
-            // avoiding the ADD + extract overhead and reducing layer size.
-            lines.push(format!(
-                "RUN --mount=type=bind,source={i}.tar,target=/tmp/_dev_feature_{i}.tar \
-                 mkdir -p {stage_dir} && \
-                 tar xf /tmp/_dev_feature_{i}.tar -C {stage_dir} && \
-                 {wrapper}",
-                wrapper = feature_wrapper_script(&feature.id, &feature.version, &stage_dir),
-            ));
-        } else {
-            lines.push(format!("ADD {i}.tar {stage_dir}/"));
+        // Always use ADD to extract the feature tarball from the uploaded build
+        // context. RUN --mount=type=bind requires a BuildKit gRPC session server
+        // that Bollard does not start, causing "context not found" on Linux with
+        // older Docker Engine (Docker Desktop on Mac silently works around it).
+        lines.push(format!("ADD {i}.tar {stage_dir}/"));
 
-            // Gap 12: Wrapper script with env sourcing and error context.
-            lines.push(format!(
-                "RUN {wrapper}",
-                wrapper = feature_wrapper_script(&feature.id, &feature.version, &stage_dir),
-            ));
-        }
+        // Gap 12: Wrapper script with env sourcing and error context.
+        lines.push(format!(
+            "RUN {wrapper}",
+            wrapper = feature_wrapper_script(&feature.id, &feature.version, &stage_dir),
+        ));
     }
 
     // Build and emit the devcontainer.metadata label (Gap 4).

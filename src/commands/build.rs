@@ -19,7 +19,7 @@ pub async fn run(
     no_cache: bool,
     verbose: bool,
     frozen_lockfile: bool,
-    buildkit: bool,
+    _buildkit: bool,
     update_remote_user_uid_default: &str,
 ) -> anyhow::Result<()> {
     let runtime = detect_runtime(runtime_override).await?;
@@ -95,7 +95,7 @@ pub async fn run(
             &folder_image,
             config.remote_user.as_deref(),
         ).await?;
-        let dockerfile = generate_feature_dockerfile_with_opts(&folder_image, &ordered, feature_user.as_deref(), &config, buildkit);
+        let dockerfile = generate_feature_dockerfile_with_opts(&folder_image, &ordered, feature_user.as_deref(), &config);
         eprintln!("Building features image...");
         let result = runtime
             .build_image(&dockerfile, &staging_dir, final_tag, &std::collections::HashMap::new(), no_cache, verbose)
@@ -176,7 +176,7 @@ pub async fn run(
             config.remote_user.as_deref(),
         ).await?;
         let dockerfile = generate_feature_dockerfile_with_opts(
-            &base_image, &ordered, feature_user.as_deref(), &config, buildkit,
+            &base_image, &ordered, feature_user.as_deref(), &config,
         );
         eprintln!("Building features image...");
         let result = runtime
@@ -219,7 +219,7 @@ pub async fn run(
         &base_image,
         config.remote_user.as_deref(),
     ).await?;
-    let dockerfile = generate_feature_dockerfile_with_opts(&base_image, &ordered, feature_user.as_deref(), &config, buildkit);
+    let dockerfile = generate_feature_dockerfile_with_opts(&base_image, &ordered, feature_user.as_deref(), &config);
     eprintln!("Building features image...");
     let result = runtime
         .build_image(&dockerfile, &staging_dir, final_tag, &std::collections::HashMap::new(), no_cache, verbose)

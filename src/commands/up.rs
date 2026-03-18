@@ -26,7 +26,7 @@ pub async fn run(
     no_cache: bool,
     verbose: bool,
     frozen_lockfile: bool,
-    buildkit: bool,
+    _buildkit: bool,
     update_remote_user_uid_default: &str,
 ) -> anyhow::Result<()> {
     let runtime = detect_runtime(runtime_override).await?;
@@ -43,7 +43,7 @@ pub async fn run(
     if config.is_compose() {
         return run_compose(
             workspace, &config, &config_path, runtime.as_ref(),
-            rebuild, no_cache, verbose, frozen_lockfile, buildkit,
+            rebuild, no_cache, verbose, frozen_lockfile,
             update_remote_user_uid_default,
         ).await;
     }
@@ -206,7 +206,6 @@ pub async fn run(
                 &ordered,
                 feature_user.as_deref(),
                 &config,
-                buildkit,
             );
             if verbose {
                 eprintln!("Features Dockerfile:\n{dockerfile}");
@@ -469,7 +468,6 @@ async fn run_compose(
     no_cache: bool,
     verbose: bool,
     frozen_lockfile: bool,
-    buildkit: bool,
     update_remote_user_uid_default: &str,
 ) -> anyhow::Result<()> {
     let compose_data = config.docker_compose_file.as_ref().unwrap();
@@ -572,7 +570,7 @@ async fn run_compose(
         ).await?;
         let feature_tag = format!("{folder_image}-features");
         let dockerfile = generate_feature_dockerfile_with_opts(
-            &base_image, &ordered, feature_user.as_deref(), config, buildkit,
+            &base_image, &ordered, feature_user.as_deref(), config,
         );
         if verbose {
             eprintln!("Features Dockerfile:\n{dockerfile}");
