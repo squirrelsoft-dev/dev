@@ -7,7 +7,7 @@ use bollard::query_parameters::{
 use bollard::Docker;
 use std::collections::HashMap;
 use std::path::Path;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 use crate::error::DevError;
 use crate::runtime::{
@@ -491,20 +491,46 @@ impl BollardRuntime {
                 }
             });
 
-            // Spawn a task to forward stdin to the container, translating
-            // Shift+Enter escape sequences into a plain carriage return so they
-            // don't print garbage in shells that don't understand them.
-            let mut stdin_writer = input;
-            let stdin_handle = tokio::spawn(async move {
-                let mut stdin = tokio::io::stdin();
+            // Create a self-pipe so we can cancel the blocking stdin reader.
+            // Writing to cancel_writer causes the poll() in the reader to
+            // wake up and exit cleanly, avoiding a stuck blocking thread that
+            // would prevent the tokio runtime from shutting down.
+            let (cancel_reader, cancel_writer) = os_pipe::pipe()
+                .map_err(|e| DevError::Runtime(format!("pipe: {e}")))?;
+
+            // Channel to bridge blocking stdin reads → async container writes.
+            let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+
+            // Blocking stdin reader using poll() so it can be cancelled.
+            let stdin_reader_handle = std::thread::spawn(move || {
+                use std::os::fd::AsRawFd;
+                let stdin_fd = std::io::stdin().as_raw_fd();
+                let cancel_fd = cancel_reader.as_raw_fd();
                 let mut buf = [0u8; 1024];
                 loop {
-                    let n = match stdin.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => n,
-                    };
-                    let translated = translate_shift_enter(&buf[..n]);
-                    if stdin_writer.write_all(&translated).await.is_err() {
+                    let mut pfds = [
+                        libc::pollfd { fd: stdin_fd, events: libc::POLLIN, revents: 0 },
+                        libc::pollfd { fd: cancel_fd, events: libc::POLLIN, revents: 0 },
+                    ];
+                    let ready = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
+                    if ready < 0 { break; }
+                    if pfds[1].revents & libc::POLLIN != 0 { break; }
+                    if pfds[0].revents & libc::POLLIN != 0 {
+                        let n = unsafe {
+                            libc::read(stdin_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                        };
+                        if n <= 0 { break; }
+                        let data = translate_shift_enter(&buf[..n as usize]);
+                        if stdin_tx.blocking_send(data).is_err() { break; }
+                    }
+                }
+            });
+
+            // Async task that forwards channel data to the container stdin.
+            let mut stdin_writer = input;
+            let stdin_handle = tokio::spawn(async move {
+                while let Some(data) = stdin_rx.recv().await {
+                    if stdin_writer.write_all(&data).await.is_err() {
                         break;
                     }
                 }
@@ -512,25 +538,61 @@ impl BollardRuntime {
 
             // Forward container output to our stdout.
             // With TTY mode, stdout and stderr are multiplexed on the same stream.
-            let mut local_stdout = tokio::io::stdout();
-            while let Some(msg) = output.next().await {
-                match msg {
-                    Ok(bollard::container::LogOutput::StdOut { message }) => {
-                        let _ = local_stdout.write_all(&message).await;
-                        let _ = local_stdout.flush().await;
+            let output_handle = tokio::spawn(async move {
+                let mut local_stdout = tokio::io::stdout();
+                while let Some(msg) = output.next().await {
+                    match msg {
+                        Ok(bollard::container::LogOutput::StdOut { message }) => {
+                            let _ = local_stdout.write_all(&message).await;
+                            let _ = local_stdout.flush().await;
+                        }
+                        Ok(bollard::container::LogOutput::StdErr { message }) => {
+                            let _ = local_stdout.write_all(&message).await;
+                            let _ = local_stdout.flush().await;
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
                     }
-                    Ok(bollard::container::LogOutput::StdErr { message }) => {
-                        let _ = local_stdout.write_all(&message).await;
-                        let _ = local_stdout.flush().await;
-                    }
-                    Ok(_) => {}
-                    Err(_) => break,
                 }
+            });
+
+            // Poll the exec status so we detect when the shell exits even if
+            // the output stream stays open (Docker keeps the bidirectional
+            // connection alive while stdin is still attached).
+            let monitor_client = self.client.clone();
+            let monitor_exec_id = exec.id.clone();
+            let monitor_handle = tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    if let Ok(info) = monitor_client.inspect_exec(&monitor_exec_id).await {
+                        if info.running == Some(false) {
+                            break;
+                        }
+                    }
+                }
+            });
+
+            // Wait for any exit signal: output stream closing, exec process
+            // exiting, or stdin failing.
+            let stdin_abort = stdin_handle.abort_handle();
+            let output_abort = output_handle.abort_handle();
+            let monitor_abort = monitor_handle.abort_handle();
+            let sigwinch_abort = sigwinch_handle.abort_handle();
+
+            tokio::select! {
+                _ = output_handle => {}
+                _ = monitor_handle => {}
+                _ = stdin_handle => {}
             }
 
-            // Abort the stdin and signal forwarding tasks.
-            stdin_handle.abort();
-            sigwinch_handle.abort();
+            // Signal the blocking stdin reader to exit, then clean up.
+            drop(cancel_writer);
+            let _ = stdin_reader_handle.join();
+
+            stdin_abort.abort();
+            output_abort.abort();
+            monitor_abort.abort();
+            sigwinch_abort.abort();
         }
 
         // _raw_guard is dropped here, restoring the terminal.
