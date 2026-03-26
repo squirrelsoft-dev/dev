@@ -28,6 +28,7 @@ pub async fn run(
     frozen_lockfile: bool,
     _buildkit: bool,
     update_remote_user_uid_default: &str,
+    port_overrides: &[String],
 ) -> anyhow::Result<()> {
     let runtime = detect_runtime(runtime_override).await?;
     let config_path = match find_config_source(workspace)? {
@@ -44,7 +45,7 @@ pub async fn run(
         return run_compose(
             workspace, &config, &config_path, runtime.as_ref(),
             rebuild, no_cache, verbose, frozen_lockfile,
-            update_remote_user_uid_default,
+            update_remote_user_uid_default, port_overrides,
         ).await;
     }
 
@@ -69,14 +70,17 @@ pub async fn run(
         }
     }
 
-    // Handle existing container
+    // Handle existing container.
+    // Port bindings are fixed at container creation time, so when --ports
+    // is supplied we must recreate the container to apply the new mappings.
+    let has_port_overrides = !port_overrides.is_empty();
     if let Some(container) = existing.first() {
         match container.state {
-            ContainerState::Running if !rebuild => {
+            ContainerState::Running if !rebuild && !has_port_overrides => {
                 println!("Container '{}' is already running.", container.name);
                 return Ok(());
             }
-            ContainerState::Stopped if !rebuild => {
+            ContainerState::Stopped if !rebuild && !has_port_overrides => {
                 println!("Starting existing container '{}'...", container.name);
                 runtime.start_container(&container.id).await?;
                 if config.post_start_command.is_some() {
@@ -91,8 +95,13 @@ pub async fn run(
                 return Ok(());
             }
             _ => {
-                // Rebuild: remove existing
-                eprintln!("Removing existing container '{}'...", container.name);
+                // Rebuild or port override: remove existing
+                if has_port_overrides && !rebuild {
+                    eprintln!("Recreating container '{}' to apply port overrides...", container.name);
+                }
+                if rebuild {
+                    eprintln!("Removing existing container '{}'...", container.name);
+                }
                 if container.state == ContainerState::Running {
                     runtime.stop_container(&container.id).await?;
                 }
@@ -246,16 +255,20 @@ pub async fn run(
         }
     }
 
-    let ports: Vec<PortMapping> = config
-        .forward_ports
-        .as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .map(|&p| PortMapping {
-            host: p,
-            container: p,
-        })
-        .collect();
+    let ports: Vec<PortMapping> = if port_overrides.is_empty() {
+        config
+            .forward_ports
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|&p| PortMapping {
+                host: p,
+                container: p,
+            })
+            .collect()
+    } else {
+        parse_port_overrides(port_overrides)?
+    };
 
     // Resolve the effective remote user from config or image metadata.
     let effective_user = resolve_remote_user(
@@ -469,6 +482,7 @@ async fn run_compose(
     verbose: bool,
     frozen_lockfile: bool,
     update_remote_user_uid_default: &str,
+    port_overrides: &[String],
 ) -> anyhow::Result<()> {
     let compose_data = config.docker_compose_file.as_ref().unwrap();
     let compose_files = compose_data.files();
@@ -640,9 +654,20 @@ async fn run_compose(
         .map(|s| substitute_variables_with_user(s, workspace, remote_user))
         .collect();
 
-    let ports: Vec<u16> = config
-        .forward_ports.as_deref().unwrap_or(&[])
-        .to_vec();
+    let ports: Vec<PortMapping> = if port_overrides.is_empty() {
+        config
+            .forward_ports
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|&p| PortMapping {
+                host: p,
+                container: p,
+            })
+            .collect()
+    } else {
+        parse_port_overrides(port_overrides)?
+    };
 
     // 8. Labels + merged feature capabilities.
     let labels_list = workspace_labels(workspace, Some(config_path));
@@ -783,6 +808,39 @@ fn parse_single_mount(s: &str) -> Option<BindMount> {
         }),
         _ => None,
     }
+}
+
+/// Parse CLI `--ports` values into `PortMapping` structs.
+///
+/// Accepted formats:
+/// - `8080` — forward container port 8080 to host port 8080
+/// - `9090:8080` — forward container port 8080 to host port 9090
+fn parse_port_overrides(args: &[String]) -> anyhow::Result<Vec<PortMapping>> {
+    let mut mappings = Vec::new();
+    for arg in args {
+        let arg = arg.trim();
+        if arg.is_empty() {
+            continue;
+        }
+        if let Some((host_str, container_str)) = arg.split_once(':') {
+            let host: u16 = host_str
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid host port in '{arg}'"))?;
+            let container: u16 = container_str
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid container port in '{arg}'"))?;
+            mappings.push(PortMapping { host, container });
+        } else {
+            let port: u16 = arg
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid port '{arg}'"))?;
+            mappings.push(PortMapping {
+                host: port,
+                container: port,
+            });
+        }
+    }
+    Ok(mappings)
 }
 
 /// Parse volume strings into `VolumeMount` structs.

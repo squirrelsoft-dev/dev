@@ -325,7 +325,7 @@ pub fn generate_compose_override(
     env: &HashMap<String, String>,
     mounts: &[String],
     volumes: &[String],
-    ports: &[u16],
+    ports: &[super::PortMapping],
     image: Option<&str>,
     caps: &MergedCapabilities,
 ) -> String {
@@ -383,7 +383,7 @@ pub fn generate_compose_override(
     if !ports.is_empty() {
         let port_entries: Vec<serde_json::Value> = ports
             .iter()
-            .map(|p| json!(format!("{p}:{p}")))
+            .map(|p| json!(format!("{}:{}", p.host, p.container)))
             .collect();
         service_obj.insert("ports".into(), serde_json::Value::Array(port_entries));
     }
@@ -644,7 +644,8 @@ mod tests {
         };
 
         let yaml = generate_compose_override(
-            "web", &[], &HashMap::new(), &[], &[], &[3000],
+            "web", &[], &HashMap::new(), &[], &[],
+            &[crate::runtime::PortMapping { host: 3000, container: 3000 }],
             Some("myimage:featured"), &caps,
         );
         assert!(yaml.contains("myimage:featured"));
