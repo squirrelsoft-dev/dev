@@ -4,18 +4,18 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::devcontainer::jsonc::parse_jsonc;
 use crate::devcontainer::merge::merge_layers;
 use crate::devcontainer::recipe::Recipe;
 use crate::util::paths::{base_config_dir, global_dir, runtime_config_dir};
 
-/// Read a JSON file, stripping comments. Returns `None` if the file doesn't exist.
+/// Read a JSON file, stripping comments and trailing commas. Returns `None` if the file doesn't exist.
 fn read_json_file(path: &Path) -> anyhow::Result<Option<Value>> {
     if !path.is_file() {
         return Ok(None);
     }
     let raw = fs::read_to_string(path)?;
-    let stripped = json_comments::StripComments::new(raw.as_bytes());
-    let value: Value = serde_json::from_reader(stripped)?;
+    let value: Value = parse_jsonc(&raw)?;
     Ok(Some(value))
 }
 

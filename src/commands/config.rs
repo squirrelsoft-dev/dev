@@ -71,8 +71,7 @@ fn property_type(name: &str) -> PropertyType {
 
 fn read_config(path: &Path) -> anyhow::Result<Value> {
     let raw = fs::read_to_string(path)?;
-    let stripped = json_comments::StripComments::new(raw.as_bytes());
-    let json: Value = serde_json::from_reader(stripped)?;
+    let json: Value = crate::devcontainer::jsonc::parse_jsonc(&raw)?;
     Ok(json)
 }
 

@@ -2,6 +2,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 
+use super::jsonc::parse_jsonc;
 use crate::error::DevError;
 
 /// A lifecycle command can be a single string, a list of strings, or named parallel commands.
@@ -96,9 +97,8 @@ impl DevcontainerConfig {
             DevError::InvalidConfig(format!("Failed to read {}: {e}", path.display()))
         })?;
 
-        // Strip JSONC comments before parsing.
-        let stripped = json_comments::StripComments::new(raw.as_bytes());
-        let config: DevcontainerConfig = serde_json::from_reader(stripped)?;
+        // Parse JSONC (supports comments and trailing commas).
+        let config: DevcontainerConfig = parse_jsonc(&raw)?;
         Ok(config)
     }
 

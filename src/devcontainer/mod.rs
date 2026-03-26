@@ -1,6 +1,7 @@
 pub mod compose;
 pub mod config;
 pub mod features;
+pub mod jsonc;
 pub mod lifecycle;
 pub mod lockfile;
 pub mod merge;

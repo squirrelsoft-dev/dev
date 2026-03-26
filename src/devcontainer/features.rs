@@ -7,6 +7,7 @@ use crate::error::DevError;
 use crate::oci::{download_artifact, extract_archive, sha256_hex};
 
 use super::config::{DevcontainerConfig, LifecycleCommand};
+use super::jsonc::parse_jsonc;
 
 /// Metadata from `devcontainer-feature.json` inside a feature artifact.
 #[derive(Deserialize, Default)]
@@ -256,8 +257,7 @@ async fn download_single_feature(
     let meta_path = extracted_dir.join("devcontainer-feature.json");
     if meta_path.exists() {
         let content = std::fs::read_to_string(&meta_path)?;
-        let stripped = json_comments::StripComments::new(content.as_bytes());
-        let meta: FeatureJsonMeta = serde_json::from_reader(stripped)?;
+        let meta: FeatureJsonMeta = parse_jsonc(&content)?;
         apply_feature_metadata(feature, &meta);
     }
 
@@ -314,8 +314,7 @@ fn read_depends_on(feature: &ResolvedFeature) -> Option<HashMap<String, serde_js
         return None;
     }
     let content = std::fs::read_to_string(&meta_path).ok()?;
-    let stripped = json_comments::StripComments::new(content.as_bytes());
-    let meta: FeatureJsonMeta = serde_json::from_reader(stripped).ok()?;
+    let meta: FeatureJsonMeta = parse_jsonc(&content).ok()?;
     meta.depends_on
 }
 

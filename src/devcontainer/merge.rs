@@ -3,6 +3,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use super::jsonc::parse_jsonc;
 use crate::util::paths::base_config_dir;
 
 /// Fields where the base config value should override the template (scalar semantics).
@@ -86,8 +87,7 @@ pub fn merge_base_config(dest: &Path) -> anyhow::Result<bool> {
 
     // Read base config
     let base_raw = fs::read_to_string(&base_config_path)?;
-    let base_stripped = json_comments::StripComments::new(base_raw.as_bytes());
-    let base: Value = serde_json::from_reader(base_stripped)?;
+    let base: Value = parse_jsonc(&base_raw)?;
 
     if base.as_object().map(|o| o.is_empty()).unwrap_or(true) {
         return Ok(false);
@@ -95,8 +95,7 @@ pub fn merge_base_config(dest: &Path) -> anyhow::Result<bool> {
 
     // Read dest config
     let dest_raw = fs::read_to_string(&dest_config_path)?;
-    let dest_stripped = json_comments::StripComments::new(dest_raw.as_bytes());
-    let mut dest_json: Value = serde_json::from_reader(dest_stripped)?;
+    let mut dest_json: Value = parse_jsonc(&dest_raw)?;
 
     merge_layer(&mut dest_json, &base);
 
