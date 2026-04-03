@@ -256,16 +256,7 @@ pub async fn run(
     }
 
     let ports: Vec<PortMapping> = if port_overrides.is_empty() {
-        config
-            .forward_ports
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .map(|&p| PortMapping {
-                host: p,
-                container: p,
-            })
-            .collect()
+        config.forward_ports.clone().unwrap_or_default()
     } else {
         parse_port_overrides(port_overrides)?
     };
@@ -655,16 +646,7 @@ async fn run_compose(
         .collect();
 
     let ports: Vec<PortMapping> = if port_overrides.is_empty() {
-        config
-            .forward_ports
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .map(|&p| PortMapping {
-                host: p,
-                container: p,
-            })
-            .collect()
+        config.forward_ports.clone().unwrap_or_default()
     } else {
         parse_port_overrides(port_overrides)?
     };

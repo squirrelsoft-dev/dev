@@ -4,6 +4,53 @@ use std::path::Path;
 
 use super::jsonc::parse_jsonc;
 use crate::error::DevError;
+use crate::runtime::PortMapping;
+
+/// A port entry in the `forwardPorts` array: either a plain number or a "host:container" string.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum PortEntry {
+    Plain(u16),
+    Mapping(String),
+}
+
+impl PortEntry {
+    fn into_port_mapping(self) -> Result<PortMapping, String> {
+        match self {
+            PortEntry::Plain(p) => Ok(PortMapping {
+                host: p,
+                container: p,
+            }),
+            PortEntry::Mapping(s) => {
+                let (host_str, container_str) = s
+                    .split_once(':')
+                    .ok_or_else(|| format!("invalid port mapping: {s}"))?;
+                let host: u16 = host_str
+                    .parse()
+                    .map_err(|_| format!("invalid host port in: {s}"))?;
+                let container: u16 = container_str
+                    .parse()
+                    .map_err(|_| format!("invalid container port in: {s}"))?;
+                Ok(PortMapping { host, container })
+            }
+        }
+    }
+}
+
+fn deserialize_forward_ports<'de, D>(deserializer: D) -> Result<Option<Vec<PortMapping>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let entries: Option<Vec<PortEntry>> = Option::deserialize(deserializer)?;
+    match entries {
+        None => Ok(None),
+        Some(v) => {
+            let mappings: Result<Vec<PortMapping>, String> =
+                v.into_iter().map(|e| e.into_port_mapping()).collect();
+            mappings.map(Some).map_err(serde::de::Error::custom)
+        }
+    }
+}
 
 /// A lifecycle command can be a single string, a list of strings, or named parallel commands.
 #[derive(Debug, Clone, Deserialize)]
@@ -54,7 +101,8 @@ pub struct DevcontainerConfig {
     pub service: Option<String>,
     pub workspace_folder: Option<String>,
     pub features: Option<HashMap<String, serde_json::Value>>,
-    pub forward_ports: Option<Vec<u16>>,
+    #[serde(default, deserialize_with = "deserialize_forward_ports")]
+    pub forward_ports: Option<Vec<PortMapping>>,
     pub remote_user: Option<String>,
     pub remote_env: Option<HashMap<String, String>>,
     pub container_env: Option<HashMap<String, String>>,
