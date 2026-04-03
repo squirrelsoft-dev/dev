@@ -159,11 +159,28 @@ fn apply_add(
                 .or_insert_with(|| Value::Array(Vec::new()));
             if let Some(vec) = arr.as_array_mut() {
                 if property == "forwardPorts" {
-                    let port: u16 = value
-                        .parse()
-                        .map_err(|_| anyhow::anyhow!("Invalid port number: {value}"))?;
-                    vec.push(Value::Number(port.into()));
-                    Ok(format!("Added port {port}"))
+                    let new_value = if let Some((host_str, container_str)) =
+                        value.split_once(':')
+                    {
+                        let _host: u16 = host_str
+                            .parse()
+                            .map_err(|_| anyhow::anyhow!("Invalid host port in: {value}"))?;
+                        let _container: u16 = container_str
+                            .parse()
+                            .map_err(|_| anyhow::anyhow!("Invalid container port in: {value}"))?;
+                        Value::String(value.to_string())
+                    } else {
+                        let port: u16 = value
+                            .parse()
+                            .map_err(|_| anyhow::anyhow!("Invalid port number: {value}"))?;
+                        Value::Number(port.into())
+                    };
+                    if vec.contains(&new_value) {
+                        Ok(format!("Port {value} already forwarded"))
+                    } else {
+                        vec.push(new_value);
+                        Ok(format!("Added port {value}"))
+                    }
                 } else {
                     vec.push(Value::String(value.to_string()));
                     Ok(format!("Added {value} to {property}"))
@@ -247,10 +264,14 @@ fn apply_remove(
             if let Some(arr) = obj.get_mut(property).and_then(|v| v.as_array_mut()) {
                 let before = arr.len();
                 if property == "forwardPorts" {
-                    let port: u16 = value
-                        .parse()
-                        .map_err(|_| anyhow::anyhow!("Invalid port number: {value}"))?;
-                    arr.retain(|v| v.as_u64() != Some(port as u64));
+                    if value.contains(':') {
+                        arr.retain(|v| v.as_str() != Some(value));
+                    } else {
+                        let port: u16 = value
+                            .parse()
+                            .map_err(|_| anyhow::anyhow!("Invalid port number: {value}"))?;
+                        arr.retain(|v| v.as_u64() != Some(port as u64));
+                    }
                 } else {
                     arr.retain(|v| v.as_str() != Some(value));
                 }
@@ -980,6 +1001,43 @@ mod tests {
         assert_eq!(ports.len(), 2);
         assert_eq!(ports[0], 3000);
         assert_eq!(ports[1], 8080);
+    }
+
+    #[test]
+    fn test_config_add_port_duplicate() {
+        let (_dir, path) = setup_config(r#"{"image": "ubuntu"}"#);
+        config_add(&target_for(&path), "forwardPorts", "3000").unwrap();
+        config_add(&target_for(&path), "forwardPorts", "3000").unwrap();
+        config_add(&target_for(&path), "forwardPorts", "3011:3000").unwrap();
+        config_add(&target_for(&path), "forwardPorts", "3011:3000").unwrap();
+        let json = read_config(&path).unwrap();
+        let ports = json["forwardPorts"].as_array().unwrap();
+        assert_eq!(ports.len(), 2);
+        assert_eq!(ports[0], 3000);
+        assert_eq!(ports[1], "3011:3000");
+    }
+
+    #[test]
+    fn test_config_add_port_mapping() {
+        let (_dir, path) = setup_config(r#"{"image": "ubuntu"}"#);
+        config_add(&target_for(&path), "forwardPorts", "3000").unwrap();
+        config_add(&target_for(&path), "forwardPorts", "3011:3000").unwrap();
+        let json = read_config(&path).unwrap();
+        let ports = json["forwardPorts"].as_array().unwrap();
+        assert_eq!(ports.len(), 2);
+        assert_eq!(ports[0], 3000);
+        assert_eq!(ports[1], "3011:3000");
+    }
+
+    #[test]
+    fn test_config_remove_port_mapping() {
+        let (_dir, path) =
+            setup_config(r#"{"forwardPorts": [3000, "3011:3000"]}"#);
+        config_remove(&target_for(&path), "forwardPorts", "3011:3000").unwrap();
+        let json = read_config(&path).unwrap();
+        let ports = json["forwardPorts"].as_array().unwrap();
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0], 3000);
     }
 
     #[test]
