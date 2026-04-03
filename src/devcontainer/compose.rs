@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::devcontainer::jsonc::parse_jsonc;
-use crate::devcontainer::merge::merge_layers;
-use crate::devcontainer::recipe::Recipe;
+use crate::devcontainer::merge::{merge_layer, merge_layers};
+use crate::devcontainer::recipe::{is_empty_object, Recipe};
 use crate::util::paths::{base_config_dir, global_dir, runtime_config_dir};
 
 /// Read a JSON file, stripping comments and trailing commas. Returns `None` if the file doesn't exist.
@@ -103,6 +103,11 @@ pub fn compose_config(recipe: &Recipe, runtime_name: &str) -> anyhow::Result<Val
                 }
             }
         }
+    }
+
+    // Apply user customizations as the highest-priority layer
+    if !is_empty_object(&recipe.customizations) {
+        merge_layer(&mut composed, &recipe.customizations);
     }
 
     Ok(composed)
@@ -299,5 +304,41 @@ mod tests {
         super::substitute_template_options(&mut value, &opts);
         assert_eq!(value["image"], "python:3.11");
         assert_eq!(value["remoteUser"], "vscode");
+    }
+
+    #[test]
+    fn test_compose_with_customizations() {
+        // Set up layers: global has remoteUser=root, base overrides to vscode
+        let (_dir, composed) = setup_test_env(
+            r#"{"image": "rust:latest", "remoteUser": "root", "forwardPorts": [3000]}"#,
+            Some(r#"{"remoteUser": "vscode"}"#),
+            None,
+            "docker",
+        );
+        // Base overrides global
+        assert_eq!(composed["remoteUser"], "vscode");
+
+        // Now simulate what compose_config does with customizations:
+        // customizations should override everything
+        let customizations = serde_json::json!({
+            "remoteUser": "developer",
+            "forwardPorts": [9090],
+            "remoteEnv": {"MY_VAR": "hello"}
+        });
+
+        let mut result = composed;
+        if !super::is_empty_object(&customizations) {
+            super::merge_layer(&mut result, &customizations);
+        }
+
+        assert_eq!(result["remoteUser"], "developer");
+        // forwardPorts are arrays — should concatenate
+        let ports = result["forwardPorts"].as_array().unwrap();
+        assert!(ports.contains(&Value::Number(3000.into())));
+        assert!(ports.contains(&Value::Number(9090.into())));
+        // New env from customizations
+        assert_eq!(result["remoteEnv"]["MY_VAR"], "hello");
+        // image preserved from global
+        assert_eq!(result["image"], "rust:latest");
     }
 }

@@ -105,6 +105,7 @@ pub async fn run(
                 features: selected_features.clone(),
                 options: opts.clone(),
                 root_folder: workspace.to_string_lossy().to_string(),
+                customizations: serde_json::Value::Object(serde_json::Map::new()),
             };
             recipe.write_to(&devcontainer_dir.join("recipe.json"))?;
 
@@ -188,6 +189,7 @@ async fn apply_global_template(
                 features: selected_features,
                 options: opts,
                 root_folder: workspace.to_string_lossy().to_string(),
+                customizations: serde_json::Value::Object(serde_json::Map::new()),
             };
             recipe.write_to(&devcontainer_dir.join("recipe.json"))?;
 

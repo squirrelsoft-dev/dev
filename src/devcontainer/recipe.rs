@@ -3,6 +3,7 @@ use std::fs;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// A lightweight recipe that references a global template by name and stores
 /// project-specific overrides. The full `devcontainer.json` is composed at
@@ -20,6 +21,21 @@ pub struct Recipe {
     pub options: HashMap<String, String>,
     /// Absolute path to the workspace root
     pub root_folder: String,
+    /// User-applied configuration overrides (highest-priority layer during composition).
+    /// Stores devcontainer.json property deltas set via `dev config set/add/remove`.
+    #[serde(
+        default = "default_empty_object",
+        skip_serializing_if = "is_empty_object"
+    )]
+    pub customizations: Value,
+}
+
+fn default_empty_object() -> Value {
+    Value::Object(serde_json::Map::new())
+}
+
+pub fn is_empty_object(v: &Value) -> bool {
+    v.as_object().map(|m| m.is_empty()).unwrap_or(true)
 }
 
 impl Recipe {
@@ -56,6 +72,7 @@ mod tests {
             features: vec!["ghcr.io/features/zsh:1".to_string()],
             options: HashMap::from([("imageVariant".to_string(), "bookworm".to_string())]),
             root_folder: "/home/user/project".to_string(),
+            customizations: default_empty_object(),
         };
 
         recipe.write_to(&path).unwrap();
@@ -77,17 +94,65 @@ mod tests {
             features: Vec::new(),
             options: HashMap::new(),
             root_folder: "/tmp/proj".to_string(),
+            customizations: default_empty_object(),
         };
 
         recipe.write_to(&path).unwrap();
         let raw = fs::read_to_string(&path).unwrap();
-        // Empty vecs/maps should be omitted
+        // Empty vecs/maps/objects should be omitted
         assert!(!raw.contains("features"));
         assert!(!raw.contains("options"));
+        assert!(!raw.contains("customizations"));
 
         let loaded = Recipe::from_path(&path).unwrap();
         assert_eq!(loaded.global_template, "python");
         assert!(loaded.features.is_empty());
         assert!(loaded.options.is_empty());
+        assert!(is_empty_object(&loaded.customizations));
+    }
+
+    #[test]
+    fn test_recipe_customizations_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("recipe.json");
+
+        let customizations = serde_json::json!({
+            "remoteUser": "vscode",
+            "forwardPorts": [9090],
+            "remoteEnv": {"MY_VAR": "hello"}
+        });
+
+        let recipe = Recipe {
+            global_template: "rust".to_string(),
+            features: Vec::new(),
+            options: HashMap::new(),
+            root_folder: "/home/user/project".to_string(),
+            customizations,
+        };
+
+        recipe.write_to(&path).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("customizations"));
+
+        let loaded = Recipe::from_path(&path).unwrap();
+        assert_eq!(loaded.customizations["remoteUser"], "vscode");
+        assert_eq!(loaded.customizations["forwardPorts"][0], 9090);
+        assert_eq!(loaded.customizations["remoteEnv"]["MY_VAR"], "hello");
+    }
+
+    #[test]
+    fn test_recipe_without_customizations_field_deserializes() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("recipe.json");
+        // Simulate a legacy recipe.json without the customizations field
+        fs::write(
+            &path,
+            r#"{"globalTemplate": "rust", "rootFolder": "/tmp/proj"}"#,
+        )
+        .unwrap();
+
+        let loaded = Recipe::from_path(&path).unwrap();
+        assert_eq!(loaded.global_template, "rust");
+        assert!(is_empty_object(&loaded.customizations));
     }
 }
