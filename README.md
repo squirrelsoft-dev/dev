@@ -150,7 +150,7 @@ User-scoped recipes reference a global template by name and store any per-projec
 
 ## Local domain routing
 
-`dev` integrates with [Caddy](https://caddyserver.com/) and dnsmasq to give each project a `.test` hostname (e.g. `move.test`) so you never have to remember port numbers.
+`dev` integrates with [Caddy](https://caddyserver.com/) and dnsmasq to give each project a `.test` hostname (e.g. `appname.test`) so you never have to remember port numbers.
 
 ### One-time setup
 
@@ -188,8 +188,8 @@ When you run `dev up`, if `forwardPorts` is configured in your `devcontainer.jso
 
 ```sh
 dev up
-# Container 'move' is ready.
-#   → http://move.test → port 3000
+# Container 'appname' is ready.
+#   → http://appname.test → port 3000
 ```
 
 When you run `dev down`, the Caddy fragment is removed and Caddy reloads.
@@ -198,8 +198,8 @@ The hostname is derived from your workspace folder name. Multiple `forwardPorts`
 
 | forwardPorts   | Hostname                      |
 | -------------- | ----------------------------- |
-| `[3000]`       | `move.test`                   |
-| `[3000, 8080]` | `move.test`, `move-8080.test` |
+| `[3000]`       | `appname.test`                      |
+| `[3000, 8080]` | `appname.test`, `appname-8080.test` |
 
 ### Caddy config files
 
