@@ -270,7 +270,12 @@ async fn run_forwarder(
         "Forwarding 127.0.0.1:{host_port} -> container:{container_port}"
     );
 
-    if let Err(e) = crate::caddy::register_site(workspace, &[host_port]) {
+    let mut all_ports = active_ports_for_workspace(workspace);
+    if !all_ports.contains(&host_port) {
+        all_ports.push(host_port);
+    }
+    all_ports.sort();
+    if let Err(e) = crate::caddy::register_site(workspace, &all_ports) {
         eprintln!("Warning: Caddy setup failed: {e}");
     }
 
