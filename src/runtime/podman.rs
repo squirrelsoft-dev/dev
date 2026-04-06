@@ -3,7 +3,8 @@ use std::path::Path;
 use crate::error::DevError;
 use crate::runtime::docker::BollardRuntime;
 use crate::runtime::{
-    BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ExecResult, ImageMetadata,
+    AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ExecResult,
+    ImageMetadata,
 };
 use std::os::unix::process::CommandExt;
 
@@ -131,5 +132,14 @@ impl ContainerRuntime for PodmanRuntime {
 
     fn inspect_image_metadata(&self, image: &str) -> BoxFut<'_, ImageMetadata> {
         self.0.inspect_image_metadata(image)
+    }
+
+    fn exec_attached(
+        &self,
+        id: &str,
+        cmd: &[String],
+        user: Option<&str>,
+    ) -> BoxFut<'_, AttachedExec> {
+        self.0.exec_attached(id, cmd, user)
     }
 }

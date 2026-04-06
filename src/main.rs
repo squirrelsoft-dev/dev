@@ -1,3 +1,4 @@
+mod caddy;
 mod cli;
 mod collection;
 mod commands;
@@ -45,6 +46,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Exec { user, cmd } => {
             commands::exec::run(&workspace, runtime_override, user.as_deref(), &cmd).await?;
+        }
+        Command::Forward { port, daemon, stop, list } => {
+            commands::forward::run(&workspace, runtime_override, &port, daemon, stop, list).await?;
         }
         Command::Shell { shell } => {
             commands::shell::run(&workspace, runtime_override, shell.as_deref()).await?;

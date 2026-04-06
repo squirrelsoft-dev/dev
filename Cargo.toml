@@ -3,7 +3,7 @@ members = [".", "crates/apple-container"]
 
 [package]
 name = "devcontainer"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 description = "A devcontainer management CLI"
 license = "MIT"
@@ -52,6 +52,9 @@ anyhow = "1"
 
 # Async streams
 futures-util = "0.3"
+
+# Byte buffers
+bytes = "1"
 
 # Platform
 libc = "0.2"

@@ -11,8 +11,8 @@ use tokio::io::AsyncWriteExt;
 
 use crate::error::DevError;
 use crate::runtime::{
-    BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ContainerState, ExecResult,
-    ImageMetadata,
+    AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ContainerState,
+    ExecResult, ImageMetadata,
 };
 
 /// RAII guard that puts the terminal into raw mode and restores it on drop.
@@ -88,6 +88,49 @@ fn translate_shift_enter(input: &[u8]) -> Vec<u8> {
         i += 1;
     }
     out
+}
+
+/// Adapts bollard's `LogOutput` stream into an `AsyncRead` byte stream.
+struct LogOutputStream {
+    inner: std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = Result<bollard::container::LogOutput, bollard::errors::Error>> + Send>,
+    >,
+    buffer: bytes::BytesMut,
+}
+
+impl tokio::io::AsyncRead for LogOutputStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if !self.buffer.is_empty() {
+            let n = std::cmp::min(buf.remaining(), self.buffer.len());
+            buf.put_slice(&self.buffer.split_to(n));
+            return std::task::Poll::Ready(Ok(()));
+        }
+
+        match self.inner.as_mut().poll_next(cx) {
+            std::task::Poll::Ready(Some(Ok(log_output))) => {
+                let data = match log_output {
+                    bollard::container::LogOutput::StdOut { message } => message,
+                    bollard::container::LogOutput::StdErr { message } => message,
+                    _ => return self.poll_read(cx, buf),
+                };
+                let n = std::cmp::min(buf.remaining(), data.len());
+                buf.put_slice(&data[..n]);
+                if n < data.len() {
+                    self.buffer.extend_from_slice(&data[n..]);
+                }
+                std::task::Poll::Ready(Ok(()))
+            }
+            std::task::Poll::Ready(Some(Err(e))) => {
+                std::task::Poll::Ready(Err(std::io::Error::other(e)))
+            }
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(Ok(())),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
 }
 
 /// Shared bollard-backed runtime used by both Docker and Podman.
@@ -599,6 +642,43 @@ impl BollardRuntime {
         Ok(())
     }
 
+    async fn exec_attached_impl(
+        &self,
+        id: &str,
+        cmd: &[String],
+        user: Option<&str>,
+    ) -> Result<AttachedExec, DevError> {
+        let exec = self
+            .client
+            .create_exec(
+                id,
+                CreateExecOptions {
+                    cmd: Some(cmd.to_vec()),
+                    attach_stdin: Some(true),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    tty: Some(false),
+                    user: user.map(|u| u.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        let start = self.client.start_exec(&exec.id, None).await?;
+        match start {
+            StartExecResults::Attached { output, input } => Ok(AttachedExec {
+                stdin: Box::pin(input),
+                stdout: Box::pin(LogOutputStream {
+                    inner: Box::pin(output),
+                    buffer: bytes::BytesMut::new(),
+                }),
+            }),
+            StartExecResults::Detached => {
+                Err(DevError::Runtime("exec session detached unexpectedly".into()))
+            }
+        }
+    }
+
     #[allow(dead_code)]
     async fn inspect_container_impl(&self, id: &str) -> Result<ContainerInfo, DevError> {
         let resp = self.client.inspect_container(id, None).await?;
@@ -811,6 +891,18 @@ impl ContainerRuntime for BollardRuntime {
         let image = image.to_string();
         Box::pin(async move { self.inspect_image_metadata_impl(&image).await })
     }
+
+    fn exec_attached(
+        &self,
+        id: &str,
+        cmd: &[String],
+        user: Option<&str>,
+    ) -> BoxFut<'_, AttachedExec> {
+        let id = id.to_string();
+        let cmd = cmd.to_vec();
+        let user = user.map(|u| u.to_string());
+        Box::pin(async move { self.exec_attached_impl(&id, &cmd, user.as_deref()).await })
+    }
 }
 
 /// Docker-specific runtime (uses default Docker socket).
@@ -900,5 +992,14 @@ impl ContainerRuntime for DockerRuntime {
 
     fn inspect_image_metadata(&self, image: &str) -> BoxFut<'_, ImageMetadata> {
         self.0.inspect_image_metadata(image)
+    }
+
+    fn exec_attached(
+        &self,
+        id: &str,
+        cmd: &[String],
+        user: Option<&str>,
+    ) -> BoxFut<'_, AttachedExec> {
+        self.0.exec_attached(id, cmd, user)
     }
 }

@@ -260,6 +260,7 @@ pub async fn run(
     } else {
         parse_port_overrides(port_overrides)?
     };
+    let caddy_host_ports: Vec<u16> = ports.iter().map(|p| p.host).collect();
 
     // Resolve the effective remote user from config or image metadata.
     let effective_user = resolve_remote_user(
@@ -361,6 +362,13 @@ pub async fn run(
     }
 
     println!("Container '{name}' is ready.");
+
+    if !caddy_host_ports.is_empty() {
+        if let Err(e) = crate::caddy::register_site(workspace, &caddy_host_ports) {
+            eprintln!("Warning: Caddy setup failed: {e}");
+        }
+    }
+
     Ok(())
 }
 
@@ -650,6 +658,7 @@ async fn run_compose(
     } else {
         parse_port_overrides(port_overrides)?
     };
+    let caddy_host_ports_compose: Vec<u16> = ports.iter().map(|p| p.host).collect();
 
     // 8. Labels + merged feature capabilities.
     let labels_list = workspace_labels(workspace, Some(config_path));
@@ -723,6 +732,13 @@ async fn run_compose(
     }
 
     println!("Compose service '{service}' is ready (container {}).", &container_id[..12.min(container_id.len())]);
+
+    if !caddy_host_ports_compose.is_empty() {
+        if let Err(e) = crate::caddy::register_site(workspace, &caddy_host_ports_compose) {
+            eprintln!("Warning: Caddy setup failed: {e}");
+        }
+    }
+
     Ok(())
 }
 

@@ -3,6 +3,7 @@ pub mod build;
 pub mod config;
 pub mod down;
 pub mod exec;
+pub mod forward;
 pub mod global;
 pub mod init;
 pub mod list;

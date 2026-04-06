@@ -155,6 +155,24 @@ pub enum Command {
         action: BaseAction,
     },
 
+    /// Forward a local port to a port inside the container
+    Forward {
+        /// Port: PORT or HOST_PORT:CONTAINER_PORT
+        port: String,
+
+        /// Run in background and write PID file
+        #[arg(short, long)]
+        daemon: bool,
+
+        /// Stop a running forwarder for the given port
+        #[arg(long)]
+        stop: bool,
+
+        /// List active forwarders for this workspace
+        #[arg(long, conflicts_with_all = ["daemon", "stop"])]
+        list: bool,
+    },
+
     /// Open VS Code attached to the running devcontainer
     Open {
         /// Use VS Code Insiders

@@ -561,11 +561,12 @@ dependencies = [
 
 [[package]]
 name = "devcontainer"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "apple-container",
  "bollard",
+ "bytes",
  "clap",
  "console",
  "dialoguer",

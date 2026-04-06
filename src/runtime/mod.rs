@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Container state as reported by the runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +97,12 @@ pub struct ImageMetadata {
     pub container_user: Option<String>,
 }
 
+/// Handle to a running exec session with attached stdin/stdout byte streams.
+pub struct AttachedExec {
+    pub stdin: Pin<Box<dyn AsyncWrite + Send>>,
+    pub stdout: Pin<Box<dyn AsyncRead + Send>>,
+}
+
 /// A boxed future that is Send.
 type BoxFut<'a, T> = Pin<Box<dyn Future<Output = Result<T, DevError>> + Send + 'a>>;
 
@@ -136,6 +143,15 @@ pub trait ContainerRuntime: Send + Sync {
     fn image_exists(&self, image: &str) -> BoxFut<'_, bool>;
 
     fn inspect_image_metadata(&self, image: &str) -> BoxFut<'_, ImageMetadata>;
+
+    /// Create an exec session with attached stdin/stdout streams (no TTY).
+    /// Used for port forwarding via netcat inside the container.
+    fn exec_attached(
+        &self,
+        id: &str,
+        cmd: &[String],
+        user: Option<&str>,
+    ) -> BoxFut<'_, AttachedExec>;
 }
 
 /// Resolve the effective remote user by checking the devcontainer config first,

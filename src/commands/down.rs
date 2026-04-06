@@ -48,6 +48,10 @@ pub async fn run(
         }
     }
 
+    if let Err(e) = crate::caddy::unregister_site(workspace) {
+        eprintln!("Warning: Caddy cleanup failed: {e}");
+    }
+
     Ok(())
 }
 
@@ -76,6 +80,10 @@ async fn run_compose_down(
             runtime_name, &compose_files, devcontainer_dir, &project_name,
         ).await?;
         println!("Compose services stopped.");
+    }
+
+    if let Err(e) = crate::caddy::unregister_site(workspace) {
+        eprintln!("Warning: Caddy cleanup failed: {e}");
     }
 
     Ok(())

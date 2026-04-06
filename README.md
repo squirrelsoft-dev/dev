@@ -148,6 +148,66 @@ Higher-priority layers override lower ones, with merge behavior depending on the
 
 User-scoped recipes reference a global template by name and store any per-project overrides. The full config is composed at build/run time.
 
+## Local domain routing
+
+`dev` integrates with [Caddy](https://caddyserver.com/) and dnsmasq to give each project a `.test` hostname (e.g. `move.test`) so you never have to remember port numbers.
+
+### One-time setup
+
+Install and configure dnsmasq to resolve all `*.test` domains to localhost:
+
+```sh
+brew install dnsmasq
+echo 'address=/.test/127.0.0.1' >> /opt/homebrew/etc/dnsmasq.conf
+sudo brew services start dnsmasq
+sudo mkdir -p /etc/resolver
+echo 'nameserver 127.0.0.1' | sudo tee /etc/resolver/test
+```
+
+Install Caddy and start it with the dev-managed Caddyfile:
+
+```sh
+brew install caddy
+sudo caddy start --config ~/.dev/caddy/Caddyfile
+```
+
+Caddy only needs to be started once — it persists across reboots and `dev` handles reloads automatically.
+
+**Note:** After first-time DNS setup, flush your browser's DNS cache or it may not pick up `.test` resolution immediately.
+
+- Chrome: visit `chrome://net-internals/#dns` and click **Clear host cache**
+- macOS system cache: `sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder`
+
+### How it works
+
+When you run `dev up`, if `forwardPorts` is configured in your `devcontainer.json`, `dev` will:
+
+1. Write a Caddy config fragment to `~/.dev/caddy/sites/<appname>.caddy`
+2. Signal Caddy to reload
+3. Print the URL(s) your project is available at
+
+```sh
+dev up
+# Container 'move' is ready.
+#   → http://move.test → port 3000
+```
+
+When you run `dev down`, the Caddy fragment is removed and Caddy reloads.
+
+The hostname is derived from your workspace folder name. Multiple `forwardPorts` entries get their own subdomains:
+
+| forwardPorts   | Hostname                      |
+| -------------- | ----------------------------- |
+| `[3000]`       | `move.test`                   |
+| `[3000, 8080]` | `move.test`, `move-8080.test` |
+
+### Caddy config files
+
+| Path                              | Purpose                                 |
+| --------------------------------- | --------------------------------------- |
+| `~/.dev/caddy/Caddyfile`          | Root config, imports all site fragments |
+| `~/.dev/caddy/sites/<name>.caddy` | Per-project fragment, managed by `dev`  |
+
 ### Global flags
 
 | Flag | Description |
