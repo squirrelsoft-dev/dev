@@ -189,7 +189,7 @@ When you run `dev up`, if `forwardPorts` is configured in your `devcontainer.jso
 ```sh
 dev up
 # Container 'appname' is ready.
-#   → http://appname.test → port 3000
+#   → https://appname.test → port 3000
 ```
 
 When you run `dev down`, the Caddy fragment is removed and Caddy reloads.

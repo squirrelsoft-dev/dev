@@ -3,7 +3,7 @@ members = [".", "crates/apple-container"]
 
 [package]
 name = "devcontainer"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2024"
 description = "A devcontainer management CLI"
 license = "MIT"

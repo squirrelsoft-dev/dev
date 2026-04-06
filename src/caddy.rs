@@ -64,7 +64,7 @@ fn write_site_config(app_name: &str, ports: &[u16]) -> anyhow::Result<Vec<SiteEn
         };
 
         config.push_str(&format!(
-            "http://{hostname} {{\n    reverse_proxy 127.0.0.1:{port}\n}}\n\n"
+            "{hostname} {{\n    tls internal\n    reverse_proxy 127.0.0.1:{port}\n}}\n\n"
         ));
 
         entries.push(SiteEntry {
@@ -169,7 +169,7 @@ pub fn register_site(workspace: &Path, ports: &[u16]) -> anyhow::Result<Vec<Site
 
     for entry in &entries {
         eprintln!(
-            "  → http://{} → localhost:{}",
+            "  → https://{} → localhost:{}",
             entry.hostname, entry.host_port
         );
     }
