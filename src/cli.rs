@@ -160,6 +160,10 @@ pub enum Command {
         /// Port: PORT or HOST_PORT:CONTAINER_PORT
         port: String,
 
+        /// Custom hostname for the .test domain (e.g. admin.myapp.test)
+        #[arg(long)]
+        name: Option<String>,
+
         /// Run in background and write PID file
         #[arg(short, long)]
         daemon: bool,

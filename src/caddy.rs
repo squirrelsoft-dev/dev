@@ -44,32 +44,43 @@ pub struct SiteEntry {
     pub host_port: u16,
 }
 
+/// A port with an optional custom hostname override.
+#[derive(Debug, Clone)]
+pub struct PortEntry {
+    pub port: u16,
+    pub custom_name: Option<String>,
+}
+
 /// Write the Caddy config fragment for a project.
 ///
 /// Each forwarded port gets its own subdomain:
 ///   - First port:  `myapp.test` → `127.0.0.1:3000`
 ///   - Extra ports: `myapp-8080.test` → `127.0.0.1:8080`
-fn write_site_config(app_name: &str, ports: &[u16]) -> anyhow::Result<Vec<SiteEntry>> {
+///   - Custom name: `admin.myapp.test` → `127.0.0.1:8080` (via --name)
+fn write_site_config(app_name: &str, ports: &[PortEntry]) -> anyhow::Result<Vec<SiteEntry>> {
     let sites_dir = caddy_dir().join("sites");
     std::fs::create_dir_all(&sites_dir)?;
 
     let mut entries = Vec::new();
     let mut config = String::new();
 
-    for (i, &port) in ports.iter().enumerate() {
-        let hostname = if i == 0 {
+    for (i, entry) in ports.iter().enumerate() {
+        let hostname = if let Some(ref name) = entry.custom_name {
+            name.clone()
+        } else if i == 0 {
             format!("{app_name}.{TLD}")
         } else {
-            format!("{app_name}-{port}.{TLD}")
+            format!("{app_name}-{}.{TLD}", entry.port)
         };
 
         config.push_str(&format!(
-            "{hostname} {{\n    tls internal\n    reverse_proxy 127.0.0.1:{port}\n}}\n\n"
+            "{hostname} {{\n    tls internal\n    reverse_proxy 127.0.0.1:{}\n}}\n\n",
+            entry.port
         ));
 
         entries.push(SiteEntry {
             hostname,
-            host_port: port,
+            host_port: entry.port,
         });
     }
 
@@ -157,7 +168,7 @@ fn print_dns_setup_hint() {
 }
 
 /// Register forwarded ports with Caddy. Best-effort — warns on failure.
-pub fn register_site(workspace: &Path, ports: &[u16]) -> anyhow::Result<Vec<SiteEntry>> {
+pub fn register_site(workspace: &Path, ports: &[PortEntry]) -> anyhow::Result<Vec<SiteEntry>> {
     let app_name = app_name_from_workspace(workspace);
     ensure_root_caddyfile()?;
     let entries = write_site_config(&app_name, ports)?;

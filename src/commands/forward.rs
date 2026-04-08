@@ -12,6 +12,7 @@ pub async fn run(
     workspace: &Path,
     runtime_override: Option<&str>,
     port_spec: &str,
+    custom_name: Option<&str>,
     daemon: bool,
     stop: bool,
     list: bool,
@@ -28,6 +29,11 @@ pub async fn run(
 
     if daemon {
         return daemonize(workspace, host_port);
+    }
+
+    // Persist custom name so it survives across register_site rebuilds
+    if let Some(name) = custom_name {
+        save_custom_name(workspace, host_port, name)?;
     }
 
     run_forwarder(workspace, runtime_override, host_port, container_port).await
@@ -80,18 +86,39 @@ fn read_pid_file(path: &Path) -> anyhow::Result<u32> {
     Ok(pid)
 }
 
-/// Collect host ports from active PID files for this workspace.
-fn active_ports_for_workspace(workspace: &Path) -> Vec<u16> {
+fn name_file_path(workspace: &Path, host_port: u16) -> std::path::PathBuf {
+    forward_dir().join(format!("{}-{}.name", workspace_hash(workspace), host_port))
+}
+
+fn save_custom_name(workspace: &Path, host_port: u16, name: &str) -> anyhow::Result<()> {
+    std::fs::create_dir_all(forward_dir())?;
+    std::fs::write(name_file_path(workspace, host_port), name)?;
+    Ok(())
+}
+
+fn load_custom_name(workspace: &Path, host_port: u16) -> Option<String> {
+    std::fs::read_to_string(name_file_path(workspace, host_port))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn remove_custom_name(workspace: &Path, host_port: u16) {
+    let _ = std::fs::remove_file(name_file_path(workspace, host_port));
+}
+
+/// Collect active port entries (with custom names) for this workspace.
+fn active_entries_for_workspace(workspace: &Path) -> Vec<crate::caddy::PortEntry> {
     let dir = forward_dir();
     let prefix = workspace_hash(workspace);
-    let mut ports = Vec::new();
+    let mut entries = Vec::new();
 
-    let entries = match std::fs::read_dir(&dir) {
+    let dir_entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
-        Err(_) => return ports,
+        Err(_) => return entries,
     };
 
-    for entry in entries.flatten() {
+    for entry in dir_entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if !name.starts_with(&prefix) || !name.ends_with(".pid") {
@@ -101,13 +128,16 @@ fn active_ports_for_workspace(workspace: &Path) -> Vec<u16> {
         if let Ok(port) = middle.parse::<u16>() {
             if let Ok(pid) = read_pid_file(&entry.path()) {
                 if is_process_alive(pid) {
-                    ports.push(port);
+                    entries.push(crate::caddy::PortEntry {
+                        port,
+                        custom_name: load_custom_name(workspace, port),
+                    });
                 }
             }
         }
     }
 
-    ports
+    entries
 }
 
 // --- Modes ---
@@ -185,15 +215,16 @@ fn stop_forwarder(workspace: &Path, host_port: u16) -> anyhow::Result<()> {
     }
 
     let _ = std::fs::remove_file(&path);
+    remove_custom_name(workspace, host_port);
     eprintln!("Stopped forwarder on port {host_port} (PID {pid})");
 
     // Update Caddy config: regenerate with remaining active ports or remove entirely
-    let remaining_ports = active_ports_for_workspace(workspace);
-    if remaining_ports.is_empty() {
+    let remaining = active_entries_for_workspace(workspace);
+    if remaining.is_empty() {
         if let Err(e) = crate::caddy::unregister_site(workspace) {
             eprintln!("Warning: Caddy cleanup failed: {e}");
         }
-    } else if let Err(e) = crate::caddy::register_site(workspace, &remaining_ports) {
+    } else if let Err(e) = crate::caddy::register_site(workspace, &remaining) {
         eprintln!("Warning: Caddy update failed: {e}");
     }
 
@@ -270,12 +301,15 @@ async fn run_forwarder(
         "Forwarding 127.0.0.1:{host_port} -> container:{container_port}"
     );
 
-    let mut all_ports = active_ports_for_workspace(workspace);
-    if !all_ports.contains(&host_port) {
-        all_ports.push(host_port);
+    let mut all_entries = active_entries_for_workspace(workspace);
+    if !all_entries.iter().any(|e| e.port == host_port) {
+        all_entries.push(crate::caddy::PortEntry {
+            port: host_port,
+            custom_name: load_custom_name(workspace, host_port),
+        });
     }
-    all_ports.sort();
-    if let Err(e) = crate::caddy::register_site(workspace, &all_ports) {
+    all_entries.sort_by_key(|e| e.port);
+    if let Err(e) = crate::caddy::register_site(workspace, &all_entries) {
         eprintln!("Warning: Caddy setup failed: {e}");
     }
 

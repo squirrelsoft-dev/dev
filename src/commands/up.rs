@@ -260,7 +260,10 @@ pub async fn run(
     } else {
         parse_port_overrides(port_overrides)?
     };
-    let caddy_host_ports: Vec<u16> = ports.iter().map(|p| p.host).collect();
+    let caddy_host_ports: Vec<crate::caddy::PortEntry> = ports
+        .iter()
+        .map(|p| crate::caddy::PortEntry { port: p.host, custom_name: None })
+        .collect();
 
     // Resolve the effective remote user from config or image metadata.
     let effective_user = resolve_remote_user(
@@ -658,7 +661,10 @@ async fn run_compose(
     } else {
         parse_port_overrides(port_overrides)?
     };
-    let caddy_host_ports_compose: Vec<u16> = ports.iter().map(|p| p.host).collect();
+    let caddy_host_ports_compose: Vec<crate::caddy::PortEntry> = ports
+        .iter()
+        .map(|p| crate::caddy::PortEntry { port: p.host, custom_name: None })
+        .collect();
 
     // 8. Labels + merged feature capabilities.
     let labels_list = workspace_labels(workspace, Some(config_path));
