@@ -49,6 +49,7 @@ pub struct SiteEntry {
 pub struct PortEntry {
     pub port: u16,
     pub custom_name: Option<String>,
+    pub keepalive: Option<String>,
 }
 
 /// Write the Caddy config fragment for a project.
@@ -73,9 +74,15 @@ fn write_site_config(app_name: &str, ports: &[PortEntry]) -> anyhow::Result<Vec<
             format!("{app_name}-{}.{TLD}", entry.port)
         };
 
+        let proxy_block = match &entry.keepalive {
+            Some(k) => format!(
+                "    reverse_proxy 127.0.0.1:{} {{\n        transport http {{\n            keepalive {}\n        }}\n    }}\n",
+                entry.port, k
+            ),
+            None => format!("    reverse_proxy 127.0.0.1:{}\n", entry.port),
+        };
         config.push_str(&format!(
-            "{hostname} {{\n    tls internal\n    reverse_proxy 127.0.0.1:{}\n}}\n\n",
-            entry.port
+            "{hostname} {{\n    tls internal\n{proxy_block}}}\n\n"
         ));
 
         entries.push(SiteEntry {

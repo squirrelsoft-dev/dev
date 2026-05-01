@@ -262,7 +262,7 @@ pub async fn run(
     };
     let caddy_host_ports: Vec<crate::caddy::PortEntry> = ports
         .iter()
-        .map(|p| crate::caddy::PortEntry { port: p.host, custom_name: None })
+        .map(|p| crate::caddy::PortEntry { port: p.host, custom_name: None, keepalive: None })
         .collect();
 
     // Resolve the effective remote user from config or image metadata.
@@ -663,7 +663,7 @@ async fn run_compose(
     };
     let caddy_host_ports_compose: Vec<crate::caddy::PortEntry> = ports
         .iter()
-        .map(|p| crate::caddy::PortEntry { port: p.host, custom_name: None })
+        .map(|p| crate::caddy::PortEntry { port: p.host, custom_name: None, keepalive: None })
         .collect();
 
     // 8. Labels + merged feature capabilities.

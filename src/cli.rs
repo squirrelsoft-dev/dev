@@ -164,6 +164,10 @@ pub enum Command {
         #[arg(long)]
         name: Option<String>,
 
+        /// Keepalive setting for Caddy reverse_proxy (e.g. "4s", "30s", "off")
+        #[arg(long)]
+        keepalive: Option<String>,
+
         /// Run in background and write PID file
         #[arg(short, long)]
         daemon: bool,

@@ -1,0 +1,9 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Skip Rust build artifacts and vendored dependencies"
+paths = [
+  '''^target/''',
+  '''^\.git/''',
+]

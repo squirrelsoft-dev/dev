@@ -13,6 +13,7 @@ pub async fn run(
     runtime_override: Option<&str>,
     port_spec: &str,
     custom_name: Option<&str>,
+    keepalive: Option<&str>,
     daemon: bool,
     stop: bool,
     list: bool,
@@ -34,6 +35,9 @@ pub async fn run(
     // Persist custom name so it survives across register_site rebuilds
     if let Some(name) = custom_name {
         save_custom_name(workspace, host_port, name)?;
+    }
+    if let Some(k) = keepalive {
+        save_keepalive(workspace, host_port, k)?;
     }
 
     run_forwarder(workspace, runtime_override, host_port, container_port).await
@@ -107,6 +111,27 @@ fn remove_custom_name(workspace: &Path, host_port: u16) {
     let _ = std::fs::remove_file(name_file_path(workspace, host_port));
 }
 
+fn keepalive_file_path(workspace: &Path, host_port: u16) -> std::path::PathBuf {
+    forward_dir().join(format!("{}-{}.keepalive", workspace_hash(workspace), host_port))
+}
+
+fn save_keepalive(workspace: &Path, host_port: u16, value: &str) -> anyhow::Result<()> {
+    std::fs::create_dir_all(forward_dir())?;
+    std::fs::write(keepalive_file_path(workspace, host_port), value)?;
+    Ok(())
+}
+
+fn load_keepalive(workspace: &Path, host_port: u16) -> Option<String> {
+    std::fs::read_to_string(keepalive_file_path(workspace, host_port))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn remove_keepalive(workspace: &Path, host_port: u16) {
+    let _ = std::fs::remove_file(keepalive_file_path(workspace, host_port));
+}
+
 /// Collect active port entries (with custom names) for this workspace.
 fn active_entries_for_workspace(workspace: &Path) -> Vec<crate::caddy::PortEntry> {
     let dir = forward_dir();
@@ -131,6 +156,7 @@ fn active_entries_for_workspace(workspace: &Path) -> Vec<crate::caddy::PortEntry
                     entries.push(crate::caddy::PortEntry {
                         port,
                         custom_name: load_custom_name(workspace, port),
+                        keepalive: load_keepalive(workspace, port),
                     });
                 }
             }
@@ -216,6 +242,7 @@ fn stop_forwarder(workspace: &Path, host_port: u16) -> anyhow::Result<()> {
 
     let _ = std::fs::remove_file(&path);
     remove_custom_name(workspace, host_port);
+    remove_keepalive(workspace, host_port);
     eprintln!("Stopped forwarder on port {host_port} (PID {pid})");
 
     // Update Caddy config: regenerate with remaining active ports or remove entirely
@@ -306,6 +333,7 @@ async fn run_forwarder(
         all_entries.push(crate::caddy::PortEntry {
             port: host_port,
             custom_name: load_custom_name(workspace, host_port),
+            keepalive: load_keepalive(workspace, host_port),
         });
     }
     all_entries.sort_by_key(|e| e.port);
