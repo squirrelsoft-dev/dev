@@ -179,7 +179,9 @@ async fn fetch_and_cache_oci_config(reference: &str) -> Result<CachedImageConfig
         user,
         working_dir,
     };
-    write_cached_config(reference, &cached)?;
+    if let Err(e) = write_cached_config(reference, &cached) {
+        eprintln!("Warning: failed to cache OCI config: {e}");
+    }
     Ok(cached)
 }
 
@@ -300,7 +302,7 @@ fn to_apple_config(
             .clone()
             .unwrap_or_else(|| "sleep".to_string()),
         arguments: if config.entrypoint.is_none() {
-            vec!["3600".to_string()]
+            vec!["infinity".to_string()]
         } else {
             Vec::new()
         },
@@ -419,18 +421,17 @@ impl ContainerRuntime for AppleRuntime {
             let cached = read_cached_config(&config.image);
             let image_env = if let Some(c) = cached {
                 c.env
+            } else if config.image.starts_with("localhost/") {
+                // Local images have no registry to query; daemon handles env vars.
+                Vec::new()
             } else {
                 match fetch_and_cache_oci_config(&config.image).await {
                     Ok(c) => c.env,
                     Err(e) => {
-                        // Only warn for non-local images; localhost refs have no
-                        // registry to query and the daemon handles env vars.
-                        if !config.image.starts_with("localhost/") {
-                            eprintln!(
-                                "Warning: could not fetch image config for {}: {e}",
-                                config.image
-                            );
-                        }
+                        eprintln!(
+                            "Warning: could not fetch image config for {}: {e}",
+                            config.image
+                        );
                         Vec::new()
                     }
                 }
@@ -706,10 +707,12 @@ impl ContainerRuntime for AppleRuntime {
                 });
             }
 
-            // Not cached — attempt to fetch from registry.  This may fail
-            // for locally-built images (`localhost/...`) which have no
-            // registry to query; we silently ignore the error and return
-            // defaults.
+            // Local images have no registry to query.
+            if image.starts_with("localhost/") {
+                return Ok(ImageMetadata::default());
+            }
+
+            // Not cached — attempt to fetch from registry.
             match fetch_and_cache_oci_config(&image).await {
                 Ok(c) => Ok(ImageMetadata {
                     env: c.env.clone(),

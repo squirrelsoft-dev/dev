@@ -141,11 +141,20 @@ impl XpcMessage {
             ));
         }
         if let Some(data) = self.get_data(crate::routes::ERROR_KEY) {
-            if let Ok(err) = serde_json::from_slice::<ContainerXPCError>(&data) {
-                return Err(AppleContainerError::XpcError(format!(
-                    "{}: {}",
-                    err.code, err.message
-                )));
+            match serde_json::from_slice::<ContainerXPCError>(&data) {
+                Ok(err) => {
+                    return Err(AppleContainerError::XpcError(format!(
+                        "{}: {}",
+                        err.code, err.message
+                    )));
+                }
+                Err(_) => {
+                    let fallback = String::from_utf8_lossy(&data).into_owned();
+                    return Err(AppleContainerError::XpcError(format!(
+                        "Daemon error (unparsed): {}",
+                        fallback
+                    )));
+                }
             }
         }
         Ok(())
