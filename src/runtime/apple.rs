@@ -2,8 +2,8 @@ use std::os::fd::AsRawFd;
 use std::path::Path;
 
 use apple_container::models::{
-    ContainerConfiguration, Filesystem, ImageDescription, OciDescriptor, ProcessConfiguration,
-    PublishPort, Resources, RuntimeStatus, User,
+    ContainerConfiguration, Empty, FSType, Filesystem, ImageDescription, ProcessConfiguration,
+    PublishPort, Resources, RuntimeStatus, User, UserId, UserString,
 };
 use apple_container::AppleContainerClient;
 
@@ -31,6 +31,26 @@ impl AppleRuntime {
             .await
             .map_err(|e| DevError::Runtime(format!("Apple Containers ping failed: {e}")))?;
         Ok(())
+    }
+
+    /// Search the Apple Container local image store for a reference.
+    ///
+    /// Returns the raw ImageDescription bytes if found, or None if the image
+    /// is not present locally and must be pulled from a registry.
+    async fn find_local_image(&self, reference: &str) -> Option<Vec<u8>> {
+        match self.client.image_list().await {
+            Ok(images) => {
+                for img in &images {
+                    if img.reference == reference {
+                        return serde_json::to_vec(&img).ok();
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Warning: could not list local images: {e}");
+            }
+        }
+        None
     }
 }
 
@@ -90,19 +110,21 @@ fn translate_shift_enter(input: &[u8]) -> Vec<u8> {
 }
 
 /// Convert our generic ContainerConfig to the Apple Containers configuration.
-fn to_apple_config(config: &ContainerConfig) -> ContainerConfiguration {
+fn to_apple_config(config: &ContainerConfig, image: ImageDescription) -> ContainerConfiguration {
     let mounts: Vec<Filesystem> = config
         .mounts
         .iter()
         .map(|m| Filesystem {
+                fs_type: FSType::Virtiofs(Empty {}),
             source: m.source.display().to_string(),
             destination: m.target.clone(),
-            read_only: m.readonly,
+            options: if m.readonly { vec!["ro".to_string()] } else { vec![] },
         })
         .chain(config.workspace_mount.iter().map(|ws| Filesystem {
+                fs_type: FSType::Virtiofs(Empty {}),
             source: ws.source.display().to_string(),
             destination: ws.target.clone(),
-            read_only: false,
+            options: vec![],
         }))
         .collect();
 
@@ -122,34 +144,69 @@ fn to_apple_config(config: &ContainerConfig) -> ContainerConfiguration {
         .map(|(k, v)| format!("{k}={v}"))
         .collect();
 
+    let mut init_env = env.clone();
+    if init_env.iter().all(|e| !e.starts_with("PATH=")) {
+        init_env.push("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string());
+    }
+
     let init_process = ProcessConfiguration {
         executable: config
             .entrypoint
             .clone()
-            .unwrap_or_else(|| "/bin/sleep".to_string()),
+            .unwrap_or_else(|| "sleep".to_string()),
         arguments: if config.entrypoint.is_none() {
-            vec!["infinity".to_string()]
+            vec!["3600".to_string()]
         } else {
             Vec::new()
         },
-        environment: env,
+        environment: init_env,
         working_directory: "/".to_string(),
         terminal: false,
-        user: User::default(),
+        user: User::Raw {
+            raw: UserString {
+                user_string: "root".to_string(),
+            },
+        },
+        supplemental_groups: vec![],
+        rlimits: vec![],
     };
 
+    // Truncate container ID to 36 chars (UUID length) — vmexec has a length limit.
+    let id = if config.name.len() > 36 {
+        format!("{}-{}", &config.name[..17], &config.name[config.name.len()-18..])
+    } else {
+        config.name.clone()
+    };
+    let hostname = id.clone();
+
     ContainerConfiguration {
-        id: config.name.clone(),
-        image: ImageDescription {
-            descriptor: OciDescriptor::default(),
-            reference: config.image.clone(),
-            manifest_digest: String::new(),
-        },
+        id,
+        image,
         mounts,
         published_ports,
         labels: config.labels.clone(),
         init_process,
-        resources: Resources::default(),
+        resources: Resources {
+            cpus: 4,
+            memory_in_bytes: 1024 * 1024 * 1024, // 1 GiB
+        },
+        runtime_handler: "container-runtime-linux".to_string(),
+        platform: apple_container::models::Platform {
+            architecture: "arm64".to_string(),
+            os: "linux".to_string(),
+        },
+        networks: vec![apple_container::models::NetworkInfo {
+            network: "default".to_string(),
+            options: apple_container::models::NetworkOptions {
+                hostname: Some(hostname),
+                mtu: Some(1280),
+            },
+        }],
+        dns: Some(apple_container::models::DnsInfo {
+            nameservers: vec![],
+            search_domains: vec![],
+            options: vec![],
+        }),
     }
 }
 
@@ -159,7 +216,7 @@ impl ContainerRuntime for AppleRuntime {
     }
 
     fn pull_image(&self, _image: &str) -> BoxFut<'_, ()> {
-        // Apple Containers pulls images automatically during containerCreate.
+        // Pulled inline in create_container so we can use the real descriptor.
         Box::pin(async { Ok(()) })
     }
 
@@ -186,7 +243,33 @@ impl ContainerRuntime for AppleRuntime {
     fn create_container(&self, config: &ContainerConfig) -> BoxFut<'_, String> {
         let config = config.clone();
         Box::pin(async move {
-            let apple_config = to_apple_config(&config);
+            let platform = serde_json::json!({
+                "architecture": "arm64",
+                "os": "linux"
+            });
+            let platform_json = serde_json::to_vec(&platform)
+                .map_err(|e| DevError::Runtime(format!("serialize platform: {e}")))?;
+
+            // Try to find the image in the local Apple Container store first.
+            // Apple's image service treats all references as remote registry URLs,
+            // so `localhost/foo:latest` gets parsed as hostname `localhost`.
+            // Local images must be resolved from the image list before pulling.
+            let image_desc_bytes = match self.find_local_image(&config.image).await {
+                Some(desc) => desc,
+                None => {
+                    apple_container::build::pull_image(&config.image, &platform_json)
+                        .await
+                        .map_err(|e| DevError::Runtime(format!("pull image: {e}")))?
+                }
+            };
+
+            apple_container::build::unpack_image(&image_desc_bytes, &platform_json)
+                .await
+                .map_err(|e| DevError::Runtime(format!("unpack image: {e}")))?;
+            let image: ImageDescription = serde_json::from_slice(&image_desc_bytes)
+                .map_err(|e| DevError::Runtime(format!("parse image descriptor: {e}")))?;
+
+            let apple_config = to_apple_config(&config, image);
             let id = apple_config.id.clone();
 
             let kernel = self.client
@@ -199,24 +282,28 @@ impl ContainerRuntime for AppleRuntime {
                 .await
                 .map_err(|e| DevError::Runtime(format!("Failed to create container: {e}")))?;
 
-            // Bootstrap the container with /dev/null fds since the init process
-            // runs detached (sleep infinity or the configured entrypoint).
+            Ok(id)
+        })
+    }
+
+    fn start_container(&self, id: &str) -> BoxFut<'_, ()> {
+        let id = id.to_string();
+        Box::pin(async move {
             let devnull = std::fs::File::open("/dev/null")
                 .map_err(|e| DevError::Runtime(format!("Failed to open /dev/null: {e}")))?;
             let fd = devnull.as_raw_fd();
-
             self.client
                 .bootstrap(&id, fd, fd, fd)
                 .await
                 .map_err(|e| DevError::Runtime(format!("Failed to bootstrap container: {e}")))?;
 
-            Ok(id)
-        })
-    }
+            self.client
+                .start_process(&id, &id)
+                .await
+                .map_err(|e| DevError::Runtime(format!("Failed to start container: {e}")))?;
 
-    fn start_container(&self, _id: &str) -> BoxFut<'_, ()> {
-        // Apple containers start on bootstrap — this is a no-op.
-        Box::pin(async { Ok(()) })
+            Ok(())
+        })
     }
 
     fn stop_container(&self, id: &str) -> BoxFut<'_, ()> {
@@ -267,7 +354,11 @@ impl ContainerRuntime for AppleRuntime {
                 environment: Vec::new(),
                 working_directory: "/".to_string(),
                 terminal: false,
-                user: User { uid, gid: uid },
+                user: User::Id {
+                    id: UserId { uid, gid: uid },
+                },
+                supplemental_groups: vec![],
+                rlimits: vec![],
             };
 
             self.client
@@ -332,7 +423,11 @@ impl ContainerRuntime for AppleRuntime {
                 environment: Vec::new(),
                 working_directory: "/".to_string(),
                 terminal: true,
-                user: User { uid, gid: uid },
+                user: User::Id {
+                    id: UserId { uid, gid: uid },
+                },
+                supplemental_groups: vec![],
+                rlimits: vec![],
             };
 
             // For interactive mode, pass the real terminal fds directly.
@@ -447,5 +542,169 @@ impl ContainerRuntime for AppleRuntime {
                 "Port forwarding is not yet supported for Apple Containers".into(),
             ))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use tempfile::TempDir;
+
+    /// Direct integration test: create + start a container using AppleRuntime,
+    /// mirroring the minimal test from apple-test.
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn test_apple_runtime_lifecycle() {
+        let runtime = AppleRuntime::connect().expect("connect failed");
+        let container_id = "apple-runtime-test-lifecycle";
+        let image_ref = "mcr.microsoft.com/devcontainers/base:ubuntu";
+
+        // Pull and unpack image
+        let platform = serde_json::json!({"architecture": "arm64", "os": "linux"});
+        let platform_json = serde_json::to_vec(&platform).unwrap();
+        let image_desc_bytes = apple_container::build::pull_image(image_ref, &platform_json)
+            .await
+            .expect("pull_image failed");
+        apple_container::build::unpack_image(&image_desc_bytes, &platform_json)
+            .await
+            .expect("unpack_image failed");
+        let image: ImageDescription = serde_json::from_slice(&image_desc_bytes)
+            .expect("parse image descriptor failed");
+
+        // Get default kernel
+        let kernel = runtime.client
+            .get_default_kernel()
+            .await
+            .expect("get_default_kernel failed");
+
+        // Build config matching the minimal test
+        let config = ContainerConfiguration {
+            id: container_id.to_string(),
+            image,
+            mounts: vec![],
+            published_ports: vec![],
+            labels: HashMap::new(),
+            init_process: ProcessConfiguration {
+                executable: "sleep".to_string(),
+                arguments: vec!["3600".to_string()],
+                environment: vec!["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()],
+                working_directory: "/".to_string(),
+                terminal: false,
+                user: User::Raw {
+                    raw: UserString { user_string: "root".to_string() },
+                },
+                supplemental_groups: vec![],
+                rlimits: vec![],
+            },
+            resources: Resources { cpus: 4, memory_in_bytes: 1024 * 1024 * 1024 },
+            runtime_handler: "container-runtime-linux".to_string(),
+            platform: Platform { architecture: "arm64".to_string(), os: "linux".to_string() },
+            networks: vec![NetworkInfo {
+                network: "default".to_string(),
+                options: NetworkOptions { hostname: Some(container_id.to_string()), mtu: Some(1280) },
+            }],
+            dns: Some(DnsInfo { nameservers: vec![], search_domains: vec![], options: vec![] }),
+        };
+
+        // Clean up any previous test container
+        let _ = runtime.client.stop(container_id).await;
+        let _ = runtime.client.delete(container_id, true).await;
+
+        // Create
+        runtime.client.create(&config, &kernel).await.expect("create failed");
+
+        // Start (bootstrap + start_process)
+        let devnull = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let fd = devnull.as_raw_fd();
+        runtime.client.bootstrap(container_id, fd, fd, fd).await.expect("bootstrap failed");
+        runtime.client.start_process(container_id, container_id).await.expect("start_process failed");
+
+        // Verify running
+        let snapshot = runtime.client.get(container_id).await.expect("get failed");
+        assert_eq!(snapshot.status, RuntimeStatus::Running, "container should be running");
+
+        // Clean up
+        runtime.client.stop(container_id).await.expect("stop failed");
+        runtime.client.delete(container_id, true).await.expect("delete failed");
+    }
+
+    /// Integration test using the public runtime API (create_container / start_container)
+    /// with a realistic ContainerConfig matching what `dev up` produces.
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn test_apple_runtime_api_lifecycle() {
+        let runtime = AppleRuntime::connect().expect("connect failed");
+        // Use a long ID (>36 chars) to verify truncation works
+        let container_id = "vsc-test-apple-workspace-d3a8ce6bf5e568384dcfdf4b671042dd9e069a6645ad70d422ff0f4f8f793b62";
+        let truncated_id = format!("{}-{}", &container_id[..17], &container_id[container_id.len()-18..]);
+        let image_ref = "mcr.microsoft.com/devcontainers/base:ubuntu";
+
+        // Pull and unpack image (same as dev up)
+        let platform = serde_json::json!({"architecture": "arm64", "os": "linux"});
+        let platform_json = serde_json::to_vec(&platform).unwrap();
+        let image_desc_bytes = apple_container::build::pull_image(image_ref, &platform_json)
+            .await
+            .expect("pull_image failed");
+        apple_container::build::unpack_image(&image_desc_bytes, &platform_json)
+            .await
+            .expect("unpack_image failed");
+
+        // Create a temp workspace directory following the project's test conventions
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path().to_path_buf();
+        let devcontainer_dir = workspace_path.join(".devcontainer");
+        std::fs::create_dir_all(&devcontainer_dir).unwrap();
+        std::fs::write(
+            devcontainer_dir.join("devcontainer.json"),
+            r#"{"name":"Test","image":"mcr.microsoft.com/devcontainers/base:ubuntu"}"#
+        ).unwrap();
+
+        // Build a ContainerConfig matching what dev up would create
+        let container_config = ContainerConfig {
+            image: image_ref.to_string(),
+            name: container_id.to_string(),
+            labels: {
+                let mut labels = HashMap::new();
+                labels.insert("devcontainer.local_folder".to_string(), workspace_path.to_string_lossy().to_string());
+                labels.insert("devcontainer.config_file".to_string(), devcontainer_dir.join("devcontainer.json").to_string_lossy().to_string());
+                labels
+            },
+            env: {
+                let mut env = HashMap::new();
+                env.insert("REMOTE_CONTAINERS".to_string(), "true".to_string());
+                env
+            },
+            mounts: vec![],
+            volumes: vec![],
+            ports: vec![],
+            workspace_mount: Some(crate::runtime::WorkspaceMount {
+                source: workspace_path.clone(),
+                target: "/workspaces/test-apple-workspace".to_string(),
+            }),
+            extra_args: vec![],
+            entrypoint: None,
+            init: false,
+            privileged: false,
+            cap_add: vec![],
+            security_opt: vec![],
+        };
+
+        // Clean up any previous test container (using truncated ID)
+        let _ = runtime.client.stop(&truncated_id).await;
+        let _ = runtime.client.delete(&truncated_id, true).await;
+
+        // Use the public API (same as dev up)
+        let id = runtime.create_container(&container_config).await.expect("create_container failed");
+        assert_eq!(id, truncated_id, "create_container should return truncated ID");
+        runtime.start_container(&id).await.expect("start_container failed");
+
+        // Verify running
+        let snapshot = runtime.client.get(&id).await.expect("get failed");
+        assert_eq!(snapshot.status, RuntimeStatus::Running, "container should be running");
+
+        // Clean up
+        runtime.client.stop(&truncated_id).await.expect("stop failed");
+        runtime.client.delete(&truncated_id, true).await.expect("delete failed");
     }
 }

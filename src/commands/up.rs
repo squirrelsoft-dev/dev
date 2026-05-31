@@ -348,7 +348,12 @@ pub async fn run(
     eprintln!("Creating container '{name}'...");
     let container_id = runtime.create_container(&container_config).await?;
 
-    eprintln!("Starting container '{name}'...");
+    // Warn when the container name was truncated by the runtime (e.g., Apple vmexec limit).
+    if container_id != name {
+        eprintln!("Truncated as '{container_id}' to fit the maximum container ID length.");
+    }
+
+    eprintln!("Starting container '{container_id}'...");
     runtime.start_container(&container_id).await?;
 
     // Run lifecycle hooks — feature hooks first, then config hooks (Gap 6).
@@ -364,7 +369,7 @@ pub async fn run(
         install_dotfiles(runtime.as_ref(), &container_id, dotfiles, remote_user).await?;
     }
 
-    println!("Container '{name}' is ready.");
+    println!("Container '{container_id}' is ready.");
 
     if !caddy_host_ports.is_empty() {
         if let Err(e) = crate::caddy::register_site(workspace, &caddy_host_ports) {
