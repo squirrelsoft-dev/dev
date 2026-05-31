@@ -95,6 +95,9 @@ pub struct ExecResult {
 pub struct ImageMetadata {
     pub remote_user: Option<String>,
     pub container_user: Option<String>,
+    /// Environment variables from the OCI image config (`Env` field).
+    #[allow(dead_code)]
+    pub env: Vec<String>,
 }
 
 /// Handle to a running exec session with attached stdin/stdout byte streams.

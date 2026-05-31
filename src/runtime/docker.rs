@@ -806,6 +806,7 @@ impl BollardRuntime {
         Ok(ImageMetadata {
             remote_user,
             container_user,
+            env: Vec::new(),
         })
     }
 }

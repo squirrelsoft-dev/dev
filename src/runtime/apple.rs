@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 
@@ -52,6 +53,134 @@ impl AppleRuntime {
         }
         None
     }
+}
+
+/// Return the path to the OCI config cache directory.
+fn oci_config_cache_dir() -> std::path::PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("devcontainer")
+        .join("oci-configs")
+}
+
+/// Cache key for an image reference (SHA-256 of normalized ref).
+fn cache_key(reference: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(reference.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Cached OCI image config fields we care about.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CachedImageConfig {
+    env: Vec<String>,
+    user: Option<String>,
+    working_dir: Option<String>,
+}
+
+/// Read cached OCI image config for a reference, if present.
+fn read_cached_config(reference: &str) -> Option<CachedImageConfig> {
+    let path = oci_config_cache_dir().join(cache_key(reference)).with_extension("json");
+    let data = std::fs::read(&path).ok()?;
+    serde_json::from_slice(&data).ok()
+}
+
+/// Write cached OCI image config for a reference.
+fn write_cached_config(reference: &str, config: &CachedImageConfig) -> Result<(), DevError> {
+    let dir = oci_config_cache_dir();
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| DevError::Runtime(format!("create cache dir: {e}")))?;
+    let path = dir.join(cache_key(reference)).with_extension("json");
+    let data = serde_json::to_vec(config)
+        .map_err(|e| DevError::Runtime(format!("serialize cache: {e}")))?;
+    std::fs::write(&path, &data)
+        .map_err(|e| DevError::Runtime(format!("write cache: {e}")))?;
+    Ok(())
+}
+
+/// Platform resolver that chooses the first linux/arm64 variant from an image index.
+fn linux_arm64_resolver(manifests: &[oci_client::manifest::ImageIndexEntry]) -> Option<String> {
+    manifests
+        .iter()
+        .find(|entry| {
+            entry.platform.as_ref().map_or(false, |platform| {
+                platform.os == "linux" && platform.architecture == "arm64"
+            })
+        })
+        .map(|entry| entry.digest.clone())
+}
+
+/// Fetch the OCI image config from a registry and cache it locally.
+///
+/// Uses `oci_client` to authenticate, pull the manifest, then pull the
+/// config blob described by `manifest.config.digest`.  The parsed
+/// `env`, `user`, and `working_dir` fields are stored in
+/// `~/.cache/devcontainer/oci-configs/` for later use by
+/// `to_apple_config`.
+async fn fetch_and_cache_oci_config(reference: &str) -> Result<CachedImageConfig, DevError> {
+    let oci_ref: oci_client::Reference = reference.parse().map_err(|e: oci_client::ParseError| {
+        DevError::Runtime(format!("invalid image ref: {e}"))
+    })?;
+
+    let client = oci_client::Client::new(oci_client::client::ClientConfig {
+        platform_resolver: Some(Box::new(linux_arm64_resolver)),
+        ..Default::default()
+    });
+    let auth = oci_client::secrets::RegistryAuth::Anonymous;
+    client
+        .auth(&oci_ref, &auth, oci_client::RegistryOperation::Pull)
+        .await
+        .map_err(|e| DevError::Runtime(format!("registry auth failed: {e}")))?;
+
+    let (manifest, _digest) = client
+        .pull_image_manifest(&oci_ref, &auth)
+        .await
+        .map_err(|e| DevError::Runtime(format!("pull manifest for {reference}: {e}")))?;
+
+    let mut config_data = Vec::new();
+    client
+        .pull_blob(
+            &oci_ref,
+            manifest.config.digest.as_str(),
+            &mut config_data,
+        )
+        .await
+        .map_err(|e| DevError::Runtime(format!("pull config blob for {reference}: {e}")))?;
+
+    let config_json: serde_json::Value = serde_json::from_slice(&config_data)
+        .map_err(|e| DevError::Runtime(format!("parse image config JSON: {e}")))?;
+
+    let env = config_json
+        .get("config")
+        .and_then(|c| c.get("Env"))
+        .and_then(|e| e.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let user = config_json
+        .get("config")
+        .and_then(|c| c.get("User"))
+        .and_then(|u| u.as_str())
+        .map(|s| s.to_string());
+
+    let working_dir = config_json
+        .get("config")
+        .and_then(|c| c.get("WorkingDir"))
+        .and_then(|w| w.as_str())
+        .map(|s| s.to_string());
+
+    let cached = CachedImageConfig {
+        env,
+        user,
+        working_dir,
+    };
+    write_cached_config(reference, &cached)?;
+    Ok(cached)
 }
 
 /// RAII guard that puts the terminal into raw mode and restores it on drop.
@@ -110,7 +239,32 @@ fn translate_shift_enter(input: &[u8]) -> Vec<u8> {
 }
 
 /// Convert our generic ContainerConfig to the Apple Containers configuration.
-fn to_apple_config(config: &ContainerConfig, image: ImageDescription) -> ContainerConfiguration {
+/// Merge environment variables from the OCI image config with the container
+/// config env, matching Apple `container` CLI's `Parser.allEnv()` order:
+/// image env → container config env → runtime env (later overrides earlier).
+fn merge_env(image_env: &[String], container_env: &HashMap<String, String>) -> Vec<String> {
+    let mut merged: HashMap<String, String> = HashMap::new();
+
+    // 1. Image env as base.
+    for entry in image_env {
+        if let Some((k, v)) = entry.split_once('=') {
+            merged.insert(k.to_string(), v.to_string());
+        }
+    }
+
+    // 2. Container config env overrides image env.
+    for (k, v) in container_env {
+        merged.insert(k.clone(), v.clone());
+    }
+
+    merged.into_iter().map(|(k, v)| format!("{k}={v}")).collect()
+}
+
+fn to_apple_config(
+    config: &ContainerConfig,
+    image: ImageDescription,
+    image_env: &[String],
+) -> ContainerConfiguration {
     let mounts: Vec<Filesystem> = config
         .mounts
         .iter()
@@ -138,16 +292,7 @@ fn to_apple_config(config: &ContainerConfig, image: ImageDescription) -> Contain
         })
         .collect();
 
-    let env: Vec<String> = config
-        .env
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect();
-
-    let mut init_env = env.clone();
-    if init_env.iter().all(|e| !e.starts_with("PATH=")) {
-        init_env.push("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string());
-    }
+    let init_env = merge_env(image_env, &config.env);
 
     let init_process = ProcessConfiguration {
         executable: config
@@ -269,7 +414,29 @@ impl ContainerRuntime for AppleRuntime {
             let image: ImageDescription = serde_json::from_slice(&image_desc_bytes)
                 .map_err(|e| DevError::Runtime(format!("parse image descriptor: {e}")))?;
 
-            let apple_config = to_apple_config(&config, image);
+            // Fetch OCI image config env vars (cached or from registry) so the
+            // init process inherits the image's expected environment.
+            let cached = read_cached_config(&config.image);
+            let image_env = if let Some(c) = cached {
+                c.env
+            } else {
+                match fetch_and_cache_oci_config(&config.image).await {
+                    Ok(c) => c.env,
+                    Err(e) => {
+                        // Only warn for non-local images; localhost refs have no
+                        // registry to query and the daemon handles env vars.
+                        if !config.image.starts_with("localhost/") {
+                            eprintln!(
+                                "Warning: could not fetch image config for {}: {e}",
+                                config.image
+                            );
+                        }
+                        Vec::new()
+                    }
+                }
+            };
+
+            let apple_config = to_apple_config(&config, image, &image_env);
             let id = apple_config.id.clone();
 
             let kernel = self.client
@@ -526,9 +693,32 @@ impl ContainerRuntime for AppleRuntime {
         Box::pin(async { Ok(false) })
     }
 
-    fn inspect_image_metadata(&self, _image: &str) -> BoxFut<'_, ImageMetadata> {
-        // Apple Containers doesn't have a local image store to query.
-        Box::pin(async { Ok(ImageMetadata::default()) })
+    fn inspect_image_metadata(&self, image: &str) -> BoxFut<'_, ImageMetadata> {
+        let image = image.to_string();
+        Box::pin(async move {
+            // Try to read cached OCI config for this image.
+            let cached = read_cached_config(&image);
+            if let Some(c) = cached {
+                return Ok(ImageMetadata {
+                    env: c.env,
+                    container_user: c.user,
+                    ..ImageMetadata::default()
+                });
+            }
+
+            // Not cached — attempt to fetch from registry.  This may fail
+            // for locally-built images (`localhost/...`) which have no
+            // registry to query; we silently ignore the error and return
+            // defaults.
+            match fetch_and_cache_oci_config(&image).await {
+                Ok(c) => Ok(ImageMetadata {
+                    env: c.env.clone(),
+                    container_user: c.user,
+                    ..ImageMetadata::default()
+                }),
+                Err(_) => Ok(ImageMetadata::default()),
+            }
+        })
     }
 
     fn exec_attached(
