@@ -11,6 +11,10 @@ repository = "https://github.com/squirrelsoft-dev/dev"
 keywords = ["devcontainer", "docker", "container", "development"]
 categories = ["command-line-utilities", "development-tools"]
 
+[lib]
+name = "devcontainer_lib"
+path = "src/lib.rs"
+
 [[bin]]
 name = "dev"
 path = "src/main.rs"
