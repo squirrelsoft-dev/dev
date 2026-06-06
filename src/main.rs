@@ -4,25 +4,8 @@ mod collection;
 mod commands;
 mod tui;
 
-// Use modules from the library crate.
-use devcontainer_lib as dclib;
-
 // Re-export library modules under the names that commands/* expect.
-mod devcontainer {
-    pub use crate::dclib::devcontainer::*;
-}
-mod error {
-    pub use crate::dclib::error::*;
-}
-mod oci {
-    pub use crate::dclib::oci::*;
-}
-mod runtime {
-    pub use crate::dclib::runtime::*;
-}
-mod util {
-    pub use crate::dclib::util::*;
-}
+pub(crate) use devcontainer_lib::{devcontainer, error, oci, runtime, util};
 
 use std::path::PathBuf;
 
