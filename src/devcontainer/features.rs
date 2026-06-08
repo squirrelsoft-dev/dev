@@ -627,9 +627,17 @@ pub fn generate_feature_dockerfile_with_opts(
                     serde_json::Value::String(s) => s.clone(),
                     other => other.to_string(),
                 };
-                // Shell-escape single quotes in values.
-                let escaped_val = val_str.replace('\'', "'\\''");
-                option_exports.push(format!("export {env_name}='{escaped_val}'"));
+                // Escape special characters for safe embedding in a printf '%b'
+                // expression inside a Dockerfile RUN step. This handles newlines,
+                // tabs, carriage returns, backslashes, and single quotes without
+                // breaking the Dockerfile syntax.
+                let escaped_val = val_str
+                    .replace('\\', "\\\\")
+                    .replace('\n', "\\n")
+                    .replace('\r', "\\r")
+                    .replace('\t', "\\t")
+                    .replace('\'', "'\\''");
+                option_exports.push(format!("export {env_name}=\"$(printf '%b' '{escaped_val}')\""));
             }
         }
 
@@ -906,7 +914,7 @@ mod tests {
         );
         // feature-a's RUN should contain the export.
         assert!(
-            dockerfile.contains("export VERSION='3.12'"),
+            dockerfile.contains("export VERSION=\"$(printf '%b' '3.12')\""),
             "Feature-a's RUN step should export VERSION.\nDockerfile:\n{dockerfile}"
         );
     }
@@ -935,5 +943,29 @@ mod tests {
         assert_eq!(option_name_to_env("version"), "VERSION");
         assert_eq!(option_name_to_env("nodeVersion"), "NODEVERSION");
         assert_eq!(option_name_to_env("my-option"), "MY_OPTION");
+    }
+
+    #[test]
+    fn feature_options_escape_special_characters() {
+        let features = vec![
+            make_feature("feature-a", serde_json::json!({"desc": "line1\nline2"})),
+        ];
+        let config = empty_config();
+        let dockerfile = generate_feature_dockerfile_with_opts(
+            "base:latest",
+            &features,
+            Some("root"),
+            &config,
+        );
+        // Newlines should be escaped as \n inside printf, not literal newlines
+        // that would break the Dockerfile RUN instruction.
+        assert!(
+            !dockerfile.contains("line1\nline2"),
+            "Literal newlines must not appear in Dockerfile.\nDockerfile:\n{dockerfile}"
+        );
+        assert!(
+            dockerfile.contains("export DESC=\"$(printf '%b' 'line1\\nline2')\""),
+            "Special characters should be escaped via printf.\nDockerfile:\n{dockerfile}"
+        );
     }
 }
