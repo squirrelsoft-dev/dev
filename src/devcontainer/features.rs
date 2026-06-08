@@ -607,12 +607,19 @@ pub fn generate_feature_dockerfile_with_opts(
         }
 
         // Emit feature's containerEnv as ENV directives (Gap 1).
+        // These intentionally persist in the final image — they are part of
+        // the container's runtime environment, not build-time options.
         for (key, val) in &feature.container_env {
             let escaped_val = val.replace('\\', "\\\\").replace('"', "\\\"");
             lines.push(format!("ENV {key}=\"{escaped_val}\""));
         }
 
-        // Pass feature options as environment variables (uppercased per spec).
+        // Collect feature options to pass as scoped exports in the RUN step.
+        // Options must NOT be emitted as ENV directives because ENV persists
+        // across all subsequent Dockerfile steps. A feature setting e.g.
+        // VERSION=3.12 would leak into later features that use $VERSION with
+        // a different meaning (e.g. copilot-cli defaulting to "latest").
+        let mut option_exports = Vec::new();
         if let Some(obj) = feature.options.as_object() {
             for (key, val) in obj {
                 let env_name = option_name_to_env(key);
@@ -620,7 +627,9 @@ pub fn generate_feature_dockerfile_with_opts(
                     serde_json::Value::String(s) => s.clone(),
                     other => other.to_string(),
                 };
-                lines.push(format!("ENV {env_name}={val_str}"));
+                // Shell-escape single quotes in values.
+                let escaped_val = val_str.replace('\'', "'\\''");
+                option_exports.push(format!("export {env_name}='{escaped_val}'"));
             }
         }
 
@@ -630,10 +639,10 @@ pub fn generate_feature_dockerfile_with_opts(
         // older Docker Engine (Docker Desktop on Mac silently works around it).
         lines.push(format!("ADD {i}.tar {stage_dir}/"));
 
-        // Gap 12: Wrapper script with env sourcing and error context.
+        // Wrapper script with env sourcing, scoped options, and error context.
         lines.push(format!(
             "RUN {wrapper}",
-            wrapper = feature_wrapper_script(&feature.id, &feature.version, &stage_dir),
+            wrapper = feature_wrapper_script(&feature.id, &feature.version, &stage_dir, &option_exports),
         ));
     }
 
@@ -656,18 +665,27 @@ pub fn generate_feature_dockerfile_with_opts(
 ///
 /// The wrapper:
 /// 1. Sources the dynamic user home script (for non-standard users)
-/// 2. Sets error context variables (_DEV_FEATURE_ID, _DEV_FEATURE_VERSION)
-/// 3. Runs install.sh with `set -e` for proper error propagation
-/// 4. Reports clear error messages on failure
-fn feature_wrapper_script(feature_id: &str, feature_version: &str, stage_dir: &str) -> String {
+/// 2. Exports feature options as scoped environment variables
+/// 3. Sets error context variables (_DEV_FEATURE_ID, _DEV_FEATURE_VERSION)
+/// 4. Runs install.sh with `set -e` for proper error propagation
+/// 5. Reports clear error messages on failure
+fn feature_wrapper_script(feature_id: &str, feature_version: &str, stage_dir: &str, option_exports: &[String]) -> String {
     // Shell-escape the feature ID for safe embedding in the script.
     let escaped_id = feature_id.replace('\'', "'\\''");
     let escaped_version = feature_version.replace('\'', "'\\''");
+
+    let options_block = if option_exports.is_empty() {
+        String::new()
+    } else {
+        format!("{} && ", option_exports.join(" && "))
+    };
+
     format!(
         "set -e && \
          if [ -f /usr/local/share/dev-container-user-home.sh ]; then \
            . /usr/local/share/dev-container-user-home.sh; \
          fi && \
+         {options_block}\
          export _DEV_FEATURE_ID='{escaped_id}' && \
          export _DEV_FEATURE_VERSION='{escaped_version}' && \
          cd {stage_dir} && \
@@ -814,3 +832,108 @@ pub struct MergedCapabilities {
     pub security_opt: Vec<String>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::devcontainer::config::DevcontainerConfig;
+
+    fn make_feature(id: &str, options: serde_json::Value) -> ResolvedFeature {
+        ResolvedFeature {
+            id: id.to_string(),
+            oci_ref: String::new(),
+            version: "1".to_string(),
+            options,
+            install_script_path: PathBuf::from("/tmp/fake"),
+            install_after: Vec::new(),
+            container_env: HashMap::new(),
+            mounts: Vec::new(),
+            init: false,
+            privileged: false,
+            cap_add: Vec::new(),
+            security_opt: Vec::new(),
+            entrypoint: None,
+            lifecycle_hooks: FeatureLifecycleHooks::default(),
+            is_dependency: false,
+        }
+    }
+
+    fn empty_config() -> DevcontainerConfig {
+        DevcontainerConfig {
+            name: None,
+            image: None,
+            build: None,
+            docker_compose_file: None,
+            service: None,
+            workspace_folder: None,
+            features: None,
+            forward_ports: None,
+            remote_user: None,
+            remote_env: None,
+            container_env: None,
+            mounts: None,
+            volumes: None,
+            run_args: None,
+            on_create_command: None,
+            update_content_command: None,
+            post_create_command: None,
+            post_start_command: None,
+            post_attach_command: None,
+            initialize_command: None,
+            customize: None,
+            update_remote_user_uid: None,
+            dotfiles: None,
+        }
+    }
+
+    #[test]
+    fn feature_options_do_not_leak_across_features() {
+        let features = vec![
+            make_feature("feature-a", serde_json::json!({"version": "3.12"})),
+            make_feature("feature-b", serde_json::json!({})),
+        ];
+        let config = empty_config();
+        let dockerfile = generate_feature_dockerfile_with_opts(
+            "base:latest",
+            &features,
+            Some("root"),
+            &config,
+        );
+
+        // Feature options should be in RUN (scoped), not ENV (global).
+        assert!(
+            !dockerfile.contains("ENV VERSION="),
+            "Feature options must not use ENV directives (they leak across features).\nDockerfile:\n{dockerfile}"
+        );
+        // feature-a's RUN should contain the export.
+        assert!(
+            dockerfile.contains("export VERSION='3.12'"),
+            "Feature-a's RUN step should export VERSION.\nDockerfile:\n{dockerfile}"
+        );
+    }
+
+    #[test]
+    fn container_env_uses_env_directive() {
+        // containerEnv intentionally persists in the image — should use ENV.
+        let mut feature = make_feature("feature-a", serde_json::json!({}));
+        feature.container_env.insert("MY_VAR".to_string(), "hello".to_string());
+        let features = vec![feature];
+        let config = empty_config();
+        let dockerfile = generate_feature_dockerfile_with_opts(
+            "base:latest",
+            &features,
+            Some("root"),
+            &config,
+        );
+        assert!(
+            dockerfile.contains("ENV MY_VAR=\"hello\""),
+            "containerEnv should use ENV directives.\nDockerfile:\n{dockerfile}"
+        );
+    }
+
+    #[test]
+    fn option_name_to_env_uppercases() {
+        assert_eq!(option_name_to_env("version"), "VERSION");
+        assert_eq!(option_name_to_env("nodeVersion"), "NODEVERSION");
+        assert_eq!(option_name_to_env("my-option"), "MY_OPTION");
+    }
+}
