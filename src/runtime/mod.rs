@@ -95,6 +95,10 @@ pub struct ExecResult {
 pub struct ImageMetadata {
     pub remote_user: Option<String>,
     pub container_user: Option<String>,
+    /// Raw `devcontainer.metadata` label entries, in label order. Empty when the label
+    /// is absent or unparseable. Retained so callers can recover settings contributed by
+    /// the features that built an image without re-resolving those features.
+    pub metadata_entries: Vec<serde_json::Value>,
 }
 
 /// Handle to a running exec session with attached stdin/stdout byte streams.

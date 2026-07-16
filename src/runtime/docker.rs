@@ -768,25 +768,23 @@ impl BollardRuntime {
 
         let mut remote_user: Option<String> = None;
         let mut container_user: Option<String> = None;
+        let mut metadata_entries: Vec<serde_json::Value> = Vec::new();
 
         // Parse the devcontainer.metadata label (JSON array or single object).
         if let Some(ref labels) = config.labels {
             if let Some(raw) = labels.get("devcontainer.metadata") {
                 if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(raw) {
-                    // Later entries win.
-                    for entry in &arr {
-                        if let Some(u) = entry.get("remoteUser").and_then(|v| v.as_str()) {
-                            remote_user = Some(u.to_string());
-                        }
-                        if let Some(u) = entry.get("containerUser").and_then(|v| v.as_str()) {
-                            container_user = Some(u.to_string());
-                        }
-                    }
+                    metadata_entries = arr;
                 } else if let Ok(obj) = serde_json::from_str::<serde_json::Value>(raw) {
-                    if let Some(u) = obj.get("remoteUser").and_then(|v| v.as_str()) {
+                    metadata_entries = vec![obj];
+                }
+
+                // Later entries win.
+                for entry in &metadata_entries {
+                    if let Some(u) = entry.get("remoteUser").and_then(|v| v.as_str()) {
                         remote_user = Some(u.to_string());
                     }
-                    if let Some(u) = obj.get("containerUser").and_then(|v| v.as_str()) {
+                    if let Some(u) = entry.get("containerUser").and_then(|v| v.as_str()) {
                         container_user = Some(u.to_string());
                     }
                 }
@@ -806,6 +804,7 @@ impl BollardRuntime {
         Ok(ImageMetadata {
             remote_user,
             container_user,
+            metadata_entries,
         })
     }
 }

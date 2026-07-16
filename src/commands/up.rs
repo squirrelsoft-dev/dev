@@ -7,7 +7,10 @@ use crate::devcontainer::{
     run_lifecycle_hooks, stage_feature_context, substitute_variables,
     substitute_variables_with_user,
 };
-use crate::devcontainer::features::{generate_feature_dockerfile_with_opts, order_features};
+use crate::devcontainer::features::{
+    MergedCapabilities, ResolvedFeature, capabilities_from_metadata,
+    generate_feature_dockerfile_with_opts, order_features,
+};
 use crate::devcontainer::lockfile::{handle_lockfile, lockfile_path};
 use crate::devcontainer::uid;
 use crate::runtime::{
@@ -232,6 +235,16 @@ pub async fn run(
         final_tag
     };
 
+    // Resolve feature capabilities against the image the features produced, before the
+    // UID-remap layer below shadows `final_image` with a derived tag.
+    let caps = resolve_container_capabilities(
+        runtime.as_ref(),
+        &final_image,
+        &ordered_features,
+        has_features,
+    )
+    .await?;
+
     // Build container config
     let name = container_name(workspace);
     let folder_name = workspace_folder_name(workspace);
@@ -315,9 +328,6 @@ pub async fn run(
         .map(|s| substitute_variables_with_user(s, workspace, remote_user))
         .collect();
 
-    // Merge feature-contributed capabilities (Gap 5).
-    let caps = merge_feature_capabilities(&ordered_features);
-
     let container_config = ContainerConfig {
         image: final_image,
         name: name.clone(),
@@ -376,6 +386,40 @@ pub async fn run(
 }
 
 /// Run the `initializeCommand` on the host machine (Gap 9).
+/// Resolve the container capabilities contributed by features.
+///
+/// On the build path `ordered_features` is populated and is authoritative. On the
+/// cache-hit path the features are never resolved, so recover the capabilities from the
+/// `devcontainer.metadata` label the build wrote onto the image — otherwise a container
+/// recreated from a cached image silently loses `privileged`, `capAdd`, `securityOpt`
+/// and `init`, and a docker-in-docker daemon cannot start.
+async fn resolve_container_capabilities(
+    runtime: &dyn ContainerRuntime,
+    image: &str,
+    ordered_features: &[ResolvedFeature],
+    has_features: bool,
+) -> anyhow::Result<MergedCapabilities> {
+    if !ordered_features.is_empty() {
+        return Ok(merge_feature_capabilities(ordered_features));
+    }
+    if !has_features {
+        return Ok(MergedCapabilities::default());
+    }
+
+    // Features were configured but not resolved, so this is the cache-hit path.
+    let meta = runtime.inspect_image_metadata(image).await?;
+    if meta.metadata_entries.is_empty() {
+        eprintln!(
+            "Warning: image '{image}' has no devcontainer metadata, so feature \
+             capabilities (privileged, cap-add, security-opt) cannot be restored. \
+             Run 'dev up --rebuild' to rebuild it."
+        );
+        return Ok(MergedCapabilities::default());
+    }
+
+    Ok(capabilities_from_metadata(&meta.metadata_entries))
+}
+
 async fn run_initialize_command(
     cmd: &crate::devcontainer::config::LifecycleCommand,
     workspace: &Path,
