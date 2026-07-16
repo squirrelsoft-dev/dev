@@ -385,7 +385,6 @@ pub async fn run(
     Ok(())
 }
 
-/// Run the `initializeCommand` on the host machine (Gap 9).
 /// Resolve the container capabilities contributed by features.
 ///
 /// On the build path `ordered_features` is populated and is authoritative. On the
@@ -420,6 +419,7 @@ async fn resolve_container_capabilities(
     Ok(capabilities_from_metadata(&meta.metadata_entries))
 }
 
+/// Run the `initializeCommand` on the host machine (Gap 9).
 async fn run_initialize_command(
     cmd: &crate::devcontainer::config::LifecycleCommand,
     workspace: &Path,
