@@ -111,7 +111,7 @@ pub struct AttachedExec {
 }
 
 /// A boxed future that is Send.
-type BoxFut<'a, T> = Pin<Box<dyn Future<Output = Result<T, DevError>> + Send + 'a>>;
+pub(crate) type BoxFut<'a, T> = Pin<Box<dyn Future<Output = Result<T, DevError>> + Send + 'a>>;
 
 /// Trait abstracting over container runtimes (Docker, Podman, Apple Containers).
 #[allow(dead_code)]
