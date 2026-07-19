@@ -28,12 +28,7 @@ pub async fn run(
     }
 
     // Non-compose: label-based container stop/remove.
-    run_with_runtime(workspace, &*runtime, remove).await?;
-
-    if let Err(e) = crate::caddy::unregister_site(workspace) {
-        eprintln!("Warning: Caddy cleanup failed: {e}");
-    }
-    Ok(())
+    run_with_runtime(workspace, &*runtime, remove, crate::caddy::unregister_site).await
 }
 
 /// Internal: run the non-compose teardown path against a specific runtime.
@@ -42,6 +37,7 @@ pub async fn run_with_runtime(
     workspace: &Path,
     runtime: &dyn crate::runtime::ContainerRuntime,
     remove: bool,
+    unregister_caddy: impl FnOnce(&Path) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let labels = workspace_labels(workspace, None);
     let filters: Vec<String> = labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
@@ -87,6 +83,9 @@ pub async fn run_with_runtime(
 
     if !failures.is_empty() {
         Err(anyhow::anyhow!("{}", failures.join("; ")))
+    } else if let Err(e) = unregister_caddy(workspace) {
+        eprintln!("Warning: Caddy cleanup failed: {e}");
+        Ok(())
     } else {
         Ok(())
     }
@@ -418,7 +417,7 @@ mod tests {
         rt.inspect_states
             .insert("2222".to_string(), ContainerState::Stopped);
 
-        let res = run_with_runtime(workspace, &rt, true).await;
+        let res = run_with_runtime(workspace, &rt, true, |_: &Path| Ok(())).await;
 
         // remove_container must be called for each container, including the one whose stop failed.
         assert_eq!(rt.removed.load(Ordering::SeqCst), 2);
@@ -448,7 +447,7 @@ mod tests {
             .insert("2222".to_string(), ContainerState::Stopped);
         rt.remove_responses.insert("2222".to_string(), Ok(()));
 
-        let res = run_with_runtime(workspace, &rt, true).await;
+        let res = run_with_runtime(workspace, &rt, true, |_: &Path| Ok(())).await;
 
         // remove_container was called for each container — no error.
         assert_eq!(rt.removed.load(Ordering::SeqCst), 2);
@@ -479,7 +478,7 @@ mod tests {
         rt.remove_responses.insert("1111".to_string(), Ok(()));
         rt.remove_responses.insert("2222".to_string(), Ok(()));
 
-        let res = run_with_runtime(workspace, &rt, true).await;
+        let res = run_with_runtime(workspace, &rt, true, |_: &Path| Ok(())).await;
 
         // remove_container should have been called for both containers: a stop
         // failure must not skip removal, so both are removed.
