@@ -39,11 +39,9 @@ fn get_dns_nameservers() -> Vec<String> {
             })
             .collect();
         if !servers.is_empty() {
-            eprintln!("[build] using DNS nameservers from /etc/resolv.conf: {:?}", servers);
             return servers;
         }
     }
-    eprintln!("[build] no nameservers found in /etc/resolv.conf, using 8.8.8.8");
     vec!["8.8.8.8".to_string()]
 }
 
@@ -62,12 +60,9 @@ pub async fn build_image(
     verbose: bool,
 ) -> Result<(), AppleContainerError> {
     // Step 1: Ensure builder VM is running.
-    eprintln!("[build] ensuring builder VM...");
     ensure_builder(conn).await?;
-    eprintln!("[build] builder ready");
 
     // Step 2: Connect via vsock (retry until the shim is listening).
-    eprintln!("[build] dialing builder shim...");
     let mut client: Option<BuilderClient<tonic::transport::Channel>> = None;
     for attempt in 0..30 {
         let fd = match dial_container(conn, BUILDER_CONTAINER_ID, 8088).await {
@@ -78,7 +73,6 @@ pub async fn build_image(
             }
             Err(e) => return Err(e),
         };
-        eprintln!("[build] got vsock fd: {fd} (attempt {attempt})");
         let channel = match dial_builder_channel(fd).await {
             Ok(ch) => ch,
             Err(_) if attempt < 29 => {
@@ -90,13 +84,11 @@ pub async fn build_image(
         let mut c = BuilderClient::new(channel);
         // Verify the channel works with a simple unary call.
         match c.info(proto::InfoRequest {}).await {
-            Ok(resp) => {
-                eprintln!("[build] gRPC info() ok: {resp:?}");
+            Ok(_resp) => {
                 client = Some(c);
                 break;
             }
             Err(e) => {
-                eprintln!("[build] gRPC not ready (attempt {attempt}): {e}");
                 if attempt == 29 {
                     return Err(AppleContainerError::XpcError(
                         format!("builder gRPC server not ready after 30s: {e}"),
@@ -116,21 +108,17 @@ pub async fn build_image(
     let build_id = uuid::Uuid::new_v4().to_string();
     let context_str = abs_context.to_string_lossy().to_string();
 
-    eprintln!("[build] build_id: {build_id}");
 
     // Dial a fresh connection for PerformBuild. The info() call completes
     // the HTTP/2 handshake — every successful test had this warmup.
     let dockerfile_b64 = base64_encode(dockerfile.as_bytes());
 
-    eprintln!("[build] dialing fresh vsock for PerformBuild...");
     let fd2 = dial_container(conn, BUILDER_CONTAINER_ID, 8088).await?;
-    eprintln!("[build] got fresh vsock fd: {fd2}");
     let ch2 = dial_builder_channel(fd2).await?;
     let mut build_client = BuilderClient::new(ch2);
 
     build_client.info(proto::InfoRequest {}).await
         .map_err(|e| AppleContainerError::XpcError(format!("fresh info() failed: {e}")))?;
-    eprintln!("[build] fresh connection info() OK");
 
     // All headers matching the Swift reference client.
     let (client_tx, client_rx) = tokio::sync::mpsc::channel::<ClientStream>(64);
@@ -152,29 +140,18 @@ pub async fn build_image(
         md.insert("no-cache", "".parse().unwrap());
     }
 
-    eprintln!("[build] calling PerformBuild...");
     let response = match tokio::time::timeout(
         std::time::Duration::from_secs(300),
         build_client.perform_build(request),
     ).await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
-            eprintln!("[build] PerformBuild error: {e}");
-            eprintln!("[build] PerformBuild error (debug): {e:?}");
-            if let Some(source) = std::error::Error::source(&e) {
-                eprintln!("[build] PerformBuild source: {source}");
-                if let Some(inner) = std::error::Error::source(source) {
-                    eprintln!("[build] PerformBuild inner: {inner}");
-                }
-            }
             return Err(AppleContainerError::XpcError(format!("PerformBuild failed: {e}")));
         }
         Err(_) => {
-            eprintln!("[build] PerformBuild timed out");
             return Err(AppleContainerError::XpcError("PerformBuild timed out".to_string()));
         }
     };
-    eprintln!("[build] PerformBuild stream opened");
 
     let mut server_stream = response.into_inner();
 
@@ -195,25 +172,10 @@ async fn process_build_stream(
 ) -> Result<(), AppleContainerError> {
     use tokio_stream::StreamExt;
 
-    let mut packet_count: u64 = 0;
-    eprintln!("[stream] waiting for packets from builder...");
-
     while let Some(msg) = server_stream.next().await {
-        packet_count += 1;
         let msg = msg.map_err(|e| {
-            eprintln!("[stream] error on packet #{packet_count}: {e}");
             AppleContainerError::XpcError(format!("build stream error: {e}"))
         })?;
-
-        let ptype = match &msg.packet_type {
-            Some(server_stream::PacketType::Io(_)) => "IO",
-            Some(server_stream::PacketType::BuildError(_)) => "BuildError",
-            Some(server_stream::PacketType::CommandComplete(_)) => "CommandComplete",
-            Some(server_stream::PacketType::BuildTransfer(_)) => "BuildTransfer",
-            Some(server_stream::PacketType::ImageTransfer(_)) => "ImageTransfer",
-            None => "None",
-        };
-        eprintln!("[stream] packet #{packet_count}: {ptype} build_id={}", msg.build_id);
 
         // CRITICAL: The server registers a demux handler keyed by
         // ServerStream.build_id (a per-request UUID, NOT the overall build ID).
@@ -230,13 +192,11 @@ async fn process_build_stream(
                 send_io_ack(&client_tx, reply_id).await?;
             }
             Some(server_stream::PacketType::BuildError(err)) => {
-                eprintln!("[stream] BuildError on packet #{packet_count}: {}", err.message);
                 return Err(AppleContainerError::XpcError(
                     format!("Build failed: {}", err.message)
                 ));
             }
-            Some(server_stream::PacketType::CommandComplete(ref cmd)) => {
-                eprintln!("[stream] CommandComplete: id={}", cmd.id);
+            Some(server_stream::PacketType::CommandComplete(ref _cmd)) => {
             }
             Some(server_stream::PacketType::BuildTransfer(transfer)) => {
                 handle_build_transfer(&transfer, &client_tx, reply_id, context, verbose).await?;
@@ -244,23 +204,18 @@ async fn process_build_stream(
             Some(server_stream::PacketType::ImageTransfer(ref transfer)) => {
                 let stage = transfer.metadata.get("stage").map(|s| s.as_str()).unwrap_or("");
                 let method = transfer.metadata.get("method").map(|s| s.as_str()).unwrap_or("");
-                eprintln!("[stream] ImageTransfer #{packet_count}: id={} stage={:?} method={:?} tag={:?} data_len={} metadata={:?}",
-                    transfer.id, stage, method, transfer.tag, transfer.data.len(), transfer.metadata);
                 if stage == "resolver" && method == "/resolve" {
                     handle_image_resolve(transfer, &client_tx, reply_id).await?;
                 } else if stage == "content-store" {
                     handle_content_store(transfer, method, &client_tx, reply_id).await?;
                 } else {
-                    eprintln!("[stream] unhandled ImageTransfer stage={:?} method={:?}", stage, method);
                 }
             }
             None => {
-                eprintln!("[stream] packet #{packet_count} has no packet_type (empty oneof)");
             }
         }
     }
 
-    eprintln!("[stream] server stream ended after {packet_count} packets");
     Ok(())
 }
 
@@ -319,15 +274,10 @@ async fn handle_build_transfer(
     client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
     build_id: &str,
     context: &Path,
-    verbose: bool,
+    _verbose: bool,
 ) -> Result<(), AppleContainerError> {
     let stage = transfer.metadata.get("stage").map(|s| s.as_str()).unwrap_or("");
     let method = transfer.metadata.get("method").map(|s| s.as_str()).unwrap_or("");
-
-    if verbose {
-        eprintln!("[build] BuildTransfer: id={} stage={:?} method={:?} source={:?}",
-            transfer.id, stage, method, transfer.source);
-    }
 
     if stage != "fssync" {
         return Ok(());
@@ -345,7 +295,6 @@ async fn handle_build_transfer(
             handle_info(transfer, client_tx, build_id, context).await?;
         }
         _ => {
-            eprintln!("[build] unknown fssync method: {method}");
         }
     }
 
@@ -421,7 +370,6 @@ async fn handle_read(
     build_id: &str,
     context: &Path,
 ) -> Result<(), AppleContainerError> {
-    eprintln!("[fssync] read request: source={:?}", transfer.source);
     let source = transfer.source.as_deref().unwrap_or("");
     let path = resolve_path(context, source);
 
@@ -526,44 +474,29 @@ async fn handle_image_resolve(
         .ok_or_else(|| AppleContainerError::XpcError("image resolve: missing ref".into()))?;
     let platform_str = transfer.metadata.get("platform").map(|s| s.as_str()).unwrap_or("linux/arm64");
 
-    eprintln!("[resolver] >>> resolving image: {reference} for platform {platform_str}");
 
-    eprintln!("[resolver] parsing reference...");
     let oci_ref: oci_client::Reference = reference.parse()
         .map_err(|e: oci_client::ParseError| {
-            eprintln!("[resolver] FAILED to parse ref: {e}");
             AppleContainerError::XpcError(format!("invalid image ref: {e}"))
         })?;
-    eprintln!("[resolver] parsed ref: registry={} repository={} tag={:?}",
-        oci_ref.registry(), oci_ref.repository(), oci_ref.tag());
 
-    eprintln!("[resolver] authenticating with registry...");
     let client = oci_client::Client::default();
     let auth = oci_client::secrets::RegistryAuth::Anonymous;
     client.auth(&oci_ref, &auth, oci_client::RegistryOperation::Pull).await
         .map_err(|e| {
-            eprintln!("[resolver] FAILED auth: {e}");
             AppleContainerError::XpcError(format!("registry auth failed: {e}"))
         })?;
-    eprintln!("[resolver] auth OK");
 
-    eprintln!("[resolver] pulling manifest...");
     let (manifest, digest) = client.pull_image_manifest(&oci_ref, &auth).await
         .map_err(|e| {
-            eprintln!("[resolver] FAILED to pull manifest: {e}");
             AppleContainerError::XpcError(format!("failed to pull manifest for {reference}: {e}"))
         })?;
-    eprintln!("[resolver] manifest OK: digest={digest} config_digest={} layers={}",
-        manifest.config.digest, manifest.layers.len());
 
-    eprintln!("[resolver] pulling config blob ({})...", manifest.config.digest);
     let mut config_data = Vec::new();
     client.pull_blob(&oci_ref, manifest.config.digest.as_str(), &mut config_data).await
         .map_err(|e| {
-            eprintln!("[resolver] FAILED to pull config blob: {e}");
             AppleContainerError::XpcError(format!("failed to pull config for {reference}: {e}"))
         })?;
-    eprintln!("[resolver] config blob OK: {} bytes", config_data.len());
 
     let mut metadata = std::collections::HashMap::new();
     metadata.insert("os".to_string(), "linux".to_string());
@@ -584,12 +517,7 @@ async fn handle_image_resolve(
             metadata,
         })),
     };
-    eprintln!("[resolver] sending response: digest={digest} id={}", transfer.id);
-    match client_tx.send(response).await {
-        Ok(()) => eprintln!("[resolver] <<< response sent OK"),
-        Err(e) => eprintln!("[resolver] FAILED to send response: {e}"),
-    }
-
+    let _ = client_tx.send(response).await;
     Ok(())
 }
 
@@ -611,21 +539,16 @@ async fn handle_content_store(
     let digest = if !transfer.tag.is_empty() {
         &transfer.tag
     } else if transfer.descriptor.as_ref().map_or(true, |d| d.digest.is_empty()) {
-        eprintln!("[content-store] no digest in request, tag={:?} descriptor={:?}",
-            transfer.tag, transfer.descriptor);
         return Ok(());
     } else {
         &transfer.descriptor.as_ref().unwrap().digest
     };
 
-    let offset = transfer.metadata.get("offset").map(|s| s.as_str()).unwrap_or("0");
-    let length = transfer.metadata.get("length").map(|s| s.as_str()).unwrap_or("0");
-    eprintln!("[content-store] method={method} digest={digest} offset={offset} length={length} data_len={}",
-        transfer.data.len());
+    let _offset = transfer.metadata.get("offset").map(|s| s.as_str()).unwrap_or("0");
+    let _length = transfer.metadata.get("length").map(|s| s.as_str()).unwrap_or("0");
 
     match method {
         "/containerd.services.content.v1.Content/Info" => {
-            eprintln!("[content-store] Info request for {digest} — sending empty response (no local content store)");
             let mut metadata = std::collections::HashMap::new();
             metadata.insert("os".to_string(), "linux".to_string());
             metadata.insert("stage".to_string(), "content-store".to_string());
@@ -643,16 +566,11 @@ async fn handle_content_store(
                     metadata,
                 })),
             };
-            match client_tx.send(response).await {
-                Ok(()) => eprintln!("[content-store] Info response sent OK"),
-                Err(e) => eprintln!("[content-store] FAILED to send Info response: {e}"),
-            }
+            let _ = client_tx.send(response).await;
         }
         "/containerd.services.content.v1.Content/ReaderAt" => {
-            eprintln!("[content-store] ReaderAt: digest={digest} offset={offset} length={length} — NOT IMPLEMENTED");
         }
         _ => {
-            eprintln!("[content-store] unknown method: {method}");
         }
     }
 
@@ -877,10 +795,8 @@ async fn dial_builder_channel(
                 let stream_slot = stream_slot.clone();
                 let call_count = call_count.clone();
                 async move {
-                    let n = call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    eprintln!("[build] connector called (invocation #{n})");
+                    let _n = call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let stream = stream_slot.lock().await.take().ok_or_else(|| {
-                        eprintln!("[build] connector: stream already consumed!");
                         std::io::Error::new(std::io::ErrorKind::Other, "stream already consumed")
                     })?;
                     Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
@@ -896,7 +812,7 @@ async fn dial_builder_channel(
 /// Pull an image via the image service XPC, returning the ImageDescription JSON bytes.
 ///
 /// The returned bytes contain `{"reference":"...","descriptor":{"mediaType":"...","digest":"...","size":...}}`.
-async fn pull_image(
+pub async fn pull_image(
     reference: &str,
     platform_json: &[u8],
 ) -> Result<Vec<u8>, AppleContainerError> {
@@ -917,7 +833,7 @@ async fn pull_image(
 }
 
 /// Unpack an image snapshot via the image service XPC.
-async fn unpack_image(
+pub async fn unpack_image(
     image_desc: &[u8],
     platform_json: &[u8],
 ) -> Result<(), AppleContainerError> {
@@ -970,7 +886,6 @@ pub async fn ensure_builder(
             return Ok(());
         }
         Some(snap) if snap.status == RuntimeStatus::Stopped => {
-            eprintln!("[build] builder exists but stopped, bootstrapping...");
             bootstrap_container(conn, BUILDER_CONTAINER_ID).await?;
             start_process(conn, BUILDER_CONTAINER_ID).await?;
             wait_for_running(conn, BUILDER_CONTAINER_ID).await?;
@@ -978,7 +893,6 @@ pub async fn ensure_builder(
         }
         Some(_) => {
             // Unknown/Stopping — try bootstrap anyway.
-            eprintln!("[build] builder in unexpected state, attempting bootstrap...");
             bootstrap_container(conn, BUILDER_CONTAINER_ID).await?;
             start_process(conn, BUILDER_CONTAINER_ID).await?;
             wait_for_running(conn, BUILDER_CONTAINER_ID).await?;
@@ -995,18 +909,13 @@ pub async fn ensure_builder(
         "variant": "v8"
     }))?;
 
-    eprintln!("[build] fetching builder image...");
     let image_desc_bytes = pull_image(BUILDER_IMAGE, &platform_json).await?;
     let image_desc: serde_json::Value = serde_json::from_slice(&image_desc_bytes)?;
-    eprintln!("[build] image descriptor: {}", image_desc);
 
-    eprintln!("[build] unpacking builder image...");
     unpack_image(&image_desc_bytes, &platform_json).await?;
 
-    eprintln!("[build] fetching default kernel...");
     let kernel_bytes = get_default_kernel(conn).await?;
 
-    eprintln!("[build] creating builder VM...");
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let exports_dir = std::path::PathBuf::from(&home)
         .join("Library/Application Support/com.apple.container/builder");
@@ -1077,10 +986,8 @@ pub async fn ensure_builder(
     drop(reply);
     drop(msg);
 
-    eprintln!("[build] bootstrapping builder VM...");
     bootstrap_container(conn, BUILDER_CONTAINER_ID).await?;
 
-    eprintln!("[build] starting builder process...");
     start_process(conn, BUILDER_CONTAINER_ID).await?;
 
     wait_for_running(conn, BUILDER_CONTAINER_ID).await?;

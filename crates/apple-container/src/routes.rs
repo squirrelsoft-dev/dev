@@ -80,6 +80,7 @@ impl XpcKey {
     pub const STATISTICS: &str = "statistics";
     pub const ARCHIVE: &str = "archive";
     pub const FORCE: &str = "force";
+    pub const STOP_OPTIONS: &str = "stopOptions";
 
     // Image service keys
     pub const IMAGE_REFERENCE: &str = "imageReference";

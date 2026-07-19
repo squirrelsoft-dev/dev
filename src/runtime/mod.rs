@@ -99,6 +99,9 @@ pub struct ImageMetadata {
     /// is absent or unparseable. Retained so callers can recover settings contributed by
     /// the features that built an image without re-resolving those features.
     pub metadata_entries: Vec<serde_json::Value>,
+    /// Environment variables from the OCI image config (`Env` field).
+    #[allow(dead_code)]
+    pub env: Vec<String>,
 }
 
 /// Handle to a running exec session with attached stdin/stdout byte streams.

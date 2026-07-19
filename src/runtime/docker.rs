@@ -805,6 +805,7 @@ impl BollardRuntime {
             remote_user,
             container_user,
             metadata_entries,
+            env: Vec::new(),
         })
     }
 }

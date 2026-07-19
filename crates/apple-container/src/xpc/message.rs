@@ -1,6 +1,8 @@
 use std::ffi::{CStr, CString};
 use std::os::fd::RawFd;
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::AppleContainerError;
 use crate::routes::ROUTE_KEY;
 use crate::xpc::ffi;
@@ -127,17 +129,44 @@ impl XpcMessage {
     }
 
     /// Check the reply for XPC-level errors or application-level error keys.
+    ///
+    /// Apple's ContainersService daemon serializes errors as a JSON blob
+    /// (`ContainerXPCError { code, message }`) stored as XPC *data*.  The
+    /// previous implementation tried to read it as an XPC *string*, which
+    /// always returned NULL — silently swallowing every daemon error.
     pub fn check_error(&self) -> Result<(), AppleContainerError> {
         if self.is_error() {
             return Err(AppleContainerError::XpcError(
                 "XPC returned an error object".to_string(),
             ));
         }
-        if let Some(err) = self.get_string(crate::routes::ERROR_KEY) {
-            return Err(AppleContainerError::XpcError(err));
+        if let Some(data) = self.get_data(crate::routes::ERROR_KEY) {
+            match serde_json::from_slice::<ContainerXPCError>(&data) {
+                Ok(err) => {
+                    return Err(AppleContainerError::XpcError(format!(
+                        "{}: {}",
+                        err.code, err.message
+                    )));
+                }
+                Err(_) => {
+                    let fallback = String::from_utf8_lossy(&data).into_owned();
+                    return Err(AppleContainerError::XpcError(format!(
+                        "Daemon error (unparsed): {}",
+                        fallback
+                    )));
+                }
+            }
         }
         Ok(())
     }
+}
+
+/// Error payload returned by the Apple Container daemon in XPC replies.
+/// Mirrors `ContainerXPCError` in the daemon's `XPCMessage.swift`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ContainerXPCError {
+    code: String,
+    message: String,
 }
 
 impl Drop for XpcMessage {

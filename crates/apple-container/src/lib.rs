@@ -8,8 +8,8 @@ use std::os::fd::RawFd;
 use std::path::Path;
 
 use error::AppleContainerError;
-use models::{ContainerConfiguration, ContainerSnapshot, ContainerStats, ProcessConfiguration};
-use routes::{XpcKey, XpcRoute, SERVICE_NAME};
+use models::{ContainerConfiguration, ContainerSnapshot, ContainerStats, ImageDescription, ProcessConfiguration};
+use routes::{ImageRoute, XpcKey, XpcRoute, IMAGE_SERVICE_NAME, SERVICE_NAME};
 use xpc::connection::XpcConnection;
 use xpc::message::XpcMessage;
 
@@ -88,13 +88,24 @@ impl AppleContainerClient {
         config: &ContainerConfiguration,
         kernel: &[u8],
     ) -> Result<(), AppleContainerError> {
+        self.create_with_options(config, kernel, None).await
+    }
+
+    pub async fn create_with_options(
+        &self,
+        config: &ContainerConfiguration,
+        kernel: &[u8],
+        options: Option<&serde_json::Value>,
+    ) -> Result<(), AppleContainerError> {
         let msg = XpcMessage::with_route(XpcRoute::ContainerCreate.as_str());
 
         let config_json = serde_json::to_vec(config)?;
         msg.set_data(XpcKey::CONTAINER_CONFIG, &config_json);
         msg.set_data(XpcKey::KERNEL, kernel);
-        let options_bytes = serde_json::to_vec(&serde_json::json!({"autoRemove": false}))?;
-        msg.set_data(XpcKey::CONTAINER_OPTIONS, &options_bytes);
+        if let Some(options) = options {
+            let options_bytes = serde_json::to_vec(options)?;
+            msg.set_data(XpcKey::CONTAINER_OPTIONS, &options_bytes);
+        }
 
         let reply = self.connection.send_async(&msg).await?;
         reply.check_error()?;
@@ -152,6 +163,21 @@ impl AppleContainerClient {
         reply.get_int64(XpcKey::EXIT_CODE) as i32
     }
 
+    /// Start the init process (or any previously created process) in a container.
+    pub async fn start_process(
+        &self,
+        id: &str,
+        process_id: &str,
+    ) -> Result<(), AppleContainerError> {
+        let msg = XpcMessage::with_route(XpcRoute::ContainerStartProcess.as_str());
+        msg.set_string(XpcKey::ID, id);
+        msg.set_string(XpcKey::PROCESS_IDENTIFIER, process_id);
+
+        let reply = self.connection.send_async(&msg).await?;
+        reply.check_error()?;
+        Ok(())
+    }
+
     /// Send a signal to a container.
     pub async fn kill(&self, id: &str, signal: i32) -> Result<(), AppleContainerError> {
         let msg = XpcMessage::with_route(XpcRoute::ContainerKill.as_str());
@@ -167,6 +193,9 @@ impl AppleContainerClient {
     pub async fn stop(&self, id: &str) -> Result<(), AppleContainerError> {
         let msg = XpcMessage::with_route(XpcRoute::ContainerStop.as_str());
         msg.set_string(XpcKey::ID, id);
+        let opts = serde_json::json!({"timeoutInSeconds": 5, "signal": 15});
+        let opts_bytes = serde_json::to_vec(&opts)?;
+        msg.set_data(XpcKey::STOP_OPTIONS, &opts_bytes);
 
         let reply = self.connection.send_async(&msg).await?;
         reply.check_error()?;
@@ -234,5 +263,35 @@ impl AppleContainerClient {
         verbose: bool,
     ) -> Result<(), AppleContainerError> {
         build::build_image(&self.connection, dockerfile, context, tag, no_cache, verbose).await
+    }
+
+    /// List locally available images.
+    ///
+    /// Queries the Apple Container image store via XPC and returns
+    /// a list of image descriptors that can be used without pulling.
+    /// The response key is `imageDescriptions` (matching the Swift daemon).
+    pub async fn image_list(&self) -> Result<Vec<ImageDescription>, AppleContainerError> {
+        let img_conn = XpcConnection::connect(IMAGE_SERVICE_NAME)?;
+        let msg = XpcMessage::with_route(ImageRoute::ImageList.as_str());
+        let reply = img_conn.send_async(&msg).await?;
+        reply.check_error()?;
+        let data = reply.get_data("imageDescriptions").unwrap_or_default();
+        if data.is_empty() {
+            return Ok(Vec::new());
+        }
+        let images: Vec<ImageDescription> = serde_json::from_slice(&data)?;
+        Ok(images)
+    }
+
+    /// Pull an image using the image service XPC.
+    ///
+    /// Creates a separate XPC connection to `com.apple.container.core.container-core-images`.
+    /// The `platform` JSON should be `{"architecture": "arm64", "os": "linux"}`.
+    pub async fn pull_image(
+        &self,
+        reference: &str,
+        platform: &[u8],
+    ) -> Result<Vec<u8>, AppleContainerError> {
+        build::pull_image(reference, platform).await
     }
 }
