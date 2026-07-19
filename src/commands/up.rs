@@ -7,6 +7,7 @@ use crate::devcontainer::{
     run_lifecycle_hooks, stage_feature_context, substitute_variables,
     substitute_variables_with_user,
 };
+use crate::devcontainer::config::MountSpec;
 use crate::devcontainer::features::{
     MergedCapabilities, ResolvedFeature, capabilities_from_metadata,
     generate_feature_dockerfile_with_opts, order_features,
@@ -303,27 +304,12 @@ pub async fn run(
         final_image
     };
 
-    let mounts: Vec<BindMount> = config
-        .mounts
-        .as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .filter_map(|m| {
-            let emitted = m.clone().substitute_and_emit(workspace, remote_user)?;
-            // The bind-mount code path only knows about bind mounts; skip (with a warning) anything
-            // that asks for volume, tmpfs, or another type. Compose handles those natively.
-            if let Some(rest) = emitted.split("type=").nth(1) {
-                let ty = rest.split(',').next().unwrap_or("");
-                if ty != "bind" {
-                    eprintln!(
-                        "Warning: mount entry uses type={ty}, which the bind-mount code path does not apply; skipping.",
-                    );
-                    return None;
-                }
-            }
-            parse_single_mount(&emitted)
-        })
-        .collect();
+    let mount_strings = substitute_mounts(
+        config.mounts.as_deref().unwrap_or(&[]),
+        workspace,
+        remote_user,
+    );
+    let mounts = parse_mounts(&mount_strings);
 
     let volume_strings: Vec<String> = config
         .volumes
@@ -721,11 +707,11 @@ async fn run_compose(
         }
     }
 
-    let mounts: Vec<String> = config
-        .mounts.as_deref().unwrap_or(&[])
-        .iter()
-        .filter_map(|m| m.clone().substitute_and_emit(workspace, remote_user))
-        .collect();
+    let mounts = substitute_mounts(
+        config.mounts.as_deref().unwrap_or(&[]),
+        workspace,
+        remote_user,
+    );
 
     let volume_strings: Vec<String> = config
         .volumes.as_deref().unwrap_or(&[])
@@ -823,6 +809,24 @@ async fn run_compose(
     }
 
     Ok(())
+}
+
+/// Substitute variables in each mount entry (string or object form) and emit
+/// Docker long-form strings, warning about entries that lack `source`/`target`.
+fn substitute_mounts(
+    mounts: &[MountSpec],
+    workspace: &Path,
+    remote_user: Option<&str>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for m in mounts {
+        if let Some(emitted) = m.substitute_and_emit(workspace, remote_user) {
+            out.push(emitted);
+        } else {
+            eprintln!("Warning: mount entry is missing source or target; skipping: {m:?}");
+        }
+    }
+    out
 }
 
 /// Parse mount strings from devcontainer.json into `BindMount` structs.
@@ -948,7 +952,8 @@ fn parse_volumes(volume_strings: &[String]) -> Vec<VolumeMount> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_image_present, parse_single_mount};
+    use super::{ensure_image_present, parse_mounts, parse_single_mount, substitute_mounts};
+    use crate::devcontainer::config::{MountObject, MountSpec};
     use crate::error::DevError;
     use crate::runtime::{
         AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ExecResult,
@@ -1131,9 +1136,8 @@ mod tests {
         assert!(m.readonly);
     }
 
-    /// `parse_single_mount` accepts a non-bind long-form string (the existing
-    /// string parser does not yet refuse non-bind types; callers wrap this with
-    /// a warning in the bind-mount path).
+    /// `parse_single_mount` accepts a non-bind long-form string (type is
+    /// ignored; Docker treats a bare source name as a named volume).
     #[test]
     fn parse_single_mount_accepts_non_bind_type() {
         let m = parse_single_mount("source=myvol,target=/data,type=volume")
@@ -1143,21 +1147,47 @@ mod tests {
         assert!(!m.readonly);
     }
 
-    /// Reproduce the filter-map logic `run` uses to skip non-bind mounts with a warning.
-    /// Mirrors the body of the bind-mount normalization block in `run`.
+    /// Non-bind mounts must NOT be dropped: a `type=volume` mount, in either
+    /// string or object form, is rendered as a `BindMount` through the same
+    /// `substitute_mounts` + `parse_mounts` chain `run` uses.
     #[test]
-    fn run_path_skips_non_bind_mount_with_warning() {
-        let emitted = String::from("source=myvol,target=/data,type=tmpfs");
-        let mut skipped = false;
-        if let Some(rest) = emitted.split("type=").nth(1) {
-            let ty = rest.split(',').next().unwrap_or("");
-            if ty != "bind" {
-                eprintln!(
-                    "Warning: mount entry uses type={ty}, which the bind-mount code path does not apply; skipping.",
-                );
-                skipped = true;
-            }
-        }
-        assert!(skipped, "non-bind mount must be skipped in the bind-mount path");
+    fn volume_type_mount_is_rendered_not_dropped() {
+        let ws = std::path::Path::new("/home/user/project");
+        let specs = vec![
+            MountSpec::Plain("source=myvol,target=/data,type=volume".to_string()),
+            MountSpec::Object(MountObject {
+                source: Some("othervol".to_string()),
+                target: Some("/cache".to_string()),
+                r#type: Some("volume".to_string()),
+                ..Default::default()
+            }),
+        ];
+        let strings = substitute_mounts(&specs, ws, None);
+        let mounts = parse_mounts(&strings);
+        assert_eq!(mounts.len(), 2, "volume-type mounts must not be dropped");
+        assert_eq!(mounts[0].source, std::path::PathBuf::from("myvol"));
+        assert_eq!(mounts[0].target, "/data");
+        assert!(!mounts[0].readonly);
+        assert_eq!(mounts[1].source, std::path::PathBuf::from("othervol"));
+        assert_eq!(mounts[1].target, "/cache");
+    }
+
+    /// An object mount missing `source` is skipped (with a warning) rather
+    /// than rendered, while valid entries in the same list survive.
+    #[test]
+    fn malformed_object_mount_is_skipped_valid_ones_survive() {
+        let ws = std::path::Path::new("/home/user/project");
+        let specs = vec![
+            MountSpec::Object(MountObject {
+                source: None,
+                target: Some("/data".to_string()),
+                ..Default::default()
+            }),
+            MountSpec::Plain("/host:/container".to_string()),
+        ];
+        let strings = substitute_mounts(&specs, ws, None);
+        let mounts = parse_mounts(&strings);
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].target, "/container");
     }
 }

@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::Path;
 use std::default::Default;
+use std::path::Path;
 
 use super::jsonc::parse_jsonc;
 use super::variables::substitute_variables_with_user;
@@ -124,17 +124,21 @@ impl MountSpec {
     /// For string-form mounts this is just variable substitution. For object-form
     /// mounts it substitutes `source`/`target` fields and emits a long-form string.
     /// Returns the substituted string, or `None` if the object lacked `source`/`target`.
-    pub fn substitute_and_emit(self, workspace: &std::path::Path, remote_user: Option<&str>) -> Option<String> {
+    pub fn substitute_and_emit(
+        &self,
+        workspace: &std::path::Path,
+        remote_user: Option<&str>,
+    ) -> Option<String> {
         match self {
-            MountSpec::Plain(s) => Some(substitute_variables_with_user(&s, workspace, remote_user)),
+            MountSpec::Plain(s) => Some(substitute_variables_with_user(s, workspace, remote_user)),
             MountSpec::Object(o) => {
-                let src = o.source.as_deref().map(|s| substitute_variables_with_user(s, workspace, remote_user));
-                let tgt = o.target.as_deref().map(|s| substitute_variables_with_user(s, workspace, remote_user));
-                let src = src?;
-                let tgt = tgt?;
-                let ty = o.r#type.unwrap_or_else(|| "bind".to_string());
+                let src =
+                    substitute_variables_with_user(o.source.as_deref()?, workspace, remote_user);
+                let tgt =
+                    substitute_variables_with_user(o.target.as_deref()?, workspace, remote_user);
+                let ty = o.r#type.as_deref().unwrap_or("bind");
                 let ro = o.readonly.unwrap_or(false);
-                Some(format!("source={src},target={tgt},type={ty},readonly={ro}") as String)
+                Some(format!("source={src},target={tgt},type={ty},readonly={ro}"))
             }
         }
     }
@@ -218,13 +222,15 @@ mod tests {
 
     #[test]
     fn object_mount_deserializes_into_config() {
-        let config = parse(r#"{
+        let config = parse(
+            r#"{
             "name": "test1",
             "image": "alpine:latest",
             "mounts": [
                 { "source": "./", "target": "/workspace", "type": "bind" }
             ]
-        }"#);
+        }"#,
+        );
         let mounts = config.mounts.expect("mounts field is present");
         assert_eq!(mounts.len(), 1);
         // Confirm it resolved to MountSpec::Object, not a plain string.
@@ -234,11 +240,13 @@ mod tests {
 
     #[test]
     fn string_mount_still_deserializes() {
-        let config = parse(r#"{
+        let config = parse(
+            r#"{
             "name": "test2",
             "image": "alpine:latest",
             "mounts": ["${localEnv:HOME}/.config:/home/vscode/.config:ro"]
-        }"#);
+        }"#,
+        );
         let mounts = config.mounts.expect("mounts field is present");
         assert_eq!(mounts.len(), 1);
         assert!(matches!(&mounts[0], MountSpec::Plain(_)))
@@ -246,14 +254,16 @@ mod tests {
 
     #[test]
     fn mixed_string_and_object_array_deserializes() {
-        let config = parse(r#"{
+        let config = parse(
+            r#"{
             "name": "mixed",
             "image": "alpine:latest",
             "mounts": [
                 "${localEnv:HOME}/.config:/home/vscode/.config:ro",
                 { "source": "./src", "target": "/workspace/src", "type": "bind" }
             ]
-        }"#);
+        }"#,
+        );
         let mounts = config.mounts.expect("mounts field is present");
         assert_eq!(mounts.len(), 2);
         assert!(matches!(&mounts[0], MountSpec::Plain(_)));
@@ -270,10 +280,14 @@ mod tests {
             readonly: Some(true),
             consistency: Some("fuzzy".into()),
         });
-        let emitted = spec.substitute_and_emit(&ws, Some("root"))
+        let emitted = spec
+            .substitute_and_emit(&ws, Some("root"))
             .expect("should emit a long-form string");
         // `${localEnv:HOME}` is the host env's HOME, not the container user's.
-        assert!(emitted.starts_with("source=./logs,target=") && emitted.ends_with(",type=bind,readonly=true"));
+        assert!(
+            emitted.starts_with("source=./logs,target=")
+                && emitted.ends_with(",type=bind,readonly=true")
+        );
         assert!(emitted.contains("type=bind") && emitted.contains("readonly=true"));
     }
 
@@ -314,10 +328,13 @@ mod tests {
             readonly: Some(false),
             consistency: None,
         });
-        let emitted = spec.substitute_and_emit(&ws, Some("vscode"))
+        let emitted = spec
+            .substitute_and_emit(&ws, Some("vscode"))
             .expect("should emit a long-form string");
         // containerEnv:HOME expands to /home/<user> for a non-root user.
-        assert!(emitted.contains("source=/home/vscode/.config,target=/home/vscode/.config,type=bind,readonly=false"));
+        assert!(emitted.contains(
+            "source=/home/vscode/.config,target=/home/vscode/.config,type=bind,readonly=false"
+        ));
     }
 
     #[test]
@@ -333,7 +350,8 @@ mod tests {
         });
         // The object struct only has known fields; unknown fields are ignored by serde
         // by default, so this parse should be fine end-to-end.
-        let config = parse(r#"{
+        let config = parse(
+            r#"{
             "name": "extras",
             "image": "alpine:latest",
             "mounts": [
@@ -345,7 +363,8 @@ mod tests {
                     "extendedAttribute": true
                 }
             ]
-        }"#);
+        }"#,
+        );
         let mounts = config.mounts.expect("mounts field is present");
         assert_eq!(mounts.len(), 1);
         assert!(matches!(&mounts[0], MountSpec::Object(o) if o.source.as_deref() == Some("./")))
