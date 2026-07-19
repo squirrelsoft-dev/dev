@@ -832,7 +832,7 @@ pub fn merge_feature_capabilities(features: &[ResolvedFeature]) -> MergedCapabil
 }
 
 /// Aggregated container capabilities from all features.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct MergedCapabilities {
     pub init: bool,
     pub privileged: bool,
@@ -840,18 +840,57 @@ pub struct MergedCapabilities {
     pub security_opt: Vec<String>,
 }
 
+/// Recover feature-contributed capabilities from an image's `devcontainer.metadata`
+/// label entries, as written by `build_metadata_label`.
+///
+/// This is the counterpart to `merge_feature_capabilities` for the cached-image path,
+/// where the features that built the image are not re-resolved and so no
+/// `ResolvedFeature` list exists. Semantics match that function: booleans are OR'd and
+/// arrays unioned. Keys are read defensively — the writer omits falsey capabilities
+/// entirely, and the trailing base-config entry carries none of them.
+pub fn capabilities_from_metadata(entries: &[serde_json::Value]) -> MergedCapabilities {
+    let mut result = MergedCapabilities::default();
+    for entry in entries {
+        result.init |= entry_flag(entry, "init");
+        result.privileged |= entry_flag(entry, "privileged");
+        union_string_array(entry.get("capAdd"), &mut result.cap_add);
+        union_string_array(entry.get("securityOpt"), &mut result.security_opt);
+    }
+    result
+}
+
+/// Read a boolean metadata key, treating absent or non-boolean values as false.
+fn entry_flag(entry: &serde_json::Value, key: &str) -> bool {
+    entry
+        .get(key)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Append the string members of a JSON array into `target`, preserving first-seen
+/// order and skipping duplicates. Non-string members are ignored.
+fn union_string_array(value: Option<&serde_json::Value>, target: &mut Vec<String>) {
+    let Some(items) = value.and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    for item in items.iter().filter_map(serde_json::Value::as_str) {
+        if !target.iter().any(|existing| existing == item) {
+            target.push(item.to_string());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::devcontainer::config::DevcontainerConfig;
 
-    fn make_feature(id: &str, options: serde_json::Value) -> ResolvedFeature {
+    fn feature(id: &str) -> ResolvedFeature {
         ResolvedFeature {
             id: id.to_string(),
-            oci_ref: String::new(),
-            version: "1".to_string(),
-            options,
-            install_script_path: PathBuf::from("/tmp/fake"),
+            oci_ref: id.to_string(),
+            version: "latest".to_string(),
+            options: serde_json::Value::Null,
+            install_script_path: PathBuf::new(),
             install_after: Vec::new(),
             container_env: HashMap::new(),
             mounts: Vec::new(),
@@ -866,31 +905,100 @@ mod tests {
     }
 
     fn empty_config() -> DevcontainerConfig {
-        DevcontainerConfig {
-            name: None,
-            image: None,
-            build: None,
-            docker_compose_file: None,
-            service: None,
-            workspace_folder: None,
-            features: None,
-            forward_ports: None,
-            remote_user: None,
-            remote_env: None,
-            container_env: None,
-            mounts: None,
-            volumes: None,
-            run_args: None,
-            on_create_command: None,
-            update_content_command: None,
-            post_create_command: None,
-            post_start_command: None,
-            post_attach_command: None,
-            initialize_command: None,
-            customize: None,
-            update_remote_user_uid: None,
-            dotfiles: None,
-        }
+        serde_json::from_str("{}").expect("empty devcontainer.json should deserialize")
+    }
+
+    fn parse_label(label: &str) -> Vec<serde_json::Value> {
+        serde_json::from_str(label).expect("metadata label should be a JSON array")
+    }
+
+    /// The capabilities recovered from a built image must equal those the build itself
+    /// derived. This is the guard against key-name drift between `build_metadata_label`
+    /// and `capabilities_from_metadata` (e.g. `capAdd` vs `cap_add`), which no
+    /// hand-written JSON fixture would catch.
+    #[test]
+    fn capabilities_survive_metadata_label_roundtrip() {
+        let mut dind = feature("ghcr.io/devcontainers/features/docker-in-docker:2");
+        dind.privileged = true;
+        dind.init = true;
+        dind.cap_add = vec!["SYS_PTRACE".to_string()];
+        dind.security_opt = vec!["seccomp=unconfined".to_string()];
+        let features = vec![dind];
+
+        let label = build_metadata_label(&features, &empty_config(), None);
+        let recovered = capabilities_from_metadata(&parse_label(&label));
+
+        assert!(recovered.privileged, "privileged must survive the roundtrip");
+        assert_eq!(recovered, merge_feature_capabilities(&features));
+    }
+
+    /// A feature declaring no capabilities must not acquire any via the label, and the
+    /// trailing base-config entry must be ignored harmlessly.
+    #[test]
+    fn plain_feature_roundtrips_without_capabilities() {
+        let features = vec![feature("ghcr.io/devcontainers/features/node:1")];
+
+        let label = build_metadata_label(&features, &empty_config(), Some("node"));
+        let recovered = capabilities_from_metadata(&parse_label(&label));
+
+        assert_eq!(recovered, MergedCapabilities::default());
+    }
+
+    #[test]
+    fn capabilities_union_across_entries_and_deduplicate() {
+        let entries = vec![
+            serde_json::json!({"id": "a", "capAdd": ["SYS_PTRACE"]}),
+            serde_json::json!({
+                "id": "b",
+                "privileged": true,
+                "capAdd": ["SYS_PTRACE", "NET_ADMIN"],
+                "securityOpt": ["seccomp=unconfined"],
+            }),
+        ];
+
+        let caps = capabilities_from_metadata(&entries);
+
+        assert!(caps.privileged);
+        assert_eq!(caps.cap_add, ["SYS_PTRACE", "NET_ADMIN"]);
+        assert_eq!(caps.security_opt, ["seccomp=unconfined"]);
+    }
+
+    /// An image with no recoverable metadata must yield no capabilities rather than
+    /// panicking or inventing them.
+    #[test]
+    fn capabilities_from_metadata_defaults_when_absent() {
+        assert_eq!(capabilities_from_metadata(&[]), MergedCapabilities::default());
+
+        let no_caps = capabilities_from_metadata(&[serde_json::json!({"id": "a"})]);
+        assert_eq!(no_caps, MergedCapabilities::default());
+    }
+
+    /// Malformed values must be ignored, not coerced into capabilities.
+    #[test]
+    fn capabilities_from_metadata_ignores_malformed_values() {
+        let entries = vec![serde_json::json!({
+            "id": "a",
+            "privileged": "yes",
+            "capAdd": "SYS_PTRACE",
+            "securityOpt": [42, "seccomp=unconfined"],
+        })];
+
+        let caps = capabilities_from_metadata(&entries);
+
+        assert!(!caps.privileged, "a non-boolean must not enable privileged");
+        assert!(caps.cap_add.is_empty(), "a non-array capAdd must be ignored");
+        assert_eq!(caps.security_opt, ["seccomp=unconfined"]);
+    }
+
+    /// Adapter over `feature` for tests that exercise Dockerfile generation.
+    ///
+    /// Sets `install_script_path`, without which `generate_feature_dockerfile_with_opts`
+    /// skips the feature entirely and emits no RUN step to assert against.
+    fn make_feature(id: &str, options: serde_json::Value) -> ResolvedFeature {
+        let mut resolved = feature(id);
+        resolved.options = options;
+        resolved.install_script_path = PathBuf::from("/tmp/fake");
+        resolved
     }
 
     #[test]
