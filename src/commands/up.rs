@@ -145,8 +145,7 @@ pub async fn run(
     } else {
         // Determine base image
         let base_image = if let Some(ref image) = config.image {
-            eprintln!("Pulling image '{image}'...");
-            runtime.pull_image(image).await?;
+            ensure_image_present(runtime.as_ref(), image).await?;
             image.clone()
         } else if let Some(ref build) = config.build {
             let context_dir = config_path
@@ -1079,6 +1078,24 @@ mod tests {
             rt.pull_count(),
             1,
             "pull_image must be called exactly once when image_exists returns false"
+        );
+    }
+
+    /// Regression test for issue #24: the build/features base-image path routes
+    /// through `ensure_image_present` and therefore skips the pull when the
+    /// image is already local. Mirrors the image-only branch's behavior.
+    #[tokio::test]
+    async fn build_path_base_image_skips_pull_when_image_exists() {
+        let rt = FakeRuntime::new(true);
+        // Base-image determination in the build/features branch:
+        let image_name = "localimg:latest";
+        ensure_image_present(&rt, image_name)
+            .await
+            .expect("helper should succeed when image exists locally");
+        assert_eq!(
+            rt.pull_count(),
+            0,
+            "build path must not call pull_image when image_exists returns true"
         );
     }
 }
