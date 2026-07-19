@@ -32,7 +32,8 @@ pub async fn run(
 }
 
 /// Internal: run the non-compose teardown path against a specific runtime.
-/// Exposed for tests.
+/// Caddy cleanup is injected so tests can stub it; production callers pass
+/// `crate::caddy::unregister_site`.
 pub async fn run_with_runtime(
     workspace: &Path,
     runtime: &dyn crate::runtime::ContainerRuntime,
