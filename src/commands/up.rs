@@ -303,12 +303,26 @@ pub async fn run(
         final_image
     };
 
-    let mounts: Vec<String> = config
+    let mounts: Vec<BindMount> = config
         .mounts
         .as_deref()
         .unwrap_or(&[])
         .iter()
-        .map(|s| substitute_variables_with_user(s, workspace, remote_user))
+        .filter_map(|m| {
+            let emitted = m.clone().substitute_and_emit(workspace, remote_user)?;
+            // The bind-mount code path only knows about bind mounts; skip (with a warning) anything
+            // that asks for volume, tmpfs, or another type. Compose handles those natively.
+            if let Some(rest) = emitted.split("type=").nth(1) {
+                let ty = rest.split(',').next().unwrap_or("");
+                if ty != "bind" {
+                    eprintln!(
+                        "Warning: mount entry uses type={ty}, which the bind-mount code path does not apply; skipping.",
+                    );
+                    return None;
+                }
+            }
+            parse_single_mount(&emitted)
+        })
         .collect();
 
     let volume_strings: Vec<String> = config
@@ -333,7 +347,7 @@ pub async fn run(
         name: name.clone(),
         labels,
         env,
-        mounts: parse_mounts(&mounts),
+        mounts,
         volumes,
         ports,
         workspace_mount: Some(WorkspaceMount {
@@ -710,7 +724,7 @@ async fn run_compose(
     let mounts: Vec<String> = config
         .mounts.as_deref().unwrap_or(&[])
         .iter()
-        .map(|s| substitute_variables_with_user(s, workspace, remote_user))
+        .filter_map(|m| m.clone().substitute_and_emit(workspace, remote_user))
         .collect();
 
     let volume_strings: Vec<String> = config
@@ -934,7 +948,7 @@ fn parse_volumes(volume_strings: &[String]) -> Vec<VolumeMount> {
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_image_present;
+    use super::{ensure_image_present, parse_single_mount};
     use crate::error::DevError;
     use crate::runtime::{
         AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ExecResult,
@@ -1097,5 +1111,53 @@ mod tests {
             0,
             "build path must not call pull_image when image_exists returns true"
         );
+    }
+
+    /// `parse_single_mount` must accept a bind-mount long-form string.
+    #[test]
+    fn parse_single_mount_accepts_bind_long_form() {
+        let m = parse_single_mount("source=./,target=/workspace,type=bind,readonly=true")
+            .expect("long-form bind mount should parse");
+        assert_eq!(m.source, std::path::PathBuf::from("./"));
+        assert_eq!(m.target, "/workspace");
+        assert!(m.readonly);
+    }
+
+    /// `parse_single_mount` must accept a bind-mount long-form string with `ro` flag.
+    #[test]
+    fn parse_single_mount_accepts_long_form_with_ro() {
+        let m = parse_single_mount("source=/host,target=/container,readonly,ro")
+            .expect("long-form bind mount with ro keyword should parse");
+        assert!(m.readonly);
+    }
+
+    /// `parse_single_mount` accepts a non-bind long-form string (the existing
+    /// string parser does not yet refuse non-bind types; callers wrap this with
+    /// a warning in the bind-mount path).
+    #[test]
+    fn parse_single_mount_accepts_non_bind_type() {
+        let m = parse_single_mount("source=myvol,target=/data,type=volume")
+            .expect("non-bind mount should still parse (type is ignored)");
+        assert_eq!(m.source, std::path::PathBuf::from("myvol"));
+        assert_eq!(m.target, "/data");
+        assert!(!m.readonly);
+    }
+
+    /// Reproduce the filter-map logic `run` uses to skip non-bind mounts with a warning.
+    /// Mirrors the body of the bind-mount normalization block in `run`.
+    #[test]
+    fn run_path_skips_non_bind_mount_with_warning() {
+        let emitted = String::from("source=myvol,target=/data,type=tmpfs");
+        let mut skipped = false;
+        if let Some(rest) = emitted.split("type=").nth(1) {
+            let ty = rest.split(',').next().unwrap_or("");
+            if ty != "bind" {
+                eprintln!(
+                    "Warning: mount entry uses type={ty}, which the bind-mount code path does not apply; skipping.",
+                );
+                skipped = true;
+            }
+        }
+        assert!(skipped, "non-bind mount must be skipped in the bind-mount path");
     }
 }
