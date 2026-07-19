@@ -377,10 +377,10 @@ pub async fn run(
 
     println!("Container '{name}' is ready.");
 
-    if !caddy_host_ports.is_empty() {
-        if let Err(e) = crate::caddy::register_site(workspace, &caddy_host_ports) {
-            eprintln!("Warning: Caddy setup failed: {e}");
-        }
+    if !caddy_host_ports.is_empty()
+        && let Err(e) = crate::caddy::register_site(workspace, &caddy_host_ports)
+    {
+        eprintln!("Warning: Caddy setup failed: {e}");
     }
 
     Ok(())
@@ -473,7 +473,7 @@ async fn run_initialize_command(
             }
         }
         LifecycleCommand::Parallel(commands) => {
-            for (_label, command) in commands {
+            for command in commands.values() {
                 run_one(command, workspace).await?;
             }
         }
@@ -803,10 +803,10 @@ async fn run_compose(
 
     println!("Compose service '{service}' is ready (container {}).", &container_id[..12.min(container_id.len())]);
 
-    if !caddy_host_ports_compose.is_empty() {
-        if let Err(e) = crate::caddy::register_site(workspace, &caddy_host_ports_compose) {
-            eprintln!("Warning: Caddy setup failed: {e}");
-        }
+    if !caddy_host_ports_compose.is_empty()
+        && let Err(e) = crate::caddy::register_site(workspace, &caddy_host_ports_compose)
+    {
+        eprintln!("Warning: Caddy setup failed: {e}");
     }
 
     Ok(())
