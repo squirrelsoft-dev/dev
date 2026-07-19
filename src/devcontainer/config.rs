@@ -340,14 +340,6 @@ mod tests {
     #[test]
     fn object_mount_with_unknown_extra_fields_emits_long_form_string() {
         // Extra unknown fields should be tolerated by #[serde(untagged)]'s Object branch.
-        let ws = PathBuf::from("/home/user/project");
-        let spec = MountSpec::Object(MountObject {
-            source: Some("./".into()),
-            target: Some("/workspace".into()),
-            r#type: Some("bind".into()),
-            readonly: None,
-            consistency: None,
-        });
         // The object struct only has known fields; unknown fields are ignored by serde
         // by default, so this parse should be fine end-to-end.
         let config = parse(
