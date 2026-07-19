@@ -28,7 +28,12 @@ pub async fn run(
     }
 
     // Non-compose: label-based container stop/remove.
-    run_with_runtime(workspace, &*runtime, remove).await
+    run_with_runtime(workspace, &*runtime, remove).await?;
+
+    if let Err(e) = crate::caddy::unregister_site(workspace) {
+        eprintln!("Warning: Caddy cleanup failed: {e}");
+    }
+    Ok(())
 }
 
 /// Internal: run the non-compose teardown path against a specific runtime.
@@ -81,11 +86,7 @@ pub async fn run_with_runtime(
     }
 
     if !failures.is_empty() {
-        let err = anyhow::anyhow!("{}", failures.join("; "));
-        Err(err)
-    } else if let Err(e) = crate::caddy::unregister_site(workspace) {
-        eprintln!("Warning: Caddy cleanup failed: {e}");
-        Ok(())
+        Err(anyhow::anyhow!("{}", failures.join("; ")))
     } else {
         Ok(())
     }
@@ -480,9 +481,8 @@ mod tests {
 
         let res = run_with_runtime(workspace, &rt, true).await;
 
-        // remove_container should have been called for both containers.
-        // The Gemini review: removal success after stop failure does not fail
-        // the command, so both are removed despite stop failures.
+        // remove_container should have been called for both containers: a stop
+        // failure must not skip removal, so both are removed.
         assert_eq!(rt.removed.load(Ordering::SeqCst), 2);
         // The overall call succeeds (all removals happened despite stop failures).
         assert!(
