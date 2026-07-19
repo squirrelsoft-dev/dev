@@ -131,11 +131,12 @@ pub async fn run(
     let mut ordered_features = Vec::new();
 
     let final_image = if !needs_build {
-        // Image-based config with no features — use the remote image directly.
+        // Image-based config with no features — use the image directly. If the
+        // image is already present locally, skip the pull (mirrors the reference
+        // devcontainer CLI, which inspects the local image before pulling).
         let image = config.image.as_ref()
             .ok_or_else(|| anyhow::anyhow!("devcontainer.json must specify 'image', 'build.dockerfile', or 'dockerComposeFile'"))?;
-        eprintln!("Pulling image '{image}'...");
-        runtime.pull_image(image).await?;
+        ensure_image_present(runtime.as_ref(), image).await?;
         image.clone()
     } else if !rebuild && !no_cache && runtime.image_exists(&final_tag).await? {
         // Image already built (e.g. by `dev build`), skip rebuild.
@@ -382,6 +383,25 @@ pub async fn run(
         }
     }
 
+    Ok(())
+}
+
+/// Ensure a container image is present locally, pulling it only if missing.
+///
+/// Mirrors the reference devcontainer CLI behavior: inspect the local image
+/// first and pull only when it is not already present. The progress message is
+/// printed *before* the pull starts so the user is not left staring at a silent
+/// prompt during a potentially long network pull.
+pub(crate) async fn ensure_image_present(
+    runtime: &dyn ContainerRuntime,
+    image: &str,
+) -> anyhow::Result<()> {
+    if runtime.image_exists(image).await? {
+        eprintln!("Using local image '{image}'...");
+    } else {
+        eprintln!("Pulling image '{image}'...");
+        runtime.pull_image(image).await?;
+    }
     Ok(())
 }
 
@@ -911,4 +931,154 @@ fn parse_volumes(volume_strings: &[String]) -> Vec<VolumeMount> {
         }
     }
     volumes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_image_present;
+    use crate::error::DevError;
+    use crate::runtime::{
+        AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ExecResult,
+        ImageMetadata,
+    };
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    fn unused<T>() -> BoxFut<'static, T> {
+        Box::pin(async {
+            Err(DevError::Runtime(
+                "FakeRuntime method unused by ensure_image_present".into(),
+            ))
+        })
+    }
+
+    /// Minimal fake runtime: records `pull_image` calls and returns a fixed
+    /// `image_exists` result. Every other trait method is unused by
+    /// `ensure_image_present` and returns an error if invoked.
+    struct FakeRuntime {
+        exists: AtomicBool,
+        pull_count: AtomicUsize,
+    }
+
+    impl FakeRuntime {
+        fn new(exists: bool) -> Self {
+            Self {
+                exists: AtomicBool::new(exists),
+                pull_count: AtomicUsize::new(0),
+            }
+        }
+
+        fn pull_count(&self) -> usize {
+            self.pull_count.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ContainerRuntime for FakeRuntime {
+        fn runtime_name(&self) -> &'static str {
+            "fake"
+        }
+
+        fn pull_image(&self, _image: &str) -> BoxFut<'_, ()> {
+            self.pull_count.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn build_image(
+            &self,
+            _dockerfile: &str,
+            _context: &Path,
+            _tag: &str,
+            _build_args: &HashMap<String, String>,
+            _no_cache: bool,
+            _verbose: bool,
+        ) -> BoxFut<'_, ()> {
+            unused()
+        }
+
+        fn create_container(&self, _config: &ContainerConfig) -> BoxFut<'_, String> {
+            unused()
+        }
+
+        fn start_container(&self, _id: &str) -> BoxFut<'_, ()> {
+            unused()
+        }
+
+        fn stop_container(&self, _id: &str) -> BoxFut<'_, ()> {
+            unused()
+        }
+
+        fn remove_container(&self, _id: &str) -> BoxFut<'_, ()> {
+            unused()
+        }
+
+        fn exec(&self, _id: &str, _cmd: &[String], _user: Option<&str>) -> BoxFut<'_, ExecResult> {
+            unused()
+        }
+
+        fn exec_interactive(
+            &self,
+            _id: &str,
+            _cmd: &[String],
+            _user: Option<&str>,
+        ) -> BoxFut<'_, ()> {
+            unused()
+        }
+
+        fn inspect_container(&self, _id: &str) -> BoxFut<'_, ContainerInfo> {
+            unused()
+        }
+
+        fn list_containers(&self, _label_filters: &[String]) -> BoxFut<'_, Vec<ContainerInfo>> {
+            unused()
+        }
+
+        fn image_exists(&self, _image: &str) -> BoxFut<'_, bool> {
+            let exists = self.exists.load(Ordering::SeqCst);
+            Box::pin(async move { Ok(exists) })
+        }
+
+        fn inspect_image_metadata(&self, _image: &str) -> BoxFut<'_, ImageMetadata> {
+            unused()
+        }
+
+        fn exec_attached(
+            &self,
+            _id: &str,
+            _cmd: &[String],
+            _user: Option<&str>,
+        ) -> BoxFut<'_, AttachedExec> {
+            unused()
+        }
+    }
+
+    /// When the image is already present locally, `ensure_image_present` must
+    /// use it and must NOT pull.
+    #[tokio::test]
+    async fn ensure_image_present_skips_pull_when_image_exists() {
+        let rt = FakeRuntime::new(true);
+        ensure_image_present(&rt, "localimg:latest")
+            .await
+            .expect("helper should succeed when image exists");
+        assert_eq!(
+            rt.pull_count(),
+            0,
+            "pull_image must not be called when image_exists returns true"
+        );
+    }
+
+    /// When the image is missing locally, `ensure_image_present` must pull it
+    /// exactly once.
+    #[tokio::test]
+    async fn ensure_image_present_pulls_when_image_missing() {
+        let rt = FakeRuntime::new(false);
+        ensure_image_present(&rt, "remoteimg:latest")
+            .await
+            .expect("helper should succeed after pulling");
+        assert_eq!(
+            rt.pull_count(),
+            1,
+            "pull_image must be called exactly once when image_exists returns false"
+        );
+    }
 }
