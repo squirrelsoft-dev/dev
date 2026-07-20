@@ -12,9 +12,11 @@ env:
 # One in-flight run per branch: pushing a fixup to a PR cancels the superseded
 # run instead of leaving both to finish. Matters most for the macos-latest job,
 # which bills at 10x the Linux rate and compiles the whole tonic/prost tree.
+# Pushes to main are exempt, so every commit on the default branch keeps its own
+# pass/fail status for bisecting and release gating.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 # No step in either job writes to the repository, so drop the default
 # GITHUB_TOKEN grant to read-only. Least privilege is the other half of the
