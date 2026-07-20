@@ -1,12 +1,15 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::devcontainer::effective::{
+    absolutize_config_paths, config_definition, prune_lower_priority_definitions,
+};
 use crate::devcontainer::jsonc::parse_jsonc;
 use crate::devcontainer::merge::{merge_layer, merge_layers};
-use crate::devcontainer::recipe::{is_empty_object, Recipe};
+use crate::devcontainer::recipe::{Recipe, is_empty_object};
 use crate::util::paths::DevHome;
 
 /// Read a JSON file, stripping comments and trailing commas. Returns `None` if the file doesn't exist.
@@ -50,20 +53,72 @@ fn substitute_template_options(value: &mut Value, options: &HashMap<String, Stri
 /// 3. Runtime config (`~/.dev/<runtime>/devcontainer.json`) (highest priority for scalars)
 ///
 /// Then inject recipe features into the composed result.
-pub(crate) fn compose_config_with_base(
-    recipe: &Recipe,
-    runtime_name: &str,
-    include_base: bool,
-) -> anyhow::Result<Value> {
-    compose_config_in(&DevHome::current(), recipe, runtime_name, include_base)
-}
-
+#[cfg(test)]
 pub(crate) fn compose_config_in(
     dev_home: &DevHome,
     recipe: &Recipe,
     runtime_name: &str,
     include_base: bool,
 ) -> anyhow::Result<Value> {
+    Ok(compose_config_details_in(dev_home, recipe, runtime_name, include_base)?.value)
+}
+
+pub(crate) struct RecipeConfig {
+    /// The devcontainer path used for relative-path resolution and container labels.
+    ///
+    /// Recipe projects no longer persist this file; it is a stable virtual path
+    /// beside `recipe.json` so existing labels and lockfile locations remain
+    /// compatible with the older composed-file flow.
+    pub(crate) config_path: PathBuf,
+    pub(crate) value: Value,
+    pub(crate) base_feature_ids: HashSet<String>,
+}
+
+pub(crate) fn compose_recipe_config(
+    recipe_path: &Path,
+    recipe: &Recipe,
+    runtime_name: &str,
+    include_base: bool,
+) -> anyhow::Result<RecipeConfig> {
+    compose_recipe_config_in(
+        &DevHome::current(),
+        recipe_path,
+        recipe,
+        runtime_name,
+        include_base,
+    )
+}
+
+pub(crate) fn compose_recipe_config_in(
+    dev_home: &DevHome,
+    recipe_path: &Path,
+    recipe: &Recipe,
+    runtime_name: &str,
+    include_base: bool,
+) -> anyhow::Result<RecipeConfig> {
+    let recipe_dir = recipe_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("recipe path has no parent: {}", recipe_path.display()))?;
+    prepare_recipe_directory_in(dev_home, recipe, recipe_dir)?;
+    let details = compose_config_details_in(dev_home, recipe, runtime_name, include_base)?;
+    Ok(RecipeConfig {
+        config_path: recipe_dir.join("devcontainer.json"),
+        value: details.value,
+        base_feature_ids: details.base_feature_ids,
+    })
+}
+
+struct ComposeDetails {
+    value: Value,
+    base_feature_ids: HashSet<String>,
+}
+
+fn compose_config_details_in(
+    dev_home: &DevHome,
+    recipe: &Recipe,
+    runtime_name: &str,
+    include_base: bool,
+) -> anyhow::Result<ComposeDetails> {
     // Layer 1: Global template
     let global_config_path = dev_home.global_template_config(&recipe.global_template);
     let mut global = read_json_file(&global_config_path)?.ok_or_else(|| {
@@ -78,16 +133,39 @@ pub(crate) fn compose_config_in(
     if !recipe.options.is_empty() {
         substitute_template_options(&mut global, &recipe.options);
     }
+    let global_feature_ids = declared_feature_ids(&global);
+    let mut selected_definition = config_definition(&global);
 
     // Layer 2: Base config
+    let mut base_feature_ids = HashSet::new();
     let base = if include_base {
-        read_json_file(&dev_home.base_config())?
+        let base_config_path = dev_home.base_config();
+        let mut base = read_json_file(&base_config_path)?;
+        if let Some(ref mut b) = base {
+            if let Some(base_dir) = base_config_path.parent() {
+                absolutize_config_paths(b, base_dir);
+            }
+            base_feature_ids = declared_feature_ids(b);
+            if let Some(definition) = config_definition(b) {
+                selected_definition = Some(definition);
+            }
+        }
+        base
     } else {
         None
     };
 
     // Layer 3: Runtime config
-    let runtime = read_json_file(&dev_home.runtime_config(runtime_name))?;
+    let runtime_config_path = dev_home.runtime_config(runtime_name);
+    let mut runtime = read_json_file(&runtime_config_path)?;
+    if let Some(ref mut r) = runtime {
+        if let Some(runtime_dir) = runtime_config_path.parent() {
+            absolutize_config_paths(r, runtime_dir);
+        }
+        if let Some(definition) = config_definition(r) {
+            selected_definition = Some(definition);
+        }
+    }
 
     // Merge layers in priority order
     let mut layers = vec![global];
@@ -116,56 +194,53 @@ pub(crate) fn compose_config_in(
                 }
             }
         }
+        for feature_ref in &recipe.features {
+            base_feature_ids.remove(feature_ref);
+        }
     }
 
     // Apply user customizations as the highest-priority layer
     if !is_empty_object(&recipe.customizations) {
+        for id in declared_feature_ids(&recipe.customizations) {
+            base_feature_ids.remove(&id);
+        }
+        if let Some(definition) = config_definition(&recipe.customizations) {
+            selected_definition = Some(definition);
+        }
         merge_layer(&mut composed, &recipe.customizations);
     }
 
-    Ok(composed)
+    for id in global_feature_ids {
+        base_feature_ids.remove(&id);
+    }
+
+    prune_lower_priority_definitions(&mut composed, selected_definition);
+
+    Ok(ComposeDetails {
+        value: composed,
+        base_feature_ids,
+    })
 }
 
-/// Compose the config and write it to the project's `.devcontainer/devcontainer.json`.
-/// Also copies auxiliary files (Dockerfiles, compose files, scripts) from the
-/// global template directory so that relative paths in the config resolve correctly.
-/// Returns the path to the written file along with the composed value.
-///
-/// The persisted file is always the full, base-inclusive composition. A run that
-/// opts out of the base layer composes its own config in memory via
-/// [`compose_config_with_base`] instead, so `--no-base` cannot leave a base-free
-/// config behind for the next `dev config` or `dev up` to read.
-pub(crate) fn compose_and_write(
-    recipe: &Recipe,
-    runtime_name: &str,
-) -> anyhow::Result<(PathBuf, Value)> {
-    compose_and_write_in(&DevHome::current(), recipe, runtime_name)
+fn declared_feature_ids(value: &Value) -> HashSet<String> {
+    value
+        .get("features")
+        .and_then(Value::as_object)
+        .map(|obj| obj.keys().cloned().collect())
+        .unwrap_or_default()
 }
 
-pub(crate) fn compose_and_write_in(
+pub(crate) fn prepare_recipe_directory_in(
     dev_home: &DevHome,
     recipe: &Recipe,
-    runtime_name: &str,
-) -> anyhow::Result<(PathBuf, Value)> {
-    let composed = compose_config_in(dev_home, recipe, runtime_name, true)?;
-
-    let folder_name = Path::new(&recipe.root_folder)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "workspace".to_string());
-
-    let dest_dir = dev_home.project_devcontainer_dir(&folder_name);
-    fs::create_dir_all(&dest_dir)?;
+    dest_dir: &Path,
+) -> anyhow::Result<()> {
+    fs::create_dir_all(dest_dir)?;
 
     // Copy auxiliary files (Dockerfiles, compose files, etc.) from the global template.
     let global_devcontainer_dir = dev_home.global_template_dir(&recipe.global_template);
-    copy_auxiliary_files(&global_devcontainer_dir, &dest_dir, &recipe.options)?;
-
-    let dest_path = dest_dir.join("devcontainer.json");
-    let formatted = serde_json::to_string_pretty(&composed)?;
-    fs::write(&dest_path, &formatted)?;
-
-    Ok((dest_path, composed))
+    copy_auxiliary_files(&global_devcontainer_dir, dest_dir, &recipe.options)?;
+    Ok(())
 }
 
 /// Copy non-config files from a global template's `.devcontainer/` directory to
@@ -192,6 +267,8 @@ fn copy_auxiliary_files(
         if src_path.is_dir() {
             fs::create_dir_all(&dest_path)?;
             copy_auxiliary_files(&src_path, &dest_path, options)?;
+        } else if dest_path.exists() {
+            continue;
         } else {
             match fs::read_to_string(&src_path) {
                 Ok(content) => {
@@ -211,6 +288,9 @@ fn copy_auxiliary_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::devcontainer::config::DevcontainerConfig;
+    use crate::devcontainer::features::feature_image_tag;
+    use crate::devcontainer::resolve_features;
     use tempfile::TempDir;
 
     /// Build a temp `~/.dev/` tree and a recipe pointing at the `test-lang`
@@ -273,14 +353,8 @@ mod tests {
             compose_config_in(&self.dev_home, recipe, runtime_name, include_base).unwrap()
         }
 
-        fn persisted(&self) -> Value {
-            let path = self
-                .dev_home
-                .project_devcontainer_dir("demo")
-                .join("devcontainer.json");
-            read_json_file(&path)
-                .unwrap()
-                .expect("composed config should be written")
+        fn recipe_dir(&self) -> PathBuf {
+            self.workspace.join(".devcontainer")
         }
     }
 
@@ -368,10 +442,12 @@ mod tests {
         let composed = env.compose(&recipe, "docker", true);
 
         assert_eq!(composed["remoteUser"], "developer");
-        assert!(composed["features"]
-            .as_object()
-            .unwrap()
-            .contains_key("ghcr.io/features/node"));
+        assert!(
+            composed["features"]
+                .as_object()
+                .unwrap()
+                .contains_key("ghcr.io/features/node")
+        );
         let ports = composed["forwardPorts"].as_array().unwrap();
         assert!(ports.contains(&Value::Number(3000.into())));
         assert!(ports.contains(&Value::Number(9090.into())));
@@ -415,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_composition_always_includes_the_base_layer() {
+    fn recipe_config_composes_in_memory_without_writing_devcontainer_json() {
         let env = TestDevHome::new(
             r#"{"image": "rust:latest", "remoteUser": "root"}"#,
             Some(r#"{"remoteUser": "vscode", "features": {"ghcr.io/features/zsh": {}}}"#),
@@ -423,20 +499,28 @@ mod tests {
             "docker",
         );
         let recipe = env.recipe();
+        let recipe_dir = env.recipe_dir();
+        fs::create_dir_all(&recipe_dir).unwrap();
+        let recipe_path = recipe_dir.join("recipe.json");
+        recipe.write_to(&recipe_path).unwrap();
 
-        let (path, returned) = compose_and_write_in(&env.dev_home, &recipe, "docker").unwrap();
+        let returned =
+            compose_recipe_config_in(&env.dev_home, &recipe_path, &recipe, "docker", true).unwrap();
 
-        assert_eq!(
-            returned,
-            env.persisted(),
-            "returned value must match the file"
+        assert_eq!(returned.value["remoteUser"], "vscode");
+        assert!(
+            returned
+                .config_path
+                .ends_with("demo/.devcontainer/devcontainer.json")
         );
-        assert_eq!(returned["remoteUser"], "vscode");
-        assert!(path.ends_with("demo/.devcontainer/devcontainer.json"));
+        assert!(
+            !returned.config_path.exists(),
+            "the composed devcontainer.json is a virtual path for recipe projects"
+        );
     }
 
     #[test]
-    fn composing_without_base_leaves_the_persisted_file_untouched() {
+    fn composing_without_base_is_invocation_local() {
         let env = TestDevHome::new(
             r#"{"image": "rust:latest", "remoteUser": "root"}"#,
             Some(r#"{"remoteUser": "vscode", "features": {"ghcr.io/features/zsh": {}}}"#),
@@ -444,25 +528,30 @@ mod tests {
             "docker",
         );
         let recipe = env.recipe();
-        compose_and_write_in(&env.dev_home, &recipe, "docker").unwrap();
-        let before = env.persisted();
+        let recipe_dir = env.recipe_dir();
+        fs::create_dir_all(&recipe_dir).unwrap();
+        let recipe_path = recipe_dir.join("recipe.json");
+        recipe.write_to(&recipe_path).unwrap();
 
-        let run_config = env.compose(&recipe, "docker", false);
+        let with_base =
+            compose_recipe_config_in(&env.dev_home, &recipe_path, &recipe, "docker", true)
+                .unwrap()
+                .value;
+        let without_base =
+            compose_recipe_config_in(&env.dev_home, &recipe_path, &recipe, "docker", false)
+                .unwrap()
+                .value;
 
         assert_eq!(
-            run_config["remoteUser"], "root",
+            without_base["remoteUser"], "root",
             "the run drops the base layer"
         );
-        assert_eq!(
-            env.persisted(),
-            before,
-            "--no-base must not rewrite the persisted composition"
-        );
-        assert_eq!(env.persisted()["remoteUser"], "vscode");
+        assert_eq!(with_base["remoteUser"], "vscode");
+        assert!(!recipe_dir.join("devcontainer.json").exists());
     }
 
     #[test]
-    fn compose_and_write_copies_auxiliary_template_files() {
+    fn prepare_recipe_directory_copies_auxiliary_template_files() {
         let env = TestDevHome::new(
             r#"{"build": {"dockerfile": "Dockerfile"}}"#,
             None,
@@ -479,13 +568,213 @@ mod tests {
             .options
             .insert("base".to_string(), "rust:latest".to_string());
 
-        compose_and_write_in(&env.dev_home, &recipe, "docker").unwrap();
+        let recipe_dir = env.recipe_dir();
+        prepare_recipe_directory_in(&env.dev_home, &recipe, &recipe_dir).unwrap();
 
-        let copied = env
-            .dev_home
-            .project_devcontainer_dir("demo")
-            .join("Dockerfile");
+        let copied = recipe_dir.join("Dockerfile");
         assert_eq!(fs::read_to_string(copied).unwrap(), "FROM rust:latest\n");
+        assert!(
+            !recipe_dir.join("devcontainer.json").exists(),
+            "preparing recipe files must not write composed config state"
+        );
+    }
+
+    #[test]
+    fn prepare_recipe_directory_does_not_overwrite_existing_auxiliary_files() {
+        let env = TestDevHome::new(
+            r#"{"build": {"dockerfile": "Dockerfile"}}"#,
+            None,
+            None,
+            "docker",
+        );
+        let aux = env
+            .dev_home
+            .global_template_dir("test-lang")
+            .join("Dockerfile");
+        fs::write(&aux, "FROM rust:latest\n").unwrap();
+        let recipe = env.recipe();
+        let recipe_dir = env.recipe_dir();
+        fs::create_dir_all(&recipe_dir).unwrap();
+        let copied = recipe_dir.join("Dockerfile");
+        fs::write(&copied, "FROM project-edited\n").unwrap();
+
+        prepare_recipe_directory_in(&env.dev_home, &recipe, &recipe_dir).unwrap();
+
+        assert_eq!(fs::read_to_string(copied).unwrap(), "FROM project-edited\n");
+    }
+
+    #[test]
+    fn base_scalar_changes_propagate_without_regenerating_recipe_state() {
+        let env = TestDevHome::new(
+            r#"{"image": "rust:latest", "remoteUser": "root"}"#,
+            Some(r#"{"remoteUser": "vscode"}"#),
+            None,
+            "docker",
+        );
+        let recipe = env.recipe();
+        let recipe_dir = env.recipe_dir();
+        fs::create_dir_all(&recipe_dir).unwrap();
+        let recipe_path = recipe_dir.join("recipe.json");
+        recipe.write_to(&recipe_path).unwrap();
+        let recipe_before = fs::read_to_string(&recipe_path).unwrap();
+
+        let first = compose_recipe_config_in(&env.dev_home, &recipe_path, &recipe, "docker", true)
+            .unwrap()
+            .value;
+        fs::write(env.dev_home.base_config(), r#"{"remoteUser": "developer"}"#).unwrap();
+        let second = compose_recipe_config_in(&env.dev_home, &recipe_path, &recipe, "docker", true)
+            .unwrap()
+            .value;
+
+        assert_eq!(first["remoteUser"], "vscode");
+        assert_eq!(second["remoteUser"], "developer");
+        assert_eq!(fs::read_to_string(&recipe_path).unwrap(), recipe_before);
+        assert!(!recipe_dir.join("devcontainer.json").exists());
+    }
+
+    #[test]
+    fn recipe_feature_image_tag_changes_when_base_scalar_changes() {
+        let env = TestDevHome::new(
+            r#"{
+                "image": "rust:latest",
+                "features": {"ghcr.io/features/node": {}}
+            }"#,
+            Some(r#"{"remoteUser": "vscode"}"#),
+            None,
+            "docker",
+        );
+        let recipe = env.recipe();
+
+        let first_value = env.compose(&recipe, "docker", true);
+        fs::write(env.dev_home.base_config(), r#"{"remoteUser": "developer"}"#).unwrap();
+        let second_value = env.compose(&recipe, "docker", true);
+
+        let tag = |value: Value| {
+            let config: DevcontainerConfig = serde_json::from_value(value).unwrap();
+            feature_image_tag("vsc-demo", &config, &resolve_features(&config).unwrap())
+        };
+
+        assert_ne!(tag(first_value), tag(second_value));
+    }
+
+    #[test]
+    fn recipe_customizations_preserve_project_over_base_precedence() {
+        let env = TestDevHome::new(
+            r#"{"image": "rust:latest", "remoteUser": "root"}"#,
+            Some(r#"{"remoteUser": "base", "containerEnv": {"SHARED": "base"}}"#),
+            None,
+            "docker",
+        );
+        let mut recipe = env.recipe();
+        recipe.customizations = serde_json::json!({
+            "remoteUser": "project",
+            "containerEnv": {"SHARED": "project"}
+        });
+
+        let composed = env.compose(&recipe, "docker", true);
+
+        assert_eq!(composed["remoteUser"], "project");
+        assert_eq!(composed["containerEnv"]["SHARED"], "project");
+    }
+
+    #[test]
+    fn recipe_no_base_is_invocation_local_and_skips_base_features() {
+        let env = TestDevHome::new(
+            r#"{"image": "rust:latest"}"#,
+            Some(
+                r#"{
+                    "remoteUser": "vscode",
+                    "features": {"ghcr.io/features/zsh": {}}
+                }"#,
+            ),
+            None,
+            "docker",
+        );
+        let recipe = env.recipe();
+        let recipe_dir = env.recipe_dir();
+        fs::create_dir_all(&recipe_dir).unwrap();
+        let recipe_path = recipe_dir.join("recipe.json");
+        recipe.write_to(&recipe_path).unwrap();
+
+        let without_base =
+            compose_recipe_config_in(&env.dev_home, &recipe_path, &recipe, "docker", false)
+                .unwrap();
+        let with_base =
+            compose_recipe_config_in(&env.dev_home, &recipe_path, &recipe, "docker", true).unwrap();
+
+        assert!(without_base.value.get("remoteUser").is_none());
+        assert!(without_base.value.get("features").is_none());
+        assert!(without_base.base_feature_ids.is_empty());
+        assert_eq!(with_base.value["remoteUser"], "vscode");
+        assert!(with_base.base_feature_ids.contains("ghcr.io/features/zsh"));
+    }
+
+    #[test]
+    fn recipe_selector_conflicts_prune_lower_priority_definitions() {
+        let env = TestDevHome::new(
+            r#"{"build": {"dockerfile": "Dockerfile"}}"#,
+            Some(r#"{"image": "base:latest"}"#),
+            None,
+            "docker",
+        );
+
+        let composed = env.compose(&env.recipe(), "docker", true);
+
+        assert_eq!(composed["image"], "base:latest");
+        assert!(
+            composed.get("build").is_none(),
+            "a higher-priority image selector must remove the lower-priority build selector"
+        );
+    }
+
+    #[test]
+    fn recipe_customization_selector_wins_over_base_selector() {
+        let env = TestDevHome::new(
+            r#"{"build": {"dockerfile": "Dockerfile"}}"#,
+            Some(r#"{"image": "base:latest"}"#),
+            None,
+            "docker",
+        );
+        let mut recipe = env.recipe();
+        recipe.customizations = serde_json::json!({
+            "build": {"dockerfile": "Project.Dockerfile"}
+        });
+
+        let composed = env.compose(&recipe, "docker", true);
+
+        assert_eq!(composed["build"]["dockerfile"], "Project.Dockerfile");
+        assert!(composed.get("image").is_none());
+    }
+
+    #[test]
+    fn runtime_relative_paths_keep_runtime_provenance_in_recipe_composition() {
+        let env = TestDevHome::new(
+            r#"{"image": "rust:latest"}"#,
+            None,
+            Some(r#"{"build": {"dockerfile": "Runtime.Dockerfile", "context": "."}}"#),
+            "docker",
+        );
+        let runtime_dir = env
+            .dev_home
+            .runtime_config("docker")
+            .parent()
+            .unwrap()
+            .to_path_buf();
+
+        let composed = env.compose(&env.recipe(), "docker", true);
+
+        assert_eq!(
+            composed["build"]["dockerfile"],
+            runtime_dir
+                .join("Runtime.Dockerfile")
+                .to_string_lossy()
+                .as_ref()
+        );
+        assert_eq!(
+            composed["build"]["context"],
+            runtime_dir.join(".").to_string_lossy().as_ref()
+        );
+        assert!(composed.get("image").is_none());
     }
 
     #[test]

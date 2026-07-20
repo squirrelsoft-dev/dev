@@ -100,7 +100,7 @@ If no base config exists, this layer is simply skipped. Pass `--no-base` to `dev
 
 For a project with its own `.devcontainer/devcontainer.json`, the base config is merged in memory only — it is never written into that file, and features it contributes are kept out of the project's `devcontainer-lock.json`.
 
-Recipe-based (user-scoped) projects work differently: their layers are composed ahead of time and the result is written to `~/.dev/devcontainers/<folder>/.devcontainer/devcontainer.json`, so the base layer is baked into that composed file. `--no-base` stays local to the run either way — it never rewrites the composed file without the base layer, so `dev config` keeps showing the same config the next `dev up` will use.
+Recipe-based projects keep `recipe.json` as the durable source of truth. `dev up` and `dev build` compose the recipe in memory with the current base and runtime layers, so edits to `~/.dev/base/devcontainer.json` take effect on the next run without regenerating project state. `--no-base` stays local to that invocation.
 
 ### Global templates
 
@@ -170,10 +170,10 @@ docker image prune
 
 `dev new` lets you choose where the config lives:
 
-- **Workspace scope** — writes to `.devcontainer/devcontainer.json` in the project (committed to git, shared with the team)
+- **Workspace scope** — writes `.devcontainer/recipe.json` plus any template auxiliary files in the project
 - **User scope** — writes a lightweight recipe to `~/.dev/devcontainers/<folder>/` (keeps the workspace clean, personal to you)
 
-User-scoped recipes reference a global template by name and store any per-project overrides. The full config is composed at build/run time.
+Recipes reference a global template by name and store any per-project overrides. The full config is composed at build/run time.
 
 ## Local domain routing
 

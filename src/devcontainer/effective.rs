@@ -8,7 +8,7 @@ use crate::error::DevError;
 use crate::util::paths::base_config_dir;
 
 use super::config::DevcontainerConfig;
-use super::features::{features_required_by, ResolvedFeature};
+use super::features::{ResolvedFeature, features_required_by};
 use super::jsonc::parse_jsonc;
 use super::lockfile::{handle_lockfile, lockfile_path};
 use super::merge::merge_layers;
@@ -28,13 +28,20 @@ pub(crate) struct EffectiveConfig {
     pub(crate) owns_lockfile: bool,
 }
 
-pub(crate) fn load_effective_config(config_path: &Path, include_base: bool) -> anyhow::Result<EffectiveConfig> {
+pub(crate) fn load_effective_config(
+    config_path: &Path,
+    include_base: bool,
+) -> anyhow::Result<EffectiveConfig> {
     let base_path = base_config_dir().join("devcontainer.json");
     let (value, base_feature_ids) =
         load_effective_config_value(config_path, include_base, &base_path)?;
     let config = serde_json::from_value(value)
         .map_err(|e| DevError::InvalidConfig(format!("Failed to parse merged config: {e}")))?;
-    Ok(EffectiveConfig { config, base_feature_ids, owns_lockfile: true })
+    Ok(EffectiveConfig {
+        config,
+        base_feature_ids,
+        owns_lockfile: true,
+    })
 }
 
 /// Build an [`EffectiveConfig`] from an already-composed config value.
@@ -46,16 +53,25 @@ pub(crate) fn load_effective_config(config_path: &Path, include_base: bool) -> a
 /// `is_persisted` says whether this value is the one written to disk. A `--no-base`
 /// run composes a narrower config than the persisted file, and its lockfile must
 /// stay out of the composed directory.
+#[cfg(test)]
 pub(crate) fn effective_config_from_value(
     value: Value,
     is_persisted: bool,
+) -> anyhow::Result<EffectiveConfig> {
+    effective_config_from_parts(value, HashSet::new(), is_persisted)
+}
+
+pub(crate) fn effective_config_from_parts(
+    value: Value,
+    base_feature_ids: HashSet<String>,
+    owns_lockfile: bool,
 ) -> anyhow::Result<EffectiveConfig> {
     let config = serde_json::from_value(value)
         .map_err(|e| DevError::InvalidConfig(format!("Failed to parse composed config: {e}")))?;
     Ok(EffectiveConfig {
         config,
-        base_feature_ids: HashSet::new(),
-        owns_lockfile: is_persisted,
+        base_feature_ids,
+        owns_lockfile,
     })
 }
 
@@ -140,7 +156,7 @@ pub(crate) fn load_effective_config_value(
         let mut base = read_json_file(base_config_path)?;
         if !base.as_object().map(|o| o.is_empty()).unwrap_or(true) {
             if let Some(base_dir) = base_config_path.parent() {
-                absolutize_base_paths(&mut base, base_dir);
+                absolutize_config_paths(&mut base, base_dir);
             }
             base_feature_ids = declared_feature_ids(&base);
             layers.push(base);
@@ -167,14 +183,14 @@ fn declared_feature_ids(value: &Value) -> HashSet<String> {
         .unwrap_or_default()
 }
 
-/// Rewrite relative paths in the base config so they resolve against the base
-/// config's own directory rather than the project's `.devcontainer/`.
+/// Rewrite relative paths in an overlay config so they resolve against that
+/// config's own directory rather than the effective config directory.
 ///
-/// The base layer is merged in memory beneath a project config that lives
+/// Runtime/base layers are merged in memory beneath a project config that lives
 /// somewhere else entirely, so every downstream consumer (Dockerfile reads, bind
-/// mount sources, local feature lookups) would otherwise resolve base paths
+/// mount sources, local feature lookups) would otherwise resolve their paths
 /// against the wrong root and fail with a bare "no such file or directory".
-fn absolutize_base_paths(base: &mut Value, base_dir: &Path) {
+pub(crate) fn absolutize_config_paths(base: &mut Value, base_dir: &Path) {
     let Some(obj) = base.as_object_mut() else {
         return;
     };
@@ -292,13 +308,13 @@ fn read_json_file(path: &Path) -> anyhow::Result<Value> {
 }
 
 #[derive(Clone, Copy)]
-enum ConfigDefinition {
+pub(crate) enum ConfigDefinition {
     Image,
     Build,
     Compose,
 }
 
-fn config_definition(value: &Value) -> Option<ConfigDefinition> {
+pub(crate) fn config_definition(value: &Value) -> Option<ConfigDefinition> {
     let obj = value.as_object()?;
     if obj.contains_key("dockerComposeFile") {
         Some(ConfigDefinition::Compose)
@@ -311,7 +327,7 @@ fn config_definition(value: &Value) -> Option<ConfigDefinition> {
     }
 }
 
-fn prune_lower_priority_definitions(
+pub(crate) fn prune_lower_priority_definitions(
     merged: &mut Value,
     project_definition: Option<ConfigDefinition>,
 ) {
@@ -340,12 +356,12 @@ fn prune_lower_priority_definitions(
 #[cfg(test)]
 mod tests {
     use super::{
-        absolutize_mount_string, effective_config_from_value, load_effective_config_value,
-        project_owned_features, LockfilePolicy,
+        LockfilePolicy, absolutize_mount_string, effective_config_from_value,
+        load_effective_config_value, project_owned_features,
     };
-    use crate::devcontainer::lockfile::lockfile_path;
     use crate::devcontainer::config::{DevcontainerConfig, LifecycleCommand};
-    use crate::devcontainer::features::{feature_image_tag, ResolvedFeature};
+    use crate::devcontainer::features::{ResolvedFeature, feature_image_tag};
+    use crate::devcontainer::lockfile::lockfile_path;
     use crate::devcontainer::resolve_features;
     use std::collections::HashMap;
     use std::fs;
@@ -498,10 +514,12 @@ mod tests {
         assert!(config.build.is_some());
         assert!(config.docker_compose_file.is_none());
         assert_eq!(config.image, None);
-        assert!(config
-            .features
-            .unwrap()
-            .contains_key("ghcr.io/devcontainers/features/rust:1"));
+        assert!(
+            config
+                .features
+                .unwrap()
+                .contains_key("ghcr.io/devcontainers/features/rust:1")
+        );
         let env = config.remote_env.unwrap();
         assert_eq!(env["EDITOR"], "nvim");
         assert_eq!(env["RUST_LOG"], "debug");
@@ -543,10 +561,12 @@ mod tests {
         assert!(config.image.is_none());
         assert!(config.build.is_none());
         assert_eq!(config.service.as_deref(), Some("app"));
-        assert!(config
-            .features
-            .unwrap()
-            .contains_key("ghcr.io/devcontainers/features/github-cli:1"));
+        assert!(
+            config
+                .features
+                .unwrap()
+                .contains_key("ghcr.io/devcontainers/features/github-cli:1")
+        );
         let env = config.container_env.unwrap();
         assert_eq!(env["APP_ENV"], "dev");
         assert_eq!(env["EDITOR"], "nvim");
@@ -844,9 +864,7 @@ mod tests {
             base_dir.join(".").to_string_lossy().as_ref()
         );
         let features = value["features"].as_object().unwrap();
-        assert!(features.contains_key(
-            base_dir.join("./local-feature").to_string_lossy().as_ref()
-        ));
+        assert!(features.contains_key(base_dir.join("./local-feature").to_string_lossy().as_ref()));
         assert!(
             features.contains_key("ghcr.io/f/gh:1"),
             "OCI references must not be treated as paths"
@@ -946,7 +964,11 @@ mod tests {
 
         assert_eq!(with_base.remote_user.as_deref(), Some("vscode"));
         assert_ne!(
-            feature_image_tag("vsc-demo", &with_base, &resolve_features(&with_base).unwrap()),
+            feature_image_tag(
+                "vsc-demo",
+                &with_base,
+                &resolve_features(&with_base).unwrap()
+            ),
             feature_image_tag(
                 "vsc-demo",
                 &without_base,

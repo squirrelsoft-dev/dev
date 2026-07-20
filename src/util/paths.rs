@@ -71,14 +71,6 @@ impl DevHome {
     pub fn runtime_config(&self, runtime: &str) -> PathBuf {
         self.root.join(runtime).join("devcontainer.json")
     }
-
-    /// A user-scoped project's `.devcontainer/` directory.
-    pub fn project_devcontainer_dir(&self, folder_name: &str) -> PathBuf {
-        self.root
-            .join("devcontainers")
-            .join(folder_name)
-            .join(".devcontainer")
-    }
 }
 
 /// VS Code remote-containers configs directory.
