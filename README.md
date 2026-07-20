@@ -163,14 +163,14 @@ Global flags: `--workspace <path>`, `--runtime <docker|podman|apple>`, `-v` / `-
 
 ## Derived images and disk use
 
-When a config declares features, `dev up` and `dev build` layer them onto a derived image tagged `<folder>-features-<digest>`. The digest covers the effective config values — base image selector, features, `remoteUser`, `containerEnv`, `remoteEnv`. Edit any of those and the next run builds a new image rather than reusing a stale one.
+When a config declares features, `dev up` and `dev build` layer them onto a derived image named `vsc-<folder>-<workspace-hash>-features-<digest>`. The digest covers the effective config values — base image selector, features, `remoteUser`, `containerEnv`, `remoteEnv`. Edit any of those and the next run builds a new image rather than reusing a stale one.
 
 The digest covers selectors, not the files they point at. Editing a `Dockerfile` referenced by `build.dockerfile` leaves the digest unchanged; pass `--rebuild` or `--no-cache` after changing Dockerfile contents.
 
 Superseded images accumulate rather than being overwritten in place. Reclaim space with your runtime's own tooling:
 
 ```sh
-docker image ls --filter 'reference=<folder>-features-*'
+docker image ls --filter 'reference=vsc-<folder>-*-features-*'
 docker image prune
 ```
 
