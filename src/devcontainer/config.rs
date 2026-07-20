@@ -266,13 +266,16 @@ impl DevcontainerConfig {
 /// Handles comma-separated key=value pairs. Trims whitespace on both sides of
 /// the `=` separator, so `"key = value"`, `"key =value"`, and `"key= value"`
 /// all parse. Values containing `=` are preserved (only the first `=` is the
-/// split). Does not attempt to handle quoted values containing commas —
-/// Docker's own parser has the same limitation, and devcontainer configs
-/// don't use it.
+/// split). Segments without an `=` (bare flags like `readonly`) are skipped
+/// rather than treated as parse failures. Does not attempt to handle quoted
+/// values containing commas — Docker's own parser has the same limitation,
+/// and devcontainer configs don't use it.
 fn parse_mount_target(mount: &str) -> Option<String> {
     for segment in mount.split(',') {
-        // Split on the first `=` and trim whitespace from each side independently.
-        let (raw_key, raw_value) = segment.split_once('=')?;
+        // Skip bare-flag segments (e.g. "readonly") — they have no `=` to split on.
+        // Using `?` here would abort the whole function on the first flag,
+        // missing any target that appears after it in the string.
+        let Some((raw_key, raw_value)) = segment.split_once('=') else { continue };
         let key = raw_key.trim();
         if matches!(key, "target" | "dst" | "destination") {
             return Some(raw_value.trim().to_string());
@@ -427,6 +430,24 @@ mod workspace_mount_tests {
         assert_eq!(parse_mount_target("type=bind,readonly"), None);
         // Keys other than target/dst/destination are not destinations.
         assert_eq!(parse_mount_target("source=/host,readonly"), None);
+    }
+
+    #[test]
+    fn parse_mount_target_skips_bare_flag_segments() {
+        // Bare-flag segments (no `=`, e.g. `readonly`) must not abort the loop.
+        // They are skipped so any target after them is still found.
+        assert_eq!(
+            parse_mount_target("readonly,target=/work,type=bind"),
+            Some("/work".to_string()),
+        );
+        assert_eq!(
+            parse_mount_target("type=bind,readonly,target=/srv"),
+            Some("/srv".to_string()),
+        );
+        assert_eq!(
+            parse_mount_target("readonly"),
+            None,
+        );
     }
 
     #[test]
