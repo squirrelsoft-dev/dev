@@ -275,7 +275,9 @@ fn parse_mount_target(mount: &str) -> Option<String> {
         // Skip bare-flag segments (e.g. "readonly") — they have no `=` to split on.
         // Using `?` here would abort the whole function on the first flag,
         // missing any target that appears after it in the string.
-        let Some((raw_key, raw_value)) = segment.split_once('=') else { continue };
+        let Some((raw_key, raw_value)) = segment.split_once('=') else {
+            continue;
+        };
         let key = raw_key.trim();
         if matches!(key, "target" | "dst" | "destination") {
             return Some(raw_value.trim().to_string());
@@ -336,7 +338,9 @@ mod workspace_mount_tests {
     #[test]
     fn workspace_folder_used_when_no_mount() {
         let host = PathBuf::from("/home/user/my-project");
-        let resolved = cfg(Some("/workspace"), None).workspace_mount_target(&host, None).unwrap();
+        let resolved = cfg(Some("/workspace"), None)
+            .workspace_mount_target(&host, None)
+            .unwrap();
         assert_eq!(resolved, "/workspace");
     }
 
@@ -354,7 +358,9 @@ mod workspace_mount_tests {
     fn workspace_mount_alone() {
         let host = PathBuf::from("/home/user/my-project");
         let mount = "source=/host,target=/srv/app,type=bind";
-        let resolved = cfg(None, Some(mount)).workspace_mount_target(&host, None).unwrap();
+        let resolved = cfg(None, Some(mount))
+            .workspace_mount_target(&host, None)
+            .unwrap();
         assert_eq!(resolved, "/srv/app");
     }
 
@@ -362,7 +368,9 @@ mod workspace_mount_tests {
     fn workspace_mount_with_local_workspace_folder_var() {
         let host = PathBuf::from("/home/user/my-project");
         let mount = "source=${localWorkspaceFolder},target=/workspace,type=bind";
-        let resolved = cfg(None, Some(mount)).workspace_mount_target(&host, None).unwrap();
+        let resolved = cfg(None, Some(mount))
+            .workspace_mount_target(&host, None)
+            .unwrap();
         // We don't assert the substituted source (the host canonicalize happens
         // in the caller), only that the target was extracted and the source
         // var was substituted without erroring. The target here is /workspace.
@@ -385,7 +393,9 @@ mod workspace_mount_tests {
     fn workspace_mount_without_target_and_no_folder_falls_back_to_default() {
         let host = PathBuf::from("/home/user/my-project");
         let mount = "type=bind,readonly";
-        let resolved = cfg(None, Some(mount)).workspace_mount_target(&host, None).unwrap();
+        let resolved = cfg(None, Some(mount))
+            .workspace_mount_target(&host, None)
+            .unwrap();
         assert_eq!(resolved, "/workspaces/my-project");
     }
 
@@ -394,7 +404,9 @@ mod workspace_mount_tests {
         // Docker's --mount flag also accepts dst= as a synonym for target=.
         let host = PathBuf::from("/home/user/my-project");
         let mount = "source=/host,dst=/srv/dst,type=bind";
-        let resolved = cfg(None, Some(mount)).workspace_mount_target(&host, None).unwrap();
+        let resolved = cfg(None, Some(mount))
+            .workspace_mount_target(&host, None)
+            .unwrap();
         assert_eq!(resolved, "/srv/dst");
     }
 
@@ -403,7 +415,9 @@ mod workspace_mount_tests {
         // Docker's --mount flag also accepts destination= as a synonym for target=.
         let host = PathBuf::from("/home/user/my-project");
         let mount = "source=/host,destination=/srv/dest,type=bind";
-        let resolved = cfg(None, Some(mount)).workspace_mount_target(&host, None).unwrap();
+        let resolved = cfg(None, Some(mount))
+            .workspace_mount_target(&host, None)
+            .unwrap();
         assert_eq!(resolved, "/srv/dest");
     }
 
@@ -444,10 +458,7 @@ mod workspace_mount_tests {
             parse_mount_target("type=bind,readonly,target=/srv"),
             Some("/srv".to_string()),
         );
-        assert_eq!(
-            parse_mount_target("readonly"),
-            None,
-        );
+        assert_eq!(parse_mount_target("readonly"), None,);
     }
 
     #[test]
