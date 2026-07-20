@@ -1,8 +1,11 @@
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 
+use serde_json::Value;
+
 use crate::devcontainer::{
-    DevcontainerConfig, Recipe, compose_and_write, download_features,
+    DevcontainerConfig, Recipe, download_features,
     merge_feature_capabilities, resolve_features,
     run_lifecycle_hooks, stage_feature_context, substitute_variables,
     substitute_variables_with_user,
@@ -12,12 +15,16 @@ use crate::devcontainer::features::{
     MergedCapabilities, ResolvedFeature, capabilities_from_metadata,
     generate_feature_dockerfile_with_opts, order_features,
 };
+use crate::devcontainer::jsonc::parse_jsonc;
 use crate::devcontainer::lockfile::{handle_lockfile, lockfile_path};
+use crate::devcontainer::merge::merge_layers;
 use crate::devcontainer::uid;
+use crate::error::DevError;
 use crate::runtime::{
     BindMount, ContainerConfig, ContainerRuntime, ContainerState, PortMapping, VolumeMount,
     WorkspaceMount, detect_runtime, resolve_remote_user,
 };
+use crate::util::paths::base_config_dir;
 use crate::util::{
     container_name, find_config_source, workspace_folder_name, workspace_labels, ConfigSource,
 };
@@ -33,16 +40,22 @@ pub async fn run(
     _buildkit: bool,
     update_remote_user_uid_default: &str,
     port_overrides: &[String],
+    no_base: bool,
 ) -> anyhow::Result<()> {
     let runtime = detect_runtime(runtime_override).await?;
     let config_path = match find_config_source(workspace)? {
         ConfigSource::Direct(path) => path,
         ConfigSource::Recipe(recipe_path) => {
             let recipe = Recipe::from_path(&recipe_path)?;
-            compose_and_write(&recipe, runtime.runtime_name())?
+            crate::devcontainer::compose::compose_and_write_with_base(
+                &recipe,
+                runtime.runtime_name(),
+                !no_base,
+            )?
         }
     };
-    let config = DevcontainerConfig::from_path(&config_path)?;
+    let mut config = load_effective_config(&config_path, !no_base)?;
+    apply_cli_overrides(&mut config, port_overrides)?;
 
     // Docker Compose configs take a completely separate code path.
     if config.is_compose() {
@@ -269,11 +282,7 @@ pub async fn run(
         }
     }
 
-    let ports: Vec<PortMapping> = if port_overrides.is_empty() {
-        config.forward_ports.clone().unwrap_or_default()
-    } else {
-        parse_port_overrides(port_overrides)?
-    };
+    let ports: Vec<PortMapping> = config.forward_ports.clone().unwrap_or_default();
     let caddy_host_ports: Vec<crate::caddy::PortEntry> = ports
         .iter()
         .map(|p| crate::caddy::PortEntry { port: p.host, custom_name: None, keepalive: None })
@@ -383,6 +392,97 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+fn load_effective_config(config_path: &Path, include_base: bool) -> anyhow::Result<DevcontainerConfig> {
+    let base_path = base_config_dir().join("devcontainer.json");
+    let value = load_effective_config_value(config_path, include_base, &base_path)?;
+    serde_json::from_value(value)
+        .map_err(|e| DevError::InvalidConfig(format!("Failed to parse merged config: {e}")).into())
+}
+
+fn apply_cli_overrides(
+    config: &mut DevcontainerConfig,
+    port_overrides: &[String],
+) -> anyhow::Result<()> {
+    if !port_overrides.is_empty() {
+        config.forward_ports = Some(parse_port_overrides(port_overrides)?);
+    }
+    Ok(())
+}
+
+fn load_effective_config_value(
+    config_path: &Path,
+    include_base: bool,
+    base_config_path: &Path,
+) -> anyhow::Result<Value> {
+    let mut layers = Vec::new();
+    if include_base && base_config_path.is_file() {
+        let base = read_json_file(base_config_path)?;
+        if !base.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+            layers.push(base);
+        }
+    }
+
+    let project = read_json_file(config_path)?;
+    let project_definition = config_definition(&project);
+    layers.push(project);
+
+    let mut merged = merge_layers(&layers);
+    prune_lower_priority_definitions(&mut merged, project_definition);
+    Ok(merged)
+}
+
+fn read_json_file(path: &Path) -> anyhow::Result<Value> {
+    let raw = fs::read_to_string(path)
+        .map_err(|e| DevError::InvalidConfig(format!("Failed to read {}: {e}", path.display())))?;
+    parse_jsonc(&raw).map_err(Into::into)
+}
+
+#[derive(Clone, Copy)]
+enum ConfigDefinition {
+    Image,
+    Build,
+    Compose,
+}
+
+fn config_definition(value: &Value) -> Option<ConfigDefinition> {
+    let obj = value.as_object()?;
+    if obj.contains_key("dockerComposeFile") {
+        Some(ConfigDefinition::Compose)
+    } else if obj.contains_key("build") {
+        Some(ConfigDefinition::Build)
+    } else if obj.contains_key("image") {
+        Some(ConfigDefinition::Image)
+    } else {
+        None
+    }
+}
+
+fn prune_lower_priority_definitions(
+    merged: &mut Value,
+    project_definition: Option<ConfigDefinition>,
+) {
+    let Some(obj) = merged.as_object_mut() else {
+        return;
+    };
+    match project_definition {
+        Some(ConfigDefinition::Image) => {
+            obj.remove("build");
+            obj.remove("dockerComposeFile");
+            obj.remove("service");
+        }
+        Some(ConfigDefinition::Build) => {
+            obj.remove("image");
+            obj.remove("dockerComposeFile");
+            obj.remove("service");
+        }
+        Some(ConfigDefinition::Compose) => {
+            obj.remove("image");
+            obj.remove("build");
+        }
+        None => {}
+    }
 }
 
 /// Ensure a container image is present locally, pulling it only if missing.
@@ -547,7 +647,7 @@ async fn run_compose(
     verbose: bool,
     frozen_lockfile: bool,
     update_remote_user_uid_default: &str,
-    port_overrides: &[String],
+    _port_overrides: &[String],
 ) -> anyhow::Result<()> {
     let compose_data = config.docker_compose_file.as_ref().unwrap();
     let compose_files = compose_data.files();
@@ -719,11 +819,7 @@ async fn run_compose(
         .map(|s| substitute_variables_with_user(s, workspace, remote_user))
         .collect();
 
-    let ports: Vec<PortMapping> = if port_overrides.is_empty() {
-        config.forward_ports.clone().unwrap_or_default()
-    } else {
-        parse_port_overrides(port_overrides)?
-    };
+    let ports: Vec<PortMapping> = config.forward_ports.clone().unwrap_or_default();
     let caddy_host_ports_compose: Vec<crate::caddy::PortEntry> = ports
         .iter()
         .map(|p| crate::caddy::PortEntry { port: p.host, custom_name: None, keepalive: None })
@@ -952,16 +1048,21 @@ fn parse_volumes(volume_strings: &[String]) -> Vec<VolumeMount> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_image_present, parse_mounts, parse_single_mount, substitute_mounts};
-    use crate::devcontainer::config::{MountObject, MountSpec};
+    use super::{
+        apply_cli_overrides, ensure_image_present, load_effective_config_value, parse_mounts,
+        parse_single_mount, substitute_mounts,
+    };
+    use crate::devcontainer::config::{DevcontainerConfig, LifecycleCommand, MountObject, MountSpec};
     use crate::error::DevError;
     use crate::runtime::{
         AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ExecResult,
         ImageMetadata,
     };
     use std::collections::HashMap;
+    use std::fs;
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tempfile::TempDir;
 
     fn unused<T>() -> BoxFut<'static, T> {
         Box::pin(async {
@@ -969,6 +1070,303 @@ mod tests {
                 "FakeRuntime method unused by ensure_image_present".into(),
             ))
         })
+    }
+
+    fn write_project_config(dir: &TempDir, content: &str) -> std::path::PathBuf {
+        let devcontainer_dir = dir.path().join(".devcontainer");
+        fs::create_dir_all(&devcontainer_dir).unwrap();
+        let path = devcontainer_dir.join("devcontainer.json");
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    fn write_base_config(dir: &TempDir, content: &str) -> std::path::PathBuf {
+        let base_dir = dir.path().join("base");
+        fs::create_dir_all(&base_dir).unwrap();
+        let path = base_dir.join("devcontainer.json");
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    fn load_config_with_base(
+        config_path: &Path,
+        include_base: bool,
+        base_config_path: &Path,
+    ) -> DevcontainerConfig {
+        let value = load_effective_config_value(config_path, include_base, base_config_path)
+            .expect("effective config should load");
+        serde_json::from_value(value).expect("effective config should deserialize")
+    }
+
+    #[test]
+    fn image_config_applies_base_in_memory_beneath_project() {
+        let workspace = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let config_path = write_project_config(
+            &workspace,
+            r#"{
+                "image": "ubuntu:24.04",
+                "features": {
+                    "ghcr.io/devcontainers/features/node:1": {"version": "22"}
+                },
+                "containerEnv": {
+                    "SHARED": "project"
+                }
+            }"#,
+        );
+        let original = fs::read_to_string(&config_path).unwrap();
+        let base_path = write_base_config(
+            &home,
+            r#"{
+                "build": {
+                    "dockerfile": "Base.Dockerfile"
+                },
+                "features": {
+                    "ghcr.io/devcontainers/features/github-cli:1": {}
+                },
+                "containerEnv": {
+                    "EDITOR": "nvim",
+                    "SHARED": "base"
+                }
+            }"#,
+        );
+
+        let config = load_config_with_base(&config_path, true, &base_path);
+
+        assert_eq!(config.image.as_deref(), Some("ubuntu:24.04"));
+        assert!(config.build.is_none());
+        let features = config.features.unwrap();
+        assert!(features.contains_key("ghcr.io/devcontainers/features/node:1"));
+        assert!(features.contains_key("ghcr.io/devcontainers/features/github-cli:1"));
+        let env = config.container_env.unwrap();
+        assert_eq!(env["EDITOR"], "nvim");
+        assert_eq!(env["SHARED"], "project");
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+    }
+
+    #[test]
+    fn build_config_applies_base_without_changing_config_type() {
+        let workspace = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let config_path = write_project_config(
+            &workspace,
+            r#"{
+                "build": {
+                    "dockerfile": "Dockerfile",
+                    "context": "."
+                },
+                "remoteEnv": {
+                    "RUST_LOG": "debug"
+                }
+            }"#,
+        );
+        let base_path = write_base_config(
+            &home,
+            r#"{
+                "image": "base:latest",
+                "features": {
+                    "ghcr.io/devcontainers/features/rust:1": {}
+                },
+                "remoteEnv": {
+                    "EDITOR": "nvim"
+                }
+            }"#,
+        );
+
+        let config = load_config_with_base(&config_path, true, &base_path);
+
+        assert!(config.build.is_some());
+        assert!(config.docker_compose_file.is_none());
+        assert_eq!(config.image, None);
+        assert!(config
+            .features
+            .unwrap()
+            .contains_key("ghcr.io/devcontainers/features/rust:1"));
+        let env = config.remote_env.unwrap();
+        assert_eq!(env["EDITOR"], "nvim");
+        assert_eq!(env["RUST_LOG"], "debug");
+    }
+
+    #[test]
+    fn compose_config_applies_base_without_changing_config_type() {
+        let workspace = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let config_path = write_project_config(
+            &workspace,
+            r#"{
+                "dockerComposeFile": "compose.yml",
+                "service": "app",
+                "containerEnv": {
+                    "APP_ENV": "dev"
+                }
+            }"#,
+        );
+        let base_path = write_base_config(
+            &home,
+            r#"{
+                "image": "base:latest",
+                "build": {
+                    "dockerfile": "Base.Dockerfile"
+                },
+                "features": {
+                    "ghcr.io/devcontainers/features/github-cli:1": {}
+                },
+                "containerEnv": {
+                    "EDITOR": "nvim"
+                }
+            }"#,
+        );
+
+        let config = load_config_with_base(&config_path, true, &base_path);
+
+        assert!(config.is_compose());
+        assert!(config.image.is_none());
+        assert!(config.build.is_none());
+        assert_eq!(config.service.as_deref(), Some("app"));
+        assert!(config
+            .features
+            .unwrap()
+            .contains_key("ghcr.io/devcontainers/features/github-cli:1"));
+        let env = config.container_env.unwrap();
+        assert_eq!(env["APP_ENV"], "dev");
+        assert_eq!(env["EDITOR"], "nvim");
+    }
+
+    #[test]
+    fn project_config_takes_precedence_over_base() {
+        let workspace = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let config_path = write_project_config(
+            &workspace,
+            r#"{
+                "image": "project:latest",
+                "remoteUser": "project",
+                "containerEnv": {
+                    "SHARED": "project"
+                },
+                "features": {
+                    "ghcr.io/devcontainers/features/rust:1": {"profile": "project"}
+                }
+            }"#,
+        );
+        let base_path = write_base_config(
+            &home,
+            r#"{
+                "image": "base:latest",
+                "remoteUser": "base",
+                "containerEnv": {
+                    "SHARED": "base",
+                    "EDITOR": "nvim"
+                },
+                "features": {
+                    "ghcr.io/devcontainers/features/rust:1": {"profile": "base"}
+                }
+            }"#,
+        );
+
+        let value = load_effective_config_value(&config_path, true, &base_path).unwrap();
+
+        assert_eq!(value["image"], "project:latest");
+        assert_eq!(value["remoteUser"], "project");
+        assert_eq!(value["containerEnv"]["SHARED"], "project");
+        assert_eq!(value["containerEnv"]["EDITOR"], "nvim");
+        assert_eq!(
+            value["features"]["ghcr.io/devcontainers/features/rust:1"]["profile"],
+            "project"
+        );
+    }
+
+    #[test]
+    fn absent_base_is_a_noop() {
+        let workspace = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let config_path = write_project_config(
+            &workspace,
+            r#"{"image": "ubuntu:24.04", "containerEnv": {"APP_ENV": "dev"}}"#,
+        );
+        let missing_base = home.path().join("base/devcontainer.json");
+
+        let value = load_effective_config_value(&config_path, true, &missing_base).unwrap();
+
+        assert_eq!(value["image"], "ubuntu:24.04");
+        assert_eq!(value["containerEnv"]["APP_ENV"], "dev");
+        assert!(value.get("features").is_none());
+    }
+
+    #[test]
+    fn no_base_skips_existing_base_config() {
+        let workspace = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let config_path = write_project_config(&workspace, r#"{"image": "ubuntu:24.04"}"#);
+        let base_path = write_base_config(
+            &home,
+            r#"{"containerEnv": {"EDITOR": "nvim"}, "features": {"ghcr.io/features/gh": {}}}"#,
+        );
+
+        let value = load_effective_config_value(&config_path, false, &base_path).unwrap();
+
+        assert_eq!(value["image"], "ubuntu:24.04");
+        assert!(value.get("containerEnv").is_none());
+        assert!(value.get("features").is_none());
+    }
+
+    #[test]
+    fn cli_port_overrides_apply_last() {
+        let workspace = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let config_path = write_project_config(
+            &workspace,
+            r#"{"image": "ubuntu:24.04", "forwardPorts": [3000]}"#,
+        );
+        let base_path = write_base_config(&home, r#"{"forwardPorts": [8080]}"#);
+        let mut config = load_config_with_base(&config_path, true, &base_path);
+
+        apply_cli_overrides(
+            &mut config,
+            &["9090:90".to_string(), "7070".to_string()],
+        )
+        .unwrap();
+
+        let ports = config.forward_ports.unwrap();
+        assert_eq!(ports.len(), 2);
+        assert_eq!(ports[0].host, 9090);
+        assert_eq!(ports[0].container, 90);
+        assert_eq!(ports[1].host, 7070);
+        assert_eq!(ports[1].container, 7070);
+    }
+
+    #[test]
+    fn named_lifecycle_commands_from_base_and_project_union() {
+        let workspace = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let config_path = write_project_config(
+            &workspace,
+            r#"{
+                "image": "ubuntu:24.04",
+                "postCreateCommand": {
+                    "project": "cargo fetch",
+                    "shared": "project"
+                }
+            }"#,
+        );
+        let base_path = write_base_config(
+            &home,
+            r#"{
+                "postCreateCommand": {
+                    "dotfiles": "install-dotfiles",
+                    "shared": "base"
+                }
+            }"#,
+        );
+
+        let config = load_config_with_base(&config_path, true, &base_path);
+
+        let LifecycleCommand::Parallel(commands) = config.post_create_command.unwrap() else {
+            panic!("postCreateCommand should deserialize as named parallel commands");
+        };
+        assert_eq!(commands["dotfiles"], "install-dotfiles");
+        assert_eq!(commands["project"], "cargo fetch");
+        assert_eq!(commands["shared"], "project");
     }
 
     /// Minimal fake runtime: records `pull_image` calls and returns a fixed

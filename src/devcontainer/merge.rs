@@ -7,12 +7,12 @@ use super::jsonc::parse_jsonc;
 use crate::util::paths::base_config_dir;
 
 /// Fields where the base config value should override the template (scalar semantics).
-const SCALAR_FIELDS: &[&str] = &[
-    "name",
-    "image",
-    "remoteUser",
-    "shutdownAction",
-    "waitFor",
+const SCALAR_FIELDS: &[&str] = &["name", "image", "remoteUser", "shutdownAction", "waitFor"];
+
+/// Lifecycle command fields. Named-command objects merge as a union; other
+/// lifecycle forms keep scalar override behavior.
+const LIFECYCLE_FIELDS: &[&str] = &[
+    "initializeCommand",
     "onCreateCommand",
     "updateContentCommand",
     "postCreateCommand",
@@ -49,6 +49,8 @@ pub fn merge_layer(base: &mut Value, overlay: &Value) {
     for (key, overlay_val) in overlay_obj {
         if SCALAR_FIELDS.contains(&key.as_str()) {
             base_obj.insert(key.clone(), overlay_val.clone());
+        } else if LIFECYCLE_FIELDS.contains(&key.as_str()) {
+            merge_lifecycle_command(base_obj, key, overlay_val);
         } else if FEATURE_FIELDS.contains(&key.as_str()) {
             merge_feature_map(base_obj, key, overlay_val);
         } else if ARRAY_FIELDS.contains(&key.as_str()) {
@@ -58,6 +60,29 @@ pub fn merge_layer(base: &mut Value, overlay: &Value) {
         } else {
             base_obj.insert(key.clone(), overlay_val.clone());
         }
+    }
+}
+
+fn merge_lifecycle_command(
+    dest_obj: &mut serde_json::Map<String, Value>,
+    key: &str,
+    overlay_val: &Value,
+) {
+    let Some(overlay_map) = overlay_val.as_object() else {
+        dest_obj.insert(key.to_string(), overlay_val.clone());
+        return;
+    };
+
+    let dest_val = dest_obj
+        .entry(key.to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+
+    if let Some(dest_map) = dest_val.as_object_mut() {
+        for (name, command) in overlay_map {
+            dest_map.insert(name.clone(), command.clone());
+        }
+    } else {
+        dest_obj.insert(key.to_string(), overlay_val.clone());
     }
 }
 
@@ -350,5 +375,48 @@ mod tests {
 
         let json: Value = serde_json::from_str(&fs::read_to_string(&dest_config).unwrap()).unwrap();
         assert_eq!(json["customSetting"], "from-base");
+    }
+
+    #[test]
+    fn lifecycle_named_commands_merge_as_union() {
+        let layers = vec![
+            serde_json::json!({
+                "postCreateCommand": {
+                    "base-dotfiles": "install-dotfiles",
+                    "shared": "base"
+                }
+            }),
+            serde_json::json!({
+                "postCreateCommand": {
+                    "project-setup": "cargo fetch",
+                    "shared": "project"
+                }
+            }),
+        ];
+
+        let merged = merge_layers(&layers);
+        assert_eq!(
+            merged["postCreateCommand"]["base-dotfiles"],
+            "install-dotfiles"
+        );
+        assert_eq!(merged["postCreateCommand"]["project-setup"], "cargo fetch");
+        assert_eq!(merged["postCreateCommand"]["shared"], "project");
+    }
+
+    #[test]
+    fn lifecycle_non_object_forms_still_override() {
+        let layers = vec![
+            serde_json::json!({
+                "postCreateCommand": {
+                    "base-dotfiles": "install-dotfiles"
+                }
+            }),
+            serde_json::json!({
+                "postCreateCommand": "project setup"
+            }),
+        ];
+
+        let merged = merge_layers(&layers);
+        assert_eq!(merged["postCreateCommand"], "project setup");
     }
 }

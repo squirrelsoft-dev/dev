@@ -84,6 +84,10 @@ pub enum Command {
         /// Override forwarded ports (host:container or just port for same on both)
         #[arg(long = "ports", value_delimiter = ',')]
         port_overrides: Vec<String>,
+
+        /// Do not apply ~/.dev/base/devcontainer.json for this run
+        #[arg(long)]
+        no_base: bool,
     },
 
     /// Stop (optionally remove) container

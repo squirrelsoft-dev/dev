@@ -50,7 +50,16 @@ fn substitute_template_options(value: &mut Value, options: &HashMap<String, Stri
 /// 3. Runtime config (`~/.dev/<runtime>/devcontainer.json`) (highest priority for scalars)
 ///
 /// Then inject recipe features into the composed result.
+#[allow(dead_code)]
 pub fn compose_config(recipe: &Recipe, runtime_name: &str) -> anyhow::Result<Value> {
+    compose_config_with_base(recipe, runtime_name, true)
+}
+
+pub(crate) fn compose_config_with_base(
+    recipe: &Recipe,
+    runtime_name: &str,
+    include_base: bool,
+) -> anyhow::Result<Value> {
     // Layer 1: Global template
     let global_config_path = global_dir()
         .join(&recipe.global_template)
@@ -69,8 +78,12 @@ pub fn compose_config(recipe: &Recipe, runtime_name: &str) -> anyhow::Result<Val
     }
 
     // Layer 2: Base config
-    let base_config_path = base_config_dir().join("devcontainer.json");
-    let base = read_json_file(&base_config_path)?;
+    let base = if include_base {
+        let base_config_path = base_config_dir().join("devcontainer.json");
+        read_json_file(&base_config_path)?
+    } else {
+        None
+    };
 
     // Layer 3: Runtime config
     let runtime_config_path = runtime_config_dir(runtime_name).join("devcontainer.json");
@@ -118,7 +131,15 @@ pub fn compose_config(recipe: &Recipe, runtime_name: &str) -> anyhow::Result<Val
 /// global template directory so that relative paths in the config resolve correctly.
 /// Returns the path to the written file.
 pub fn compose_and_write(recipe: &Recipe, runtime_name: &str) -> anyhow::Result<PathBuf> {
-    let composed = compose_config(recipe, runtime_name)?;
+    compose_and_write_with_base(recipe, runtime_name, true)
+}
+
+pub(crate) fn compose_and_write_with_base(
+    recipe: &Recipe,
+    runtime_name: &str,
+    include_base: bool,
+) -> anyhow::Result<PathBuf> {
+    let composed = compose_config_with_base(recipe, runtime_name, include_base)?;
 
     let folder_name = Path::new(&recipe.root_folder)
         .file_name()
