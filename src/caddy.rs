@@ -170,6 +170,7 @@ fn print_dns_setup_hint() {
          brew install dnsmasq\n  \
          echo 'address=/.{TLD}/127.0.0.1' >> /opt/homebrew/etc/dnsmasq.conf\n  \
          sudo brew services start dnsmasq\n  \
+         sudo mkdir -p /etc/resolver\n  \
          echo 'nameserver 127.0.0.1' | sudo tee /etc/resolver/{TLD}\n"
     );
 }

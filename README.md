@@ -114,19 +114,17 @@ Recipe projects have no `devcontainer.json` for the remote-containers extension 
 
 ## Local domain routing
 
-Each project gets a `.test` hostname (`appname.test`) via Caddy and dnsmasq. Both are host prerequisites you install once:
+Each project gets a `.test` hostname (`appname.test`) via Caddy and dnsmasq. Install both once and point the resolver at localhost:
 
 ```sh
 brew install dnsmasq caddy
 echo 'address=/.test/127.0.0.1' >> /opt/homebrew/etc/dnsmasq.conf
 sudo brew services start dnsmasq
+sudo mkdir -p /etc/resolver
 echo 'nameserver 127.0.0.1' | sudo tee /etc/resolver/test
-sudo caddy start --config ~/.dev/caddy/Caddyfile
 ```
 
-`dev up` prints these same steps when Caddy is missing from `PATH` or `/etc/resolver/test` doesn't exist, so you can also skip ahead and let it tell you. After first-time DNS setup, flush your browser's DNS cache (Chrome: `chrome://net-internals/#dns` → **Clear host cache**) or `.test` may not resolve immediately.
-
-When `forwardPorts` is configured, `dev up` writes a Caddy fragment, reloads, and prints the URL:
+When the merged config declares `forwardPorts`, `dev up` writes `~/.dev/caddy/Caddyfile` and a per-project fragment, reloads Caddy, and prints the URL:
 
 ```sh
 dev up
@@ -134,14 +132,22 @@ dev up
 #   → https://appname.test → port 3000
 ```
 
+`dev` creates that Caddyfile lazily on that first forwarded-port run, so start Caddy against it afterwards — not before:
+
+```sh
+sudo caddy start --config ~/.dev/caddy/Caddyfile
+```
+
+Those `forwardPorts` runs are also where `dev up` checks your host setup: it prints the Caddy install steps when `caddy` isn't on `PATH`, and the dnsmasq steps when `/etc/resolver/test` is missing. With no `forwardPorts` configured it does neither. After first-time DNS setup, flush your browser's DNS cache (Chrome: `chrome://net-internals/#dns` → **Clear host cache**) or `.test` may not resolve immediately.
+
 ## Commands reference
 
 | Command | What it does |
 |---------|-------------|
 | `dev init` | Scaffold minimal `.devcontainer/` with Dockerfile |
 | `dev new` | Pick a template, features, and scope; write a recipe |
-| `dev build` | Build the image (with optional `--no-cache`, `--buildkit`, `--frozen-lockfile`, `--no-base`) |
-| `dev up` | Start the container (with `--rebuild`, `--buildkit`, `--ports`, `--no-base`) |
+| `dev build` | Build the image (with optional `--no-cache`, `--frozen-lockfile`, `--no-base`) |
+| `dev up` | Start the container (with `--rebuild`, `--ports`, `--no-base`) |
 | `dev exec` | Run a command in the running container |
 | `dev shell` | Open an interactive shell |
 | `dev down` | Stop (optionally `--remove`) |
