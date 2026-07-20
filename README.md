@@ -43,6 +43,20 @@ dev down --remove
 
 A project with its own `.devcontainer/devcontainer.json` merges only the base layer beneath it. Whichever of `image`, `build`, or `dockerComposeFile` the project declares is authoritative — competing selectors from the base are dropped, not merged.
 
+For a recipe there is no such project file, so the *highest layer that declares a selector* wins: recipe overrides, then runtime, then base, then the global template. `dev config set image` on a recipe therefore drops a `build` inherited from its global template.
+
+Higher layers override lower ones, with the strategy depending on the field type:
+
+| Field type | Merge strategy | Examples |
+|-----------|----------------|----------|
+| Scalar | Higher priority wins | `image`, `remoteUser` |
+| Array | Concatenate (deduplicated) | `mounts`, `forwardPorts`, `runArgs` |
+| Map | Merge (higher priority keys win) | `remoteEnv`, `containerEnv` |
+| Features | Union | `features` |
+| Lifecycle commands | Named-command objects union per name; string and array forms follow scalar rules | `postCreateCommand`, `onCreateCommand` |
+
+Command-line overrides such as `dev up --ports` are applied last, on top of the merged result.
+
 ### Base config
 
 Your user-wide defaults — preferred shell, editor settings, environment variables. Open it in your editor or set individual properties:
@@ -73,7 +87,9 @@ dev global remove my-rust
 
 A recipe names a global template and stores overrides. It has no `devcontainer.json` on disk — `dev up` and `dev build` compose it in memory with the current base and runtime layers. Editing `~/.dev/base/devcontainer.json` takes effect on the next run without regenerating project state.
 
-Because a recipe project has no `devcontainer.json`, VS Code's "Reopen in Container" has nothing to read. Run `dev up` and attach your editor to the running container instead. `dev vscode repair` re-links user-scoped projects that predate recipes.
+Those same commands do write the template's auxiliary files — Dockerfiles, compose files, scripts — into `.devcontainer/` so the build has the context it references. They are filled in only where missing and are not recorded in `recipe.json`, so a later `dev new` that wants to replace one refuses rather than assuming it is safe to overwrite.
+
+Because a recipe project has no `devcontainer.json`, VS Code's "Reopen in Container" has nothing to read. Run `dev up` and attach your editor to the running container instead. `dev vscode repair` re-links *legacy* user-scoped projects that predate recipes and kept a real `devcontainer.json`; it refuses recipe projects rather than leaving a link that resolves to nothing.
 
 ## Container runtimes
 
@@ -81,7 +97,7 @@ Because a recipe project has no `devcontainer.json`, VS Code's "Reopen in Contai
 
 - **Docker** — the default on every platform
 - **Podman** — drop-in compatible, no daemon
-- **Apple Containers** — macOS native via XPC (compiled with `--features apple`)
+- **Apple Containers** — macOS native via XPC; requires a source build with `--features apple` (see [Installation](#installation))
 
 Docker Compose projects get a full lifecycle path: build, layer features, UID remap, generate a compose override injecting labels/env/mounts/ports, start services, run lifecycle hooks.
 
@@ -94,11 +110,23 @@ dev open
 dev open --insiders
 ```
 
-User-scoped projects predate recipes and keep a real `devcontainer.json`; `dev vscode repair` re-links them. Recipe projects skip the link — they compose at runtime.
+Recipe projects have no `devcontainer.json` for the remote-containers extension to open, so attaching to a running container is the supported flow — see [Recipe projects](#recipe-projects) for `dev vscode repair` and the legacy user-scoped case.
 
 ## Local domain routing
 
-Each project gets a `.test` hostname (`appname.test`) via Caddy and dnsmasq. When `forwardPorts` is configured, `dev up` writes a Caddy fragment, reloads, and prints the URL:
+Each project gets a `.test` hostname (`appname.test`) via Caddy and dnsmasq. Both are host prerequisites you install once:
+
+```sh
+brew install dnsmasq caddy
+echo 'address=/.test/127.0.0.1' >> /opt/homebrew/etc/dnsmasq.conf
+sudo brew services start dnsmasq
+echo 'nameserver 127.0.0.1' | sudo tee /etc/resolver/test
+sudo caddy start --config ~/.dev/caddy/Caddyfile
+```
+
+`dev up` prints these same steps when Caddy is missing from `PATH` or `/etc/resolver/test` doesn't exist, so you can also skip ahead and let it tell you. After first-time DNS setup, flush your browser's DNS cache (Chrome: `chrome://net-internals/#dns` → **Clear host cache**) or `.test` may not resolve immediately.
+
+When `forwardPorts` is configured, `dev up` writes a Caddy fragment, reloads, and prints the URL:
 
 ```sh
 dev up
@@ -112,8 +140,8 @@ dev up
 |---------|-------------|
 | `dev init` | Scaffold minimal `.devcontainer/` with Dockerfile |
 | `dev new` | Pick a template, features, and scope; write a recipe |
-| `dev build` | Build the image (with optional `--no-cache`, `--frozen-lockfile`, `--no-base`) |
-| `dev up` | Start the container (with `--rebuild`, `--ports`, `--no-base`) |
+| `dev build` | Build the image (with optional `--no-cache`, `--buildkit`, `--frozen-lockfile`, `--no-base`) |
+| `dev up` | Start the container (with `--rebuild`, `--buildkit`, `--ports`, `--no-base`) |
 | `dev exec` | Run a command in the running container |
 | `dev shell` | Open an interactive shell |
 | `dev down` | Stop (optionally `--remove`) |
@@ -125,7 +153,7 @@ dev up
 | `dev forward` | Forward a local port (with `--daemon`, `--stop`, `--list`) |
 | `dev open` / `dev vscode repair` | VS Code integration |
 
-Global flags: `--workspace <path>`, `--runtime <runtime>`, `-v` / `-vv` / `-vvv`.
+Global flags: `--workspace <path>`, `--runtime <docker|podman|apple>`, `-v` / `-vv` / `-vvv`.
 
 ## Derived images and disk use
 
@@ -152,13 +180,13 @@ Or from source:
 cargo install --path .
 ```
 
-**Note:** The Apple Containers runtime is opt-in — it is only available on macOS and only when built with `--features apple`:
+The Apple Containers runtime is behind an optional `apple` feature, so `--runtime apple` only works on a binary built with it:
 
 ```sh
 cargo install --path . --features apple
 ```
 
-That build needs `protoc` on `PATH`; see [CONTRIBUTING.md](CONTRIBUTING.md#development) for the prerequisites.
+That build is macOS-only and needs `protoc` on `PATH`; see [CONTRIBUTING.md](CONTRIBUTING.md#development) for the prerequisites.
 
 ## Safety
 
