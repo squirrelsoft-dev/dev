@@ -248,7 +248,6 @@ pub async fn run(
 
     // Build container config
     let name = container_name(workspace);
-    let folder_name = workspace_folder_name(workspace);
 
     let mut labels = HashMap::new();
     for (k, v) in &labels_list {
@@ -338,7 +337,7 @@ pub async fn run(
         ports,
         workspace_mount: Some(WorkspaceMount {
             source: workspace.to_path_buf(),
-            target: format!("/workspaces/{folder_name}"),
+            target: config.workspace_mount_target(workspace)?,
         }),
         extra_args,
         entrypoint: None,

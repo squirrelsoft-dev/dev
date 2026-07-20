@@ -126,6 +126,7 @@ mod tests {
             docker_compose_file: None,
             service: None,
             workspace_folder: None,
+            workspace_mount: None,
             features: None,
             forward_ports: None,
             remote_user: None,

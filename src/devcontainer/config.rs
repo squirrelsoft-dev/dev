@@ -4,7 +4,7 @@ use std::default::Default;
 use std::path::Path;
 
 use super::jsonc::parse_jsonc;
-use super::variables::substitute_variables_with_user;
+use super::variables::{substitute_variables, substitute_variables_with_user};
 use crate::error::DevError;
 use crate::runtime::PortMapping;
 
@@ -155,6 +155,11 @@ pub struct DevcontainerConfig {
     pub docker_compose_file: Option<DockerComposeFile>,
     pub service: Option<String>,
     pub workspace_folder: Option<String>,
+    /// Full `--mount` string for `docker run`, per the devcontainer spec.
+    /// Example: `"source=${localWorkspaceFolder},target=/workspace,type=bind"`.
+    /// When set, the `target=` segment takes precedence over `workspace_folder`
+    /// for the effective bind mount destination.
+    pub workspace_mount: Option<String>,
     pub features: Option<HashMap<String, serde_json::Value>>,
     #[serde(default, deserialize_with = "deserialize_forward_ports")]
     pub forward_ports: Option<Vec<PortMapping>>,
@@ -208,6 +213,164 @@ impl DevcontainerConfig {
     /// Returns true if this config uses Docker Compose rather than image/Dockerfile.
     pub fn is_compose(&self) -> bool {
         self.docker_compose_file.is_some()
+    }
+
+    /// Returns the effective workspace bind-mount target inside the container,
+    /// per the devcontainer spec precedence:
+    ///   1. `workspaceMount.target` (after variable substitution), if set
+    ///   2. `workspaceFolder`, if set
+    ///   3. `/workspaces/{folder_name}` as a last-resort default
+    ///
+    /// Only the `target=` segment of `workspaceMount` is consulted; `source=`,
+    /// `type=`, and `readonly=` are ignored here because the source is the host
+    /// workspace directory and the bind is always writable at this layer.
+    pub fn workspace_mount_target(&self, host: &Path) -> Result<String, DevError> {
+        let folder_name = host
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let default = format!("/workspaces/{folder_name}");
+
+        // Spec precedence: workspaceMount.target wins, then workspaceFolder, then default.
+        if let Some(mount) = &self.workspace_mount {
+            // Substitute variables first so e.g. ${localWorkspaceFolder} expands
+            // before we look for `target=`.
+            let expanded = substitute_variables(mount, host);
+            if let Some(target) = parse_mount_target(&expanded) {
+                return Ok(target);
+            }
+            // Mount string was set but had no recognizable target= segment.
+            // Fall back to workspaceFolder, then to the default.
+        }
+
+        if let Some(folder) = &self.workspace_folder {
+            return Ok(substitute_variables(folder, host));
+        }
+
+        Ok(default)
+    }
+}
+
+/// Extracts the `target=` value from a Docker `--mount` string.
+/// Returns `None` if no `target=` segment is found.
+///
+/// Handles both comma-separated key=value pairs (the common Docker syntax) and
+/// values that may contain `=` (only the first `=` after the key is the split).
+/// Does not attempt to handle quoted values containing commas — Docker's own
+/// parser has the same limitation, and devcontainer configs don't use it.
+fn parse_mount_target(mount: &str) -> Option<String> {
+    for segment in mount.split(',') {
+        let segment = segment.trim();
+        if let Some(rest) = segment.strip_prefix("target=") {
+            return Some(rest.to_string());
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod workspace_mount_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn cfg(workspace_folder: Option<&str>, workspace_mount: Option<&str>) -> DevcontainerConfig {
+        DevcontainerConfig {
+            workspace_folder: workspace_folder.map(String::from),
+            workspace_mount: workspace_mount.map(String::from),
+            ..make_minimal_config()
+        }
+    }
+
+    fn make_minimal_config() -> DevcontainerConfig {
+        DevcontainerConfig {
+            name: None,
+            image: Some("ubuntu:24.04".to_string()),
+            build: None,
+            docker_compose_file: None,
+            service: None,
+            workspace_folder: None,
+            workspace_mount: None,
+            features: None,
+            forward_ports: None,
+            remote_user: None,
+            remote_env: None,
+            container_env: None,
+            mounts: None,
+            volumes: None,
+            run_args: None,
+            on_create_command: None,
+            update_content_command: None,
+            post_create_command: None,
+            post_start_command: None,
+            post_attach_command: None,
+            initialize_command: None,
+            customize: None,
+            update_remote_user_uid: None,
+            dotfiles: None,
+        }
+    }
+
+    #[test]
+    fn no_config_falls_back_to_workspaces_folder() {
+        let host = PathBuf::from("/home/user/my-project");
+        let resolved = cfg(None, None).workspace_mount_target(&host).unwrap();
+        assert_eq!(resolved, "/workspaces/my-project");
+    }
+
+    #[test]
+    fn workspace_folder_used_when_no_mount() {
+        let host = PathBuf::from("/home/user/my-project");
+        let resolved = cfg(Some("/workspace"), None).workspace_mount_target(&host).unwrap();
+        assert_eq!(resolved, "/workspace");
+    }
+
+    #[test]
+    fn workspace_mount_target_wins() {
+        let host = PathBuf::from("/home/user/my-project");
+        let mount = "source=/host,target=/container/work,type=bind";
+        let resolved = cfg(Some("/workspace"), Some(mount))
+            .workspace_mount_target(&host)
+            .unwrap();
+        assert_eq!(resolved, "/container/work");
+    }
+
+    #[test]
+    fn workspace_mount_alone() {
+        let host = PathBuf::from("/home/user/my-project");
+        let mount = "source=/host,target=/srv/app,type=bind";
+        let resolved = cfg(None, Some(mount)).workspace_mount_target(&host).unwrap();
+        assert_eq!(resolved, "/srv/app");
+    }
+
+    #[test]
+    fn workspace_mount_with_local_workspace_folder_var() {
+        let host = PathBuf::from("/home/user/my-project");
+        let mount = "source=${localWorkspaceFolder},target=/workspace,type=bind";
+        let resolved = cfg(None, Some(mount)).workspace_mount_target(&host).unwrap();
+        // We don't assert the substituted source (the host canonicalize happens
+        // in the caller), only that the target was extracted and the source
+        // var was substituted without erroring. The target here is /workspace.
+        assert_eq!(resolved, "/workspace");
+    }
+
+    #[test]
+    fn workspace_mount_without_target_falls_through_to_folder() {
+        // A mount string with no target= segment should not crash; we fall
+        // back to workspaceFolder, then to the default.
+        let host = PathBuf::from("/home/user/my-project");
+        let mount = "type=bind,readonly";
+        let resolved = cfg(Some("/workspace"), Some(mount))
+            .workspace_mount_target(&host)
+            .unwrap();
+        assert_eq!(resolved, "/workspace");
+    }
+
+    #[test]
+    fn workspace_mount_without_target_and_no_folder_falls_back_to_default() {
+        let host = PathBuf::from("/home/user/my-project");
+        let mount = "type=bind,readonly";
+        let resolved = cfg(None, Some(mount)).workspace_mount_target(&host).unwrap();
+        assert_eq!(resolved, "/workspaces/my-project");
     }
 }
 
