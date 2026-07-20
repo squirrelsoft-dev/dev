@@ -163,16 +163,24 @@ fn check_dns_setup() -> bool {
     Path::new(&format!("/etc/resolver/{TLD}")).exists()
 }
 
-/// Print one-time dnsmasq setup instructions.
-fn print_dns_setup_hint() {
-    eprintln!(
+/// One-time dnsmasq setup instructions.
+///
+/// Returned as a value rather than printed directly so the steps can be asserted
+/// against the copy README.md documents; the two drifting apart is a real defect.
+fn dns_setup_hint() -> String {
+    format!(
         "\nhint: to enable .{TLD} routing, run once:\n  \
          brew install dnsmasq\n  \
          echo 'address=/.{TLD}/127.0.0.1' >> /opt/homebrew/etc/dnsmasq.conf\n  \
          sudo brew services start dnsmasq\n  \
          sudo mkdir -p /etc/resolver\n  \
          echo 'nameserver 127.0.0.1' | sudo tee /etc/resolver/{TLD}\n"
-    );
+    )
+}
+
+/// Print one-time dnsmasq setup instructions.
+fn print_dns_setup_hint() {
+    eprintln!("{}", dns_setup_hint());
 }
 
 /// Register forwarded ports with Caddy. Best-effort — warns on failure.
@@ -202,4 +210,49 @@ pub fn unregister_site(workspace: &Path) -> anyhow::Result<()> {
     remove_site_config(&app_name)?;
     reload_caddy();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The DNS setup steps `dev up` prints must match the ones README.md documents.
+    /// A reader who follows the README and a reader who follows the hint have to end
+    /// up with the same working resolver.
+    #[test]
+    fn dns_setup_hint_steps_are_documented_in_readme() {
+        let readme = include_str!("../README.md");
+        let hint = dns_setup_hint();
+
+        let steps: Vec<&str> = hint
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("hint:"))
+            .collect();
+
+        assert!(!steps.is_empty(), "hint produced no setup steps");
+        for step in steps {
+            assert!(
+                readme.contains(step),
+                "DNS setup step is printed by `dev up` but missing from README.md: {step}"
+            );
+        }
+    }
+
+    /// Writing the resolver file with `tee` fails if /etc/resolver does not exist yet,
+    /// which is the default on a machine that has never configured one.
+    #[test]
+    fn dns_setup_hint_creates_resolver_dir_before_writing_to_it() {
+        let hint = dns_setup_hint();
+        let mkdir = hint
+            .find("mkdir -p /etc/resolver")
+            .expect("hint must create /etc/resolver");
+        let tee = hint
+            .find("tee /etc/resolver/")
+            .expect("hint must write the resolver file");
+        assert!(
+            mkdir < tee,
+            "hint must create /etc/resolver before writing into it"
+        );
+    }
 }

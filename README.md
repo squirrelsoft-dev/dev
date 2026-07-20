@@ -128,8 +128,8 @@ When the merged config declares `forwardPorts`, `dev up` writes `~/.dev/caddy/Ca
 
 ```sh
 dev up
-# Container 'appname' is ready.
-#   → https://appname.test → port 3000
+# Container 'vsc-appname-<hash>' is ready.
+#   → https://appname.test → localhost:3000
 ```
 
 `dev` creates that Caddyfile lazily on that first forwarded-port run, so start Caddy against it afterwards — not before:
