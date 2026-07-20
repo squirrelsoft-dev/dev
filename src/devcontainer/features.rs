@@ -1084,23 +1084,50 @@ mod tests {
         let folder_image = crate::util::naming::container_name(std::path::Path::new("/tmp/webapp"));
         let image = feature_image_tag(&folder_image, &empty_config(), &[feature("ghcr.io/x/y")]);
 
-        // Match the glob by walking its literal segments in order, with `*`
-        // standing in for the folder name and path/config digests.
-        let mut rest = image.as_str();
-        for (i, literal) in glob.split('*').enumerate() {
+        assert!(
+            glob_matches(&glob, &image),
+            "README.md documents `reference={glob}` but it does not match `{image}`"
+        );
+    }
+
+    /// A glob with no trailing wildcard must reject extra text after its final
+    /// literal — the old generic matcher would have silently accepted it.
+    #[test]
+    fn non_trailing_wildcard_glob_rejects_suffix() {
+        let glob = "vsc-webapp-*-features";
+        let folder_image = crate::util::naming::container_name(std::path::Path::new("/tmp/webapp"));
+        let image = feature_image_tag(&folder_image, &empty_config(), &[feature("ghcr.io/x/y")]);
+
+        assert!(
+            !glob_matches(glob, &image),
+            "non-trailing-wildcard glob must reject extra suffix; got rest={image:?}"
+        );
+    }
+
+    fn glob_matches(glob: &str, image: &str) -> bool {
+        let literals: Vec<&str> = glob.split('*').collect();
+        let trailing_wildcard = glob.ends_with('*');
+        let mut rest = image;
+        for (i, literal) in literals.iter().enumerate() {
             let found = if i == 0 {
                 rest.strip_prefix(literal).map(|r| (literal, r))
+            } else if !trailing_wildcard && i == literals.len() - 1 && !literal.is_empty() {
+                let end = rest.len().checked_sub(literal.len()).unwrap_or(0);
+                rest[end..].strip_prefix(literal).map(|r| (literal, r))
             } else {
                 rest.find(literal)
                     .map(|at| (literal, &rest[at + literal.len()..]))
             };
-            let (_, remainder) = found.unwrap_or_else(|| {
-                panic!(
-                    "README.md documents `reference={glob}`, but the derived image \
-                     `{image}` does not match it (stuck at segment {i:?}: {literal:?})"
-                )
-            });
+            let (_, remainder) = match found {
+                Some(pair) => pair,
+                None => return false,
+            };
             rest = remainder;
+        }
+        if !trailing_wildcard {
+            rest.is_empty()
+        } else {
+            true
         }
     }
 
