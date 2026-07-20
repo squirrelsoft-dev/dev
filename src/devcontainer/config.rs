@@ -428,6 +428,25 @@ mod workspace_mount_tests {
         // Keys other than target/dst/destination are not destinations.
         assert_eq!(parse_mount_target("source=/host,readonly"), None);
     }
+
+    #[test]
+    fn workspace_mount_substitutes_user_dependent_vars() {
+        // ${containerEnv:HOME} must resolve against the effective remote
+        // user's container env, not the host. This is the case the
+        // _with_user variant of substitute_variables was added to handle.
+        let host = PathBuf::from("/home/user/my-project");
+        let mut config = cfg(
+            None,
+            Some("source=/host,target=${containerEnv:HOME}/work,type=bind"),
+        );
+        config.remote_user = Some("dev".to_string());
+        config.container_env = Some(std::collections::HashMap::from([(
+            "HOME".to_string(),
+            "/home/dev".to_string(),
+        )]));
+        let resolved = config.workspace_mount_target(&host, Some("dev")).unwrap();
+        assert_eq!(resolved, "/home/dev/work");
+    }
 }
 
 #[cfg(test)]
