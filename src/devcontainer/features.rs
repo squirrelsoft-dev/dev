@@ -1109,26 +1109,19 @@ mod tests {
         let trailing_wildcard = glob.ends_with('*');
         let mut rest = image;
         for (i, literal) in literals.iter().enumerate() {
-            let found = if i == 0 {
-                rest.strip_prefix(literal).map(|r| (literal, r))
-            } else if !trailing_wildcard && i == literals.len() - 1 && !literal.is_empty() {
-                let end = rest.len().checked_sub(literal.len()).unwrap_or(0);
-                rest[end..].strip_prefix(literal).map(|r| (literal, r))
+            let remainder = if i == 0 {
+                rest.strip_prefix(literal)
+            } else if !trailing_wildcard && i == literals.len() - 1 {
+                rest.ends_with(literal).then_some("")
             } else {
-                rest.find(literal)
-                    .map(|at| (literal, &rest[at + literal.len()..]))
+                rest.find(literal).map(|at| &rest[at + literal.len()..])
             };
-            let (_, remainder) = match found {
-                Some(pair) => pair,
+            rest = match remainder {
+                Some(r) => r,
                 None => return false,
             };
-            rest = remainder;
         }
-        if !trailing_wildcard {
-            rest.is_empty()
-        } else {
-            true
-        }
+        trailing_wildcard || rest.is_empty()
     }
 
     fn parse_label(label: &str) -> Vec<serde_json::Value> {
