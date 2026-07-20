@@ -31,6 +31,8 @@ const FEATURE_FIELDS: &[&str] = &["features"];
 
 /// Merge a single overlay layer on top of a base value, using field-type strategies:
 /// - Scalar fields: overlay overrides base
+/// - Lifecycle fields: named-command objects union (overlay wins per name); any
+///   other form overrides base
 /// - Array fields: concatenate (overlay appended to base, skipping duplicates)
 /// - Map fields: merge (overlay keys override base keys)
 /// - Feature fields: union (overlay features added to base features)

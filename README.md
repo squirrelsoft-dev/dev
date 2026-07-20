@@ -132,6 +132,8 @@ When you create a workspace with `dev new` or bring one up with `dev up`, the co
 4. Per-project config  (.devcontainer/devcontainer.json or recipe)
 ```
 
+The global template and runtime layers come from a user-scoped recipe, so a project with its own `.devcontainer/devcontainer.json` merges just the base config beneath it.
+
 Higher-priority layers override lower ones, with merge behavior depending on the field type:
 
 | Field type | Merge strategy | Examples |
@@ -140,8 +142,13 @@ Higher-priority layers override lower ones, with merge behavior depending on the
 | Array | Concatenate (deduplicated) | `mounts`, `forwardPorts`, `runArgs` |
 | Map | Merge (higher priority keys win) | `remoteEnv`, `containerEnv` |
 | Features | Union (all features combined) | `features` |
+| Lifecycle commands | Named-command objects union (higher priority wins per name); string and array forms follow scalar rules | `postCreateCommand`, `onCreateCommand` |
 
 **Example:** if your global template sets `image: rust:latest` and your base config sets `remoteUser: vscode` with a zsh feature, the final config gets the Rust image, the vscode user, and both sets of features combined.
+
+Whichever of `image`, `build`, or `dockerComposeFile` a project's own `.devcontainer/devcontainer.json` declares is authoritative: the competing selectors from the base layer are dropped rather than merged, so a base config `image` cannot turn a `build`- or compose-based project into an image-based one.
+
+Command-line overrides such as `dev up --ports` are applied last, on top of the merged result.
 
 ### Derived images and disk use
 

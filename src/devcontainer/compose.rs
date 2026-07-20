@@ -208,7 +208,6 @@ fn copy_auxiliary_files(
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,7 +252,11 @@ mod tests {
             let workspace = root.join("projects/demo");
             fs::create_dir_all(&workspace).unwrap();
 
-            TestDevHome { dev_home: DevHome::at(root), workspace, _dir: dir }
+            TestDevHome {
+                dev_home: DevHome::at(root),
+                workspace,
+                _dir: dir,
+            }
         }
 
         fn recipe(&self) -> Recipe {
@@ -275,7 +278,9 @@ mod tests {
                 .dev_home
                 .project_devcontainer_dir("demo")
                 .join("devcontainer.json");
-            read_json_file(&path).unwrap().expect("composed config should be written")
+            read_json_file(&path)
+                .unwrap()
+                .expect("composed config should be written")
         }
     }
 
@@ -383,7 +388,9 @@ mod tests {
             "docker",
         );
         let mut recipe = env.recipe();
-        recipe.options.insert("imageVariant".to_string(), "3.11".to_string());
+        recipe
+            .options
+            .insert("imageVariant".to_string(), "3.11".to_string());
 
         let composed = env.compose(&recipe, "docker", true);
 
@@ -417,10 +424,13 @@ mod tests {
         );
         let recipe = env.recipe();
 
-        let (path, returned) =
-            compose_and_write_in(&env.dev_home, &recipe, "docker").unwrap();
+        let (path, returned) = compose_and_write_in(&env.dev_home, &recipe, "docker").unwrap();
 
-        assert_eq!(returned, env.persisted(), "returned value must match the file");
+        assert_eq!(
+            returned,
+            env.persisted(),
+            "returned value must match the file"
+        );
         assert_eq!(returned["remoteUser"], "vscode");
         assert!(path.ends_with("demo/.devcontainer/devcontainer.json"));
     }
@@ -439,7 +449,10 @@ mod tests {
 
         let run_config = env.compose(&recipe, "docker", false);
 
-        assert_eq!(run_config["remoteUser"], "root", "the run drops the base layer");
+        assert_eq!(
+            run_config["remoteUser"], "root",
+            "the run drops the base layer"
+        );
         assert_eq!(
             env.persisted(),
             before,
@@ -462,7 +475,9 @@ mod tests {
             .join("Dockerfile");
         fs::write(&aux, "FROM ${templateOption:base}\n").unwrap();
         let mut recipe = env.recipe();
-        recipe.options.insert("base".to_string(), "rust:latest".to_string());
+        recipe
+            .options
+            .insert("base".to_string(), "rust:latest".to_string());
 
         compose_and_write_in(&env.dev_home, &recipe, "docker").unwrap();
 
@@ -482,7 +497,10 @@ mod tests {
         let err = compose_config_in(&env.dev_home, &recipe, "docker", true).unwrap_err();
 
         let message = err.to_string();
-        assert!(message.contains("absent"), "should name the template: {message}");
+        assert!(
+            message.contains("absent"),
+            "should name the template: {message}"
+        );
         assert!(
             message.contains("global/absent"),
             "should name the searched path: {message}"
