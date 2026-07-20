@@ -63,7 +63,7 @@ pub async fn run(
             } else if all.is_empty() {
                 println!("No templates found.");
             } else {
-                println!("{:<40} {:<20} {}", "ID", "NAME", "DESCRIPTION");
+                println!("{:<40} {:<20} DESCRIPTION", "ID", "NAME");
                 for (_, t) in &all {
                     println!("{:<40} {:<20} {}", t.id, t.name, t.description);
                 }
@@ -119,7 +119,7 @@ pub async fn run(
             } else if all.is_empty() {
                 println!("No features found.");
             } else {
-                println!("{:<40} {:<20} {}", "ID", "NAME", "DESCRIPTION");
+                println!("{:<40} {:<20} DESCRIPTION", "ID", "NAME");
                 for (_, f) in &all {
                     println!("{:<40} {:<20} {}", f.id, f.name, f.description);
                 }

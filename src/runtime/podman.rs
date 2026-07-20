@@ -32,14 +32,13 @@ fn podman_socket_path() -> Result<String, DevError> {
     }
 
     // macOS via Homebrew podman machine
-    if cfg!(target_os = "macos") {
-        if let Ok(home) = std::env::var("HOME") {
+    if cfg!(target_os = "macos")
+        && let Ok(home) = std::env::var("HOME") {
             let path = format!("{home}/.local/share/containers/podman/machine/podman.sock");
             if std::path::Path::new(&path).exists() {
                 return Ok(path);
             }
         }
-    }
 
     // Linux fallback
     let uid_path = format!("/run/user/{}/podman/podman.sock", unsafe {

@@ -204,20 +204,17 @@ pub async fn detect_runtime(
     let docker_running = {
         let mut found = None;
         // Try default socket (DOCKER_HOST or /var/run/docker.sock)
-        if let Ok(rt) = docker::DockerRuntime::connect() {
-            if rt.ping().await.is_ok() {
+        if let Ok(rt) = docker::DockerRuntime::connect()
+            && rt.ping().await.is_ok() {
                 found = Some(rt);
             }
-        }
         // Fallback: Docker Desktop on macOS uses ~/.docker/run/docker.sock
         // while /var/run/docker.sock may point to a different runtime.
-        if found.is_none() {
-            if let Some(rt) = docker::DockerRuntime::connect_fallback() {
-                if rt.ping().await.is_ok() {
+        if found.is_none()
+            && let Some(rt) = docker::DockerRuntime::connect_fallback()
+                && rt.ping().await.is_ok() {
                     found = Some(rt);
                 }
-            }
-        }
         found
     };
 

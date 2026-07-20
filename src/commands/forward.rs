@@ -150,17 +150,15 @@ fn active_entries_for_workspace(workspace: &Path) -> Vec<crate::caddy::PortEntry
             continue;
         }
         let middle = &name[prefix.len() + 1..name.len() - 4];
-        if let Ok(port) = middle.parse::<u16>() {
-            if let Ok(pid) = read_pid_file(&entry.path()) {
-                if is_process_alive(pid) {
+        if let Ok(port) = middle.parse::<u16>()
+            && let Ok(pid) = read_pid_file(&entry.path())
+                && is_process_alive(pid) {
                     entries.push(crate::caddy::PortEntry {
                         port,
                         custom_name: load_custom_name(workspace, port),
                         keepalive: load_keepalive(workspace, port),
                     });
                 }
-            }
-        }
     }
 
     entries

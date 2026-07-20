@@ -91,9 +91,9 @@ pub fn pick_scope() -> anyhow::Result<Scope> {
 
 /// Present an interactive fuzzy-select picker for templates.
 /// Returns the OCI reference prefix and the selected template.
-pub fn pick_template<'a>(
-    templates: &'a [(String, TemplateMetadata)],
-) -> anyhow::Result<(String, &'a TemplateMetadata)> {
+pub fn pick_template(
+    templates: &[(String, TemplateMetadata)],
+) -> anyhow::Result<(String, &TemplateMetadata)> {
     let dims = term_dimensions();
     let display_items: Vec<String> = templates
         .iter()

@@ -486,28 +486,25 @@ fn rewrite_service_volumes(service: &mut serde_yaml::Value, workspace: &Path) {
         match vol {
             // Short syntax: "source:target[:mode]"
             serde_yaml::Value::String(s) => {
-                if s.starts_with("..") {
-                    if let Some(colon_pos) = s.find(':') {
+                if s.starts_with("..")
+                    && let Some(colon_pos) = s.find(':') {
                         let source = &s[..colon_pos];
                         let rest = &s[colon_pos..];
                         let resolved = resolve_parent_ref(source, workspace);
                         *s = format!("{}{rest}", resolved.display());
                     }
-                }
             }
             // Long syntax: mapping with source/target/type keys
             serde_yaml::Value::Mapping(map) => {
                 let source_key = serde_yaml::Value::String("source".to_string());
-                if let Some(source_val) = map.get_mut(&source_key) {
-                    if let Some(s) = source_val.as_str() {
-                        if s.starts_with("..") {
+                if let Some(source_val) = map.get_mut(&source_key)
+                    && let Some(s) = source_val.as_str()
+                        && s.starts_with("..") {
                             let resolved = resolve_parent_ref(s, workspace);
                             *source_val = serde_yaml::Value::String(
                                 resolved.to_string_lossy().to_string(),
                             );
                         }
-                    }
-                }
             }
             _ => {}
         }

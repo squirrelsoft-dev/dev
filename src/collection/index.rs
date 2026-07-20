@@ -192,13 +192,11 @@ pub async fn fetch_collection_index(
     let cache = CacheManager::new()?;
     let cache_key = "collection-index.yml";
 
-    if !force_refresh && cache.is_fresh(cache_key) {
-        if let Some(data) = cache.read(cache_key) {
-            if let Ok(collections) = parse_collection_index(&data) {
+    if !force_refresh && cache.is_fresh(cache_key)
+        && let Some(data) = cache.read(cache_key)
+            && let Ok(collections) = parse_collection_index(&data) {
                 return Ok(collections);
             }
-        }
-    }
 
     let (data, etag) = fetch_with_etag(COLLECTION_INDEX_URL, cache.etag(cache_key)).await?;
 
@@ -276,11 +274,10 @@ async fn fetch_collection_json(
     let cache = CacheManager::new()?;
     let cache_key = format!("{collection_name}-collection.json");
 
-    if !force_refresh && cache.is_fresh(&cache_key) {
-        if let Some(data) = cache.read(&cache_key) {
+    if !force_refresh && cache.is_fresh(&cache_key)
+        && let Some(data) = cache.read(&cache_key) {
             return Ok(data);
         }
-    }
 
     // The devcontainer-collection.json is stored as tag "latest"
     // in the OCI registry at the collection's ociReference

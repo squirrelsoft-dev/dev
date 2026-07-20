@@ -259,14 +259,13 @@ impl BollardRuntime {
                     return Err(DevError::BuildFailed(format!("Docker stream error: {e}")));
                 }
             };
-            if verbose {
-                if let Some(ref stream_text) = info.stream {
+            if verbose
+                && let Some(ref stream_text) = info.stream {
                     eprint!("{stream_text}");
                 }
-            }
             // Check for BuildKit trace messages with vertex errors or log output.
-            if is_buildkit {
-                if let Some(bollard::models::BuildInfoAux::BuildKit(ref status)) = info.aux {
+            if is_buildkit
+                && let Some(bollard::models::BuildInfoAux::BuildKit(ref status)) = info.aux {
                     for vertex in &status.vertexes {
                         if !vertex.error.is_empty() {
                             return Err(DevError::BuildFailed(vertex.error.clone()));
@@ -279,7 +278,6 @@ impl BollardRuntime {
                         }
                     }
                 }
-            }
             if let Some(ref detail) = info.error_detail {
                 let msg = detail.message.clone().unwrap_or_default();
                 if !msg.is_empty() {
@@ -607,11 +605,10 @@ impl BollardRuntime {
             let monitor_handle = tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    if let Ok(info) = monitor_client.inspect_exec(&monitor_exec_id).await {
-                        if info.running == Some(false) {
+                    if let Ok(info) = monitor_client.inspect_exec(&monitor_exec_id).await
+                        && info.running == Some(false) {
                             break;
                         }
-                    }
                 }
             });
 
@@ -771,8 +768,8 @@ impl BollardRuntime {
         let mut metadata_entries: Vec<serde_json::Value> = Vec::new();
 
         // Parse the devcontainer.metadata label (JSON array or single object).
-        if let Some(ref labels) = config.labels {
-            if let Some(raw) = labels.get("devcontainer.metadata") {
+        if let Some(ref labels) = config.labels
+            && let Some(raw) = labels.get("devcontainer.metadata") {
                 if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(raw) {
                     metadata_entries = arr;
                 } else if let Ok(obj) = serde_json::from_str::<serde_json::Value>(raw) {
@@ -789,17 +786,15 @@ impl BollardRuntime {
                     }
                 }
             }
-        }
 
         // Fall back to the Dockerfile USER instruction for container_user.
-        if container_user.is_none() {
-            if let Some(ref user) = config.user {
+        if container_user.is_none()
+            && let Some(ref user) = config.user {
                 let user = user.trim();
                 if !user.is_empty() {
                     container_user = Some(user.to_string());
                 }
             }
-        }
 
         Ok(ImageMetadata {
             remote_user,
@@ -917,14 +912,13 @@ impl DockerRuntime {
     /// at ~/.docker/run/docker.sock while /var/run/docker.sock may be a
     /// symlink to a different runtime).
     pub fn connect_fallback() -> Option<Self> {
-        if cfg!(target_os = "macos") {
-            if let Ok(home) = std::env::var("HOME") {
+        if cfg!(target_os = "macos")
+            && let Ok(home) = std::env::var("HOME") {
                 let path = format!("{home}/.docker/run/docker.sock");
                 if std::path::Path::new(&path).exists() {
                     return BollardRuntime::connect_to_socket(&path).ok().map(Self);
                 }
             }
-        }
         None
     }
 
