@@ -1643,6 +1643,24 @@ mod tests {
             composed["workspaceMount"],
             "source=${localWorkspaceFolder},target=/mount-from-global,type=bind"
         );
+
+        // The mirror direction: overriding workspaceMount leaves workspaceFolder intact.
+        let env = TestDevHome::new(
+            r#"{"image": "rust:latest", "workspaceFolder": "/from-global", "workspaceMount": "source=${localWorkspaceFolder},target=/mount-from-global,type=bind"}"#,
+            None,
+            Some(
+                r#"{"workspaceMount": "source=${localWorkspaceFolder},target=/mount-from-runtime,type=bind"}"#,
+            ),
+            "docker",
+        );
+
+        let composed = env.compose(&env.recipe(), "docker", true);
+
+        assert_eq!(
+            composed["workspaceMount"],
+            "source=${localWorkspaceFolder},target=/mount-from-runtime,type=bind"
+        );
+        assert_eq!(composed["workspaceFolder"], "/from-global");
     }
 
     #[test]

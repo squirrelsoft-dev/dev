@@ -1094,6 +1094,23 @@ mod tests {
             merged["workspaceMount"],
             "source=${localWorkspaceFolder},target=/from-base,type=bind"
         );
+
+        // The mirror direction: a project workspaceMount does not clear the
+        // base's workspaceFolder.
+        let dir = TempDir::new().unwrap();
+        let base = write_base_config(&dir, r#"{"workspaceFolder": "/from-base"}"#);
+        let project = write_project_config(
+            &dir,
+            r#"{"image": "ubuntu:24.04", "workspaceMount": "source=${localWorkspaceFolder},target=/from-project,type=bind"}"#,
+        );
+
+        let merged = effective_value(&project, true, &base);
+
+        assert_eq!(
+            merged["workspaceMount"],
+            "source=${localWorkspaceFolder},target=/from-project,type=bind"
+        );
+        assert_eq!(merged["workspaceFolder"], "/from-base");
     }
 
     #[test]
