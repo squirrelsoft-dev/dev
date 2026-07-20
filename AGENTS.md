@@ -19,8 +19,6 @@
   directory (the vendored `crates/buildkit-client-patch` is the exception).
 - Anything that reads `~/.dev` takes a `&DevHome` in an `*_in` variant (`src/util/paths.rs`);
   test against those with `DevHome::at(tmp)` rather than the `current()`-based wrappers.
-- `cargo fmt --check` is dirty repo-wide on `main`, so it is not a useful signal.
-  Check that a change adds no *new* rustfmt diffs instead of expecting a clean run.
 
 ## Maintaining this file
 
