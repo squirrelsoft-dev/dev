@@ -1628,8 +1628,10 @@ mod tests {
 
     #[test]
     fn each_of_workspace_mount_and_workspace_folder_is_overridden_independently() {
+        let global_config = r#"{"image": "rust:latest", "workspaceFolder": "/from-global", "workspaceMount": "source=${localWorkspaceFolder},target=/mount-from-global,type=bind"}"#;
+
         let env = TestDevHome::new(
-            r#"{"image": "rust:latest", "workspaceFolder": "/from-global", "workspaceMount": "source=${localWorkspaceFolder},target=/mount-from-global,type=bind"}"#,
+            global_config,
             None,
             Some(r#"{"workspaceFolder": "/from-runtime"}"#),
             "docker",
@@ -1646,7 +1648,7 @@ mod tests {
 
         // The mirror direction: overriding workspaceMount leaves workspaceFolder intact.
         let env = TestDevHome::new(
-            r#"{"image": "rust:latest", "workspaceFolder": "/from-global", "workspaceMount": "source=${localWorkspaceFolder},target=/mount-from-global,type=bind"}"#,
+            global_config,
             None,
             Some(
                 r#"{"workspaceMount": "source=${localWorkspaceFolder},target=/mount-from-runtime,type=bind"}"#,
