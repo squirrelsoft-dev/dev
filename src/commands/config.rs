@@ -331,10 +331,11 @@ fn apply_remove(
             if let Some(map) = obj.get_mut(property).and_then(|v| v.as_object_mut()) {
                 if map.remove(value).is_some() {
                     if map.len() == 1
-                        && let Some((_, single_val)) = map.iter().next() {
-                            let simplified = single_val.clone();
-                            obj.insert(property.to_string(), simplified);
-                        }
+                        && let Some((_, single_val)) = map.iter().next()
+                    {
+                        let simplified = single_val.clone();
+                        obj.insert(property.to_string(), simplified);
+                    }
                     Ok(format!("Removed {value} from {property}"))
                 } else {
                     Ok(format!("Label '{value}' not found in {property}"))
@@ -458,39 +459,43 @@ fn config_list(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
 
     // Features
     if let Some(features) = obj.get("features").and_then(|v| v.as_object())
-        && !features.is_empty() {
-            println!("features:");
-            for key in features.keys() {
-                println!("  - {key}");
-            }
+        && !features.is_empty()
+    {
+        println!("features:");
+        for key in features.keys() {
+            println!("  - {key}");
         }
+    }
 
     // Forward ports
     if let Some(ports) = obj.get("forwardPorts").and_then(|v| v.as_array())
-        && !ports.is_empty() {
-            let ports_str: Vec<String> = ports.iter().map(format_value).collect();
-            println!("forwardPorts: {}", ports_str.join(", "));
-        }
+        && !ports.is_empty()
+    {
+        let ports_str: Vec<String> = ports.iter().map(format_value).collect();
+        println!("forwardPorts: {}", ports_str.join(", "));
+    }
 
     // Env maps
     for key in ["remoteEnv", "containerEnv"] {
         if let Some(env) = obj.get(key).and_then(|v| v.as_object())
-            && !env.is_empty() {
-                println!("{key}:");
-                for (k, v) in env {
-                    println!("  {k}={}", format_value(v));
-                }
+            && !env.is_empty()
+        {
+            println!("{key}:");
+            for (k, v) in env {
+                println!("  {k}={}", format_value(v));
             }
+        }
     }
 
     // Mounts
     if let Some(mounts) = obj.get("mounts").and_then(|v| v.as_array())
-        && !mounts.is_empty() {
-            println!("mounts:");
-            for m in mounts {
-                println!("  - {}", format_value(m));
-            }
+        && !mounts.is_empty()
+    {
+        println!("mounts:");
+        for m in mounts {
+            println!("  - {}", format_value(m));
         }
+    }
 
     // Lifecycle commands
     for key in LIFECYCLE_COMMANDS {
@@ -507,8 +512,7 @@ fn config_list(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
                         match cmd {
                             Value::String(s) => println!("  {label}: {s}"),
                             Value::Array(arr) => {
-                                let cmds: Vec<String> =
-                                    arr.iter().map(format_value).collect();
+                                let cmds: Vec<String> = arr.iter().map(format_value).collect();
                                 println!("  {label}: [{}]", cmds.join(", "));
                             }
                             other => println!("  {label}: {other}"),

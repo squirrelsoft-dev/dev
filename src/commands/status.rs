@@ -9,10 +9,11 @@ pub async fn run(
     json: bool,
 ) -> anyhow::Result<()> {
     // Check for devcontainer config (informational only)
-    if find_config_source(workspace).is_err() {
-        if !json {
-            eprintln!("No devcontainer configuration found in {}", workspace.display());
-        }
+    if find_config_source(workspace).is_err() && !json {
+        eprintln!(
+            "No devcontainer configuration found in {}",
+            workspace.display()
+        );
     }
 
     let runtime = detect_runtime(runtime_override).await?;
@@ -37,9 +38,14 @@ pub async fn run(
         println!("No containers running for this workspace.");
         println!("Use `dev up` to start a container for this workspace.");
     } else {
-        println!("{:<30} {:<12} {}", "NAME", "STATE", "IMAGE");
+        println!("{:<30} {:<12} IMAGE", "NAME", "STATE");
         for c in &containers {
-            println!("{:<30} {:<12} {}", c.name, format!("{:?}", c.state), c.image);
+            println!(
+                "{:<30} {:<12} {}",
+                c.name,
+                format!("{:?}", c.state),
+                c.image
+            );
         }
     }
 

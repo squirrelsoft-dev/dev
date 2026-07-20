@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use cli::{Cli, BaseAction, Command, GlobalAction, VscodeAction};
+use cli::{BaseAction, Cli, Command, GlobalAction, VscodeAction};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -35,11 +35,49 @@ async fn main() -> anyhow::Result<()> {
         Command::New { template, options } => {
             commands::new::run(&workspace, template.as_deref(), &options, verbose).await?;
         }
-        Command::Build { tag, no_cache, frozen_lockfile, buildkit, update_remote_user_uid_default, no_base } => {
-            commands::build::run(&workspace, runtime_override, tag.as_deref(), no_cache, verbose > 0, frozen_lockfile, buildkit, &update_remote_user_uid_default, no_base).await?;
+        Command::Build {
+            tag,
+            no_cache,
+            frozen_lockfile,
+            buildkit,
+            update_remote_user_uid_default,
+            no_base,
+        } => {
+            commands::build::run(
+                &workspace,
+                runtime_override,
+                tag.as_deref(),
+                no_cache,
+                verbose > 0,
+                frozen_lockfile,
+                buildkit,
+                &update_remote_user_uid_default,
+                no_base,
+            )
+            .await?;
         }
-        Command::Up { rebuild, no_cache, frozen_lockfile, buildkit, update_remote_user_uid_default, port_overrides, no_base } => {
-            commands::up::run(&workspace, runtime_override, rebuild, no_cache, verbose > 0, frozen_lockfile, buildkit, &update_remote_user_uid_default, &port_overrides, no_base).await?;
+        Command::Up {
+            rebuild,
+            no_cache,
+            frozen_lockfile,
+            buildkit,
+            update_remote_user_uid_default,
+            port_overrides,
+            no_base,
+        } => {
+            commands::up::run(
+                &workspace,
+                runtime_override,
+                rebuild,
+                no_cache,
+                verbose > 0,
+                frozen_lockfile,
+                buildkit,
+                &update_remote_user_uid_default,
+                &port_overrides,
+                no_base,
+            )
+            .await?;
         }
         Command::Down { remove } => {
             commands::down::run(&workspace, runtime_override, remove).await?;
@@ -47,8 +85,25 @@ async fn main() -> anyhow::Result<()> {
         Command::Exec { user, cmd } => {
             commands::exec::run(&workspace, runtime_override, user.as_deref(), &cmd).await?;
         }
-        Command::Forward { port, name, keepalive, daemon, stop, list } => {
-            commands::forward::run(&workspace, runtime_override, &port, name.as_deref(), keepalive.as_deref(), daemon, stop, list).await?;
+        Command::Forward {
+            port,
+            name,
+            keepalive,
+            daemon,
+            stop,
+            list,
+        } => {
+            commands::forward::run(
+                &workspace,
+                runtime_override,
+                &port,
+                name.as_deref(),
+                keepalive.as_deref(),
+                daemon,
+                stop,
+                list,
+            )
+            .await?;
         }
         Command::Shell { shell } => {
             commands::shell::run(&workspace, runtime_override, shell.as_deref()).await?;
@@ -77,7 +132,9 @@ async fn main() -> anyhow::Result<()> {
             BaseAction::Edit => {
                 commands::base::edit()?;
             }
-            BaseAction::Config { action: config_action } => {
+            BaseAction::Config {
+                action: config_action,
+            } => {
                 commands::base::config(config_action, verbose).await?;
             }
         },

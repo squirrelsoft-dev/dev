@@ -82,10 +82,7 @@ pub async fn new(verbose: u8) -> anyhow::Result<()> {
     fs::write(&config_path, serde_json::to_string_pretty(&json)?)?;
 
     if verbose > 0 {
-        eprintln!(
-            "Selected {} feature(s)",
-            selected_features.len()
-        );
+        eprintln!("Selected {} feature(s)", selected_features.len());
     }
     println!("Base config written to {}", config_path.display());
     Ok(())

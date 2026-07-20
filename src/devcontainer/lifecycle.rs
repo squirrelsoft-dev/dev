@@ -26,7 +26,14 @@ pub async fn run_lifecycle_hooks<R: ContainerRuntime + ?Sized>(
     // onCreateCommand: features first (in dependency order), then config
     for f in features {
         if let Some(ref cmd) = f.lifecycle_hooks.on_create_command {
-            run_hook(runtime, container_id, &format!("onCreateCommand [{}]", f.id), cmd, user).await?;
+            run_hook(
+                runtime,
+                container_id,
+                &format!("onCreateCommand [{}]", f.id),
+                cmd,
+                user,
+            )
+            .await?;
         }
     }
     if let Some(ref cmd) = config.on_create_command {
@@ -41,7 +48,14 @@ pub async fn run_lifecycle_hooks<R: ContainerRuntime + ?Sized>(
     // postCreateCommand: features first, then config
     for f in features {
         if let Some(ref cmd) = f.lifecycle_hooks.post_create_command {
-            run_hook(runtime, container_id, &format!("postCreateCommand [{}]", f.id), cmd, user).await?;
+            run_hook(
+                runtime,
+                container_id,
+                &format!("postCreateCommand [{}]", f.id),
+                cmd,
+                user,
+            )
+            .await?;
         }
     }
     if let Some(ref cmd) = config.post_create_command {
@@ -51,7 +65,14 @@ pub async fn run_lifecycle_hooks<R: ContainerRuntime + ?Sized>(
     // postStartCommand: features first, then config
     for f in features {
         if let Some(ref cmd) = f.lifecycle_hooks.post_start_command {
-            run_hook(runtime, container_id, &format!("postStartCommand [{}]", f.id), cmd, user).await?;
+            run_hook(
+                runtime,
+                container_id,
+                &format!("postStartCommand [{}]", f.id),
+                cmd,
+                user,
+            )
+            .await?;
         }
     }
     if let Some(ref cmd) = config.post_start_command {
@@ -78,7 +99,14 @@ pub async fn run_post_attach_hooks<R: ContainerRuntime + ?Sized>(
 
     for f in features {
         if let Some(ref cmd) = f.lifecycle_hooks.post_attach_command {
-            run_hook(runtime, container_id, &format!("postAttachCommand [{}]", f.id), cmd, user).await?;
+            run_hook(
+                runtime,
+                container_id,
+                &format!("postAttachCommand [{}]", f.id),
+                cmd,
+                user,
+            )
+            .await?;
         }
     }
     if let Some(ref cmd) = config.post_attach_command {
@@ -98,22 +126,14 @@ async fn run_hook<R: ContainerRuntime + ?Sized>(
     match cmd {
         LifecycleCommand::Single(command) => {
             eprintln!("[lifecycle] Running {name}: {command}");
-            let args = vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                command.clone(),
-            ];
+            let args = vec!["sh".to_string(), "-c".to_string(), command.clone()];
             let result = runtime.exec(container_id, &args, user).await?;
             check_result(name, command, &result)?;
         }
         LifecycleCommand::Multiple(commands) => {
             for command in commands {
                 eprintln!("[lifecycle] Running {name}: {command}");
-                let args = vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    command.clone(),
-                ];
+                let args = vec!["sh".to_string(), "-c".to_string(), command.clone()];
                 let result = runtime.exec(container_id, &args, user).await?;
                 check_result(name, command, &result)?;
             }
@@ -146,11 +166,7 @@ async fn run_parallel<R: ContainerRuntime + ?Sized>(
 
             async move {
                 eprintln!("[lifecycle] Running {name} ({label}): {command}");
-                let args = vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    command.clone(),
-                ];
+                let args = vec!["sh".to_string(), "-c".to_string(), command.clone()];
                 let result = runtime.exec(&container_id, &args, user.as_deref()).await?;
                 check_result(&name, &command, &result)?;
                 Ok::<(), DevError>(())

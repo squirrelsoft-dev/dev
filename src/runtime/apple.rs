@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 
+use apple_container::AppleContainerClient;
 use apple_container::models::{
     ContainerConfiguration, Empty, FSType, Filesystem, ImageDescription, ProcessConfiguration,
     PublishPort, Resources, RuntimeStatus, User, UserId, UserString,
 };
-use apple_container::AppleContainerClient;
 
 use crate::error::DevError;
 use crate::runtime::{
@@ -81,7 +81,9 @@ struct CachedImageConfig {
 
 /// Read cached OCI image config for a reference, if present.
 fn read_cached_config(reference: &str) -> Option<CachedImageConfig> {
-    let path = oci_config_cache_dir().join(cache_key(reference)).with_extension("json");
+    let path = oci_config_cache_dir()
+        .join(cache_key(reference))
+        .with_extension("json");
     let data = std::fs::read(&path).ok()?;
     serde_json::from_slice(&data).ok()
 }
@@ -94,8 +96,7 @@ fn write_cached_config(reference: &str, config: &CachedImageConfig) -> Result<()
     let path = dir.join(cache_key(reference)).with_extension("json");
     let data = serde_json::to_vec(config)
         .map_err(|e| DevError::Runtime(format!("serialize cache: {e}")))?;
-    std::fs::write(&path, &data)
-        .map_err(|e| DevError::Runtime(format!("write cache: {e}")))?;
+    std::fs::write(&path, &data).map_err(|e| DevError::Runtime(format!("write cache: {e}")))?;
     Ok(())
 }
 
@@ -104,9 +105,10 @@ fn linux_arm64_resolver(manifests: &[oci_client::manifest::ImageIndexEntry]) -> 
     manifests
         .iter()
         .find(|entry| {
-            entry.platform.as_ref().is_some_and(|platform| {
-                platform.os == "linux" && platform.architecture == "arm64"
-            })
+            entry
+                .platform
+                .as_ref()
+                .is_some_and(|platform| platform.os == "linux" && platform.architecture == "arm64")
         })
         .map(|entry| entry.digest.clone())
 }
@@ -119,9 +121,10 @@ fn linux_arm64_resolver(manifests: &[oci_client::manifest::ImageIndexEntry]) -> 
 /// `~/.cache/devcontainer/oci-configs/` for later use by
 /// `to_apple_config`.
 async fn fetch_and_cache_oci_config(reference: &str) -> Result<CachedImageConfig, DevError> {
-    let oci_ref: oci_client::Reference = reference.parse().map_err(|e: oci_client::ParseError| {
-        DevError::Runtime(format!("invalid image ref: {e}"))
-    })?;
+    let oci_ref: oci_client::Reference =
+        reference.parse().map_err(|e: oci_client::ParseError| {
+            DevError::Runtime(format!("invalid image ref: {e}"))
+        })?;
 
     let client = oci_client::Client::new(oci_client::client::ClientConfig {
         platform_resolver: Some(Box::new(linux_arm64_resolver)),
@@ -140,11 +143,7 @@ async fn fetch_and_cache_oci_config(reference: &str) -> Result<CachedImageConfig
 
     let mut config_data = Vec::new();
     client
-        .pull_blob(
-            &oci_ref,
-            manifest.config.digest.as_str(),
-            &mut config_data,
-        )
+        .pull_blob(&oci_ref, manifest.config.digest.as_str(), &mut config_data)
         .await
         .map_err(|e| DevError::Runtime(format!("pull config blob for {reference}: {e}")))?;
 
@@ -196,7 +195,9 @@ impl RawModeGuard {
         let fd = std::io::stdin().as_raw_fd();
         let mut original: libc::termios = unsafe { std::mem::zeroed() };
         if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
-            return Err(DevError::Runtime("Failed to get terminal attributes".into()));
+            return Err(DevError::Runtime(
+                "Failed to get terminal attributes".into(),
+            ));
         }
         let mut raw = original;
         unsafe { libc::cfmakeraw(&mut raw) };
@@ -259,7 +260,10 @@ fn merge_env(image_env: &[String], container_env: &HashMap<String, String>) -> V
         merged.insert(k.clone(), v.clone());
     }
 
-    merged.into_iter().map(|(k, v)| format!("{k}={v}")).collect()
+    merged
+        .into_iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect()
 }
 
 /// Apple's `vmexec` rejects container IDs longer than this (UUID length).
@@ -288,13 +292,17 @@ fn to_apple_config(
         .mounts
         .iter()
         .map(|m| Filesystem {
-                fs_type: FSType::Virtiofs(Empty {}),
+            fs_type: FSType::Virtiofs(Empty {}),
             source: m.source.display().to_string(),
             destination: m.target.clone(),
-            options: if m.readonly { vec!["ro".to_string()] } else { vec![] },
+            options: if m.readonly {
+                vec!["ro".to_string()]
+            } else {
+                vec![]
+            },
         })
         .chain(config.workspace_mount.iter().map(|ws| Filesystem {
-                fs_type: FSType::Virtiofs(Empty {}),
+            fs_type: FSType::Virtiofs(Empty {}),
             source: ws.source.display().to_string(),
             destination: ws.target.clone(),
             options: vec![],
@@ -415,11 +423,9 @@ impl ContainerRuntime for AppleRuntime {
             // Local images must be resolved from the image list before pulling.
             let image_desc_bytes = match self.find_local_image(&config.image).await {
                 Some(desc) => desc,
-                None => {
-                    apple_container::build::pull_image(&config.image, &platform_json)
-                        .await
-                        .map_err(|e| DevError::Runtime(format!("pull image: {e}")))?
-                }
+                None => apple_container::build::pull_image(&config.image, &platform_json)
+                    .await
+                    .map_err(|e| DevError::Runtime(format!("pull image: {e}")))?,
             };
 
             apple_container::build::unpack_image(&image_desc_bytes, &platform_json)
@@ -462,7 +468,8 @@ impl ContainerRuntime for AppleRuntime {
                 );
             }
 
-            let kernel = self.client
+            let kernel = self
+                .client
                 .get_default_kernel()
                 .await
                 .map_err(|e| DevError::Runtime(format!("Failed to get default kernel: {e}")))?;
@@ -529,7 +536,11 @@ impl ContainerRuntime for AppleRuntime {
                 os_pipe::pipe().map_err(|e| DevError::Runtime(format!("pipe: {e}")))?;
 
             let executable = cmd.first().cloned().unwrap_or_default();
-            let arguments = if cmd.len() > 1 { cmd[1..].to_vec() } else { Vec::new() };
+            let arguments = if cmd.len() > 1 {
+                cmd[1..].to_vec()
+            } else {
+                Vec::new()
+            };
 
             let process_id = format!("exec-{}", std::process::id());
 
@@ -598,7 +609,11 @@ impl ContainerRuntime for AppleRuntime {
             let _raw_guard = RawModeGuard::enter()?;
 
             let executable = cmd.first().cloned().unwrap_or_default();
-            let arguments = if cmd.len() > 1 { cmd[1..].to_vec() } else { Vec::new() };
+            let arguments = if cmd.len() > 1 {
+                cmd[1..].to_vec()
+            } else {
+                Vec::new()
+            };
 
             let process_id = format!("exec-interactive-{}", std::process::id());
 
@@ -797,7 +812,10 @@ mod tests {
 
         let (id_a, id_b) = (truncate_container_id(&a), truncate_container_id(&b));
 
-        assert_ne!(id_a, id_b, "names differing only in suffix must not collide");
+        assert_ne!(
+            id_a, id_b,
+            "names differing only in suffix must not collide"
+        );
         assert!(id_a.ends_with(&a[a.len() - 18..]));
     }
 
@@ -823,11 +841,12 @@ mod tests {
         apple_container::build::unpack_image(&image_desc_bytes, &platform_json)
             .await
             .expect("unpack_image failed");
-        let image: ImageDescription = serde_json::from_slice(&image_desc_bytes)
-            .expect("parse image descriptor failed");
+        let image: ImageDescription =
+            serde_json::from_slice(&image_desc_bytes).expect("parse image descriptor failed");
 
         // Get default kernel
-        let kernel = runtime.client
+        let kernel = runtime
+            .client
             .get_default_kernel()
             .await
             .expect("get_default_kernel failed");
@@ -842,23 +861,40 @@ mod tests {
             init_process: ProcessConfiguration {
                 executable: "sleep".to_string(),
                 arguments: vec!["3600".to_string()],
-                environment: vec!["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()],
+                environment: vec![
+                    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+                ],
                 working_directory: "/".to_string(),
                 terminal: false,
                 user: User::Raw {
-                    raw: UserString { user_string: "root".to_string() },
+                    raw: UserString {
+                        user_string: "root".to_string(),
+                    },
                 },
                 supplemental_groups: vec![],
                 rlimits: vec![],
             },
-            resources: Resources { cpus: 4, memory_in_bytes: 1024 * 1024 * 1024 },
+            resources: Resources {
+                cpus: 4,
+                memory_in_bytes: 1024 * 1024 * 1024,
+            },
             runtime_handler: "container-runtime-linux".to_string(),
-            platform: Platform { architecture: "arm64".to_string(), os: "linux".to_string() },
+            platform: Platform {
+                architecture: "arm64".to_string(),
+                os: "linux".to_string(),
+            },
             networks: vec![NetworkInfo {
                 network: "default".to_string(),
-                options: NetworkOptions { hostname: Some(container_id.to_string()), mtu: Some(1280) },
+                options: NetworkOptions {
+                    hostname: Some(container_id.to_string()),
+                    mtu: Some(1280),
+                },
             }],
-            dns: Some(DnsInfo { nameservers: vec![], search_domains: vec![], options: vec![] }),
+            dns: Some(DnsInfo {
+                nameservers: vec![],
+                search_domains: vec![],
+                options: vec![],
+            }),
         };
 
         // Clean up any previous test container
@@ -866,21 +902,45 @@ mod tests {
         let _ = runtime.client.delete(container_id, true).await;
 
         // Create
-        runtime.client.create(&config, &kernel).await.expect("create failed");
+        runtime
+            .client
+            .create(&config, &kernel)
+            .await
+            .expect("create failed");
 
         // Start (bootstrap + start_process)
         let devnull = std::fs::File::open("/dev/null").expect("open /dev/null");
         let fd = devnull.as_raw_fd();
-        runtime.client.bootstrap(container_id, fd, fd, fd).await.expect("bootstrap failed");
-        runtime.client.start_process(container_id, container_id).await.expect("start_process failed");
+        runtime
+            .client
+            .bootstrap(container_id, fd, fd, fd)
+            .await
+            .expect("bootstrap failed");
+        runtime
+            .client
+            .start_process(container_id, container_id)
+            .await
+            .expect("start_process failed");
 
         // Verify running
         let snapshot = runtime.client.get(container_id).await.expect("get failed");
-        assert_eq!(snapshot.status, RuntimeStatus::Running, "container should be running");
+        assert_eq!(
+            snapshot.status,
+            RuntimeStatus::Running,
+            "container should be running"
+        );
 
         // Clean up
-        runtime.client.stop(container_id).await.expect("stop failed");
-        runtime.client.delete(container_id, true).await.expect("delete failed");
+        runtime
+            .client
+            .stop(container_id)
+            .await
+            .expect("stop failed");
+        runtime
+            .client
+            .delete(container_id, true)
+            .await
+            .expect("delete failed");
     }
 
     /// Integration test using the public runtime API (create_container / start_container)
@@ -895,7 +955,11 @@ mod tests {
         let runtime = AppleRuntime::connect().expect("connect failed");
         // Use a long ID (>36 chars) to verify truncation works
         let container_id = "vsc-test-apple-workspace-d3a8ce6bf5e568384dcfdf4b671042dd9e069a6645ad70d422ff0f4f8f793b62";
-        let truncated_id = format!("{}-{}", &container_id[..17], &container_id[container_id.len()-18..]);
+        let truncated_id = format!(
+            "{}-{}",
+            &container_id[..17],
+            &container_id[container_id.len() - 18..]
+        );
         let image_ref = "mcr.microsoft.com/devcontainers/base:ubuntu";
 
         // Pull and unpack image (same as dev up)
@@ -915,8 +979,9 @@ mod tests {
         std::fs::create_dir_all(&devcontainer_dir).unwrap();
         std::fs::write(
             devcontainer_dir.join("devcontainer.json"),
-            r#"{"name":"Test","image":"mcr.microsoft.com/devcontainers/base:ubuntu"}"#
-        ).unwrap();
+            r#"{"name":"Test","image":"mcr.microsoft.com/devcontainers/base:ubuntu"}"#,
+        )
+        .unwrap();
 
         // Build a ContainerConfig matching what dev up would create
         let container_config = ContainerConfig {
@@ -924,8 +989,17 @@ mod tests {
             name: container_id.to_string(),
             labels: {
                 let mut labels = HashMap::new();
-                labels.insert("devcontainer.local_folder".to_string(), workspace_path.to_string_lossy().to_string());
-                labels.insert("devcontainer.config_file".to_string(), devcontainer_dir.join("devcontainer.json").to_string_lossy().to_string());
+                labels.insert(
+                    "devcontainer.local_folder".to_string(),
+                    workspace_path.to_string_lossy().to_string(),
+                );
+                labels.insert(
+                    "devcontainer.config_file".to_string(),
+                    devcontainer_dir
+                        .join("devcontainer.json")
+                        .to_string_lossy()
+                        .to_string(),
+                );
                 labels
             },
             env: {
@@ -953,16 +1027,37 @@ mod tests {
         let _ = runtime.client.delete(&truncated_id, true).await;
 
         // Use the public API (same as dev up)
-        let id = runtime.create_container(&container_config).await.expect("create_container failed");
-        assert_eq!(id, truncated_id, "create_container should return truncated ID");
-        runtime.start_container(&id).await.expect("start_container failed");
+        let id = runtime
+            .create_container(&container_config)
+            .await
+            .expect("create_container failed");
+        assert_eq!(
+            id, truncated_id,
+            "create_container should return truncated ID"
+        );
+        runtime
+            .start_container(&id)
+            .await
+            .expect("start_container failed");
 
         // Verify running
         let snapshot = runtime.client.get(&id).await.expect("get failed");
-        assert_eq!(snapshot.status, RuntimeStatus::Running, "container should be running");
+        assert_eq!(
+            snapshot.status,
+            RuntimeStatus::Running,
+            "container should be running"
+        );
 
         // Clean up
-        runtime.client.stop(&truncated_id).await.expect("stop failed");
-        runtime.client.delete(&truncated_id, true).await.expect("delete failed");
+        runtime
+            .client
+            .stop(&truncated_id)
+            .await
+            .expect("stop failed");
+        runtime
+            .client
+            .delete(&truncated_id, true)
+            .await
+            .expect("delete failed");
     }
 }

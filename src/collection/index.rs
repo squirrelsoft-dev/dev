@@ -1,9 +1,9 @@
 use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 
+use super::cache::CacheManager;
 use crate::error::DevError;
 use crate::oci::registry::pull_first_layer;
-use super::cache::CacheManager;
 
 const COLLECTION_INDEX_URL: &str = "https://raw.githubusercontent.com/devcontainers/devcontainers.github.io/gh-pages/_data/collection-index.yml";
 
@@ -186,17 +186,17 @@ struct RawFeatureEntry {
 // --- Public API ---
 
 /// Fetch and parse the devcontainers collection index.
-pub async fn fetch_collection_index(
-    force_refresh: bool,
-) -> Result<Vec<Collection>, DevError> {
+pub async fn fetch_collection_index(force_refresh: bool) -> Result<Vec<Collection>, DevError> {
     let cache = CacheManager::new()?;
     let cache_key = "collection-index.yml";
 
-    if !force_refresh && cache.is_fresh(cache_key)
+    if !force_refresh
+        && cache.is_fresh(cache_key)
         && let Some(data) = cache.read(cache_key)
-            && let Ok(collections) = parse_collection_index(&data) {
-                return Ok(collections);
-            }
+        && let Ok(collections) = parse_collection_index(&data)
+    {
+        return Ok(collections);
+    }
 
     let (data, etag) = fetch_with_etag(COLLECTION_INDEX_URL, cache.etag(cache_key)).await?;
 
@@ -205,9 +205,9 @@ pub async fn fetch_collection_index(
         data
     } else {
         // 304 Not Modified - use cached version
-        cache.read(cache_key).ok_or_else(|| {
-            DevError::Cache("got 304 but no cached data available".into())
-        })?
+        cache
+            .read(cache_key)
+            .ok_or_else(|| DevError::Cache("got 304 but no cached data available".into()))?
     };
 
     parse_collection_index(&data)
@@ -220,7 +220,8 @@ pub async fn fetch_templates(
     collection: &Collection,
     force_refresh: bool,
 ) -> Result<Vec<TemplateMetadata>, DevError> {
-    let collection_json = fetch_collection_json(&collection.oci_ref, &collection.name, force_refresh).await?;
+    let collection_json =
+        fetch_collection_json(&collection.oci_ref, &collection.name, force_refresh).await?;
     parse_templates(&collection_json)
 }
 
@@ -229,7 +230,8 @@ pub async fn fetch_features(
     collection: &Collection,
     force_refresh: bool,
 ) -> Result<Vec<FeatureMetadata>, DevError> {
-    let collection_json = fetch_collection_json(&collection.oci_ref, &collection.name, force_refresh).await?;
+    let collection_json =
+        fetch_collection_json(&collection.oci_ref, &collection.name, force_refresh).await?;
     parse_features(&collection_json)
 }
 
@@ -252,9 +254,9 @@ async fn fetch_with_etag(
         return Ok((None, None));
     }
 
-    let resp = resp.error_for_status().map_err(|e| {
-        DevError::Registry(format!("failed to fetch {url}: {e}"))
-    })?;
+    let resp = resp
+        .error_for_status()
+        .map_err(|e| DevError::Registry(format!("failed to fetch {url}: {e}")))?;
 
     let new_etag = resp
         .headers()
@@ -274,10 +276,12 @@ async fn fetch_collection_json(
     let cache = CacheManager::new()?;
     let cache_key = format!("{collection_name}-collection.json");
 
-    if !force_refresh && cache.is_fresh(&cache_key)
-        && let Some(data) = cache.read(&cache_key) {
-            return Ok(data);
-        }
+    if !force_refresh
+        && cache.is_fresh(&cache_key)
+        && let Some(data) = cache.read(&cache_key)
+    {
+        return Ok(data);
+    }
 
     // The devcontainer-collection.json is stored as tag "latest"
     // in the OCI registry at the collection's ociReference

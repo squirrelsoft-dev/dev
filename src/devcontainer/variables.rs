@@ -15,7 +15,11 @@ pub fn substitute_variables(s: &str, workspace: &Path) -> String {
 
 /// Like [`substitute_variables`] but also expands `containerEnv` / `remoteEnv`
 /// variables that depend on the remote user (e.g. `HOME`).
-pub fn substitute_variables_with_user(s: &str, workspace: &Path, remote_user: Option<&str>) -> String {
+pub fn substitute_variables_with_user(
+    s: &str,
+    workspace: &Path,
+    remote_user: Option<&str>,
+) -> String {
     let mut result = String::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -58,7 +62,10 @@ fn expand_variable(expr: &str, workspace: &Path, remote_user: Option<&str>) -> O
             None => (rest, ""),
         };
         Some(std::env::var(var_name).unwrap_or_else(|_| default.to_string()))
-    } else if let Some(var_name) = expr.strip_prefix("containerEnv:").or_else(|| expr.strip_prefix("remoteEnv:")) {
+    } else if let Some(var_name) = expr
+        .strip_prefix("containerEnv:")
+        .or_else(|| expr.strip_prefix("remoteEnv:"))
+    {
         // Expand known container/remote env vars based on remoteUser.
         match var_name {
             "HOME" => Some(home_for_user(remote_user.unwrap_or("root"))),
@@ -92,7 +99,10 @@ mod tests {
     #[test]
     fn test_no_variables() {
         let workspace = PathBuf::from("/home/user/project");
-        assert_eq!(substitute_variables("hello world", &workspace), "hello world");
+        assert_eq!(
+            substitute_variables("hello world", &workspace),
+            "hello world"
+        );
     }
 
     #[test]
@@ -142,7 +152,11 @@ mod tests {
     fn test_container_env_home_with_user() {
         let workspace = PathBuf::from("/home/user/project");
         assert_eq!(
-            substitute_variables_with_user("${containerEnv:HOME}/scripts", &workspace, Some("vscode")),
+            substitute_variables_with_user(
+                "${containerEnv:HOME}/scripts",
+                &workspace,
+                Some("vscode")
+            ),
             "/home/vscode/scripts"
         );
     }
@@ -151,7 +165,11 @@ mod tests {
     fn test_container_env_home_root() {
         let workspace = PathBuf::from("/home/user/project");
         assert_eq!(
-            substitute_variables_with_user("${containerEnv:HOME}/scripts", &workspace, Some("root")),
+            substitute_variables_with_user(
+                "${containerEnv:HOME}/scripts",
+                &workspace,
+                Some("root")
+            ),
             "/root/scripts"
         );
     }

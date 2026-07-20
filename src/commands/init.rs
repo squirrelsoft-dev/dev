@@ -25,9 +25,6 @@ pub fn run(workspace: &Path) -> anyhow::Result<()> {
     });
     fs::write(&devcontainer_json, serde_json::to_string_pretty(&config)?)?;
 
-    println!(
-        "Created .devcontainer/ in {}",
-        workspace.display()
-    );
+    println!("Created .devcontainer/ in {}", workspace.display());
     Ok(())
 }

@@ -1,8 +1,8 @@
 use oci_client::manifest::OciImageManifest;
 use oci_client::{Client, Reference};
 
-use crate::error::DevError;
 use super::auth::{anonymous_auth, auth_anonymous, oci_client};
+use crate::error::DevError;
 
 /// Pull an OCI image manifest and its digest.
 pub async fn pull_manifest(
