@@ -9,20 +9,34 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Actions are pinned to full commit SHAs (with the human-readable version in a
+# trailing comment) so a retagged release cannot silently change what CI runs.
+# Dependabot's github-actions ecosystem keeps these pins current.
 jobs:
   ci:
     name: Build, test, and lint
     runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install Rust toolchain (stable, with clippy)
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Install Rust toolchain (stable, with clippy and rustfmt)
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           toolchain: stable
-          components: clippy
+          components: clippy, rustfmt
           rustflags: ""
+          # This action bundles Swatinem/rust-cache; disable it so the explicit
+          # cache step below is the single source of caching.
+          cache: false
+
+      - name: Cache cargo registry and target dir
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: . -> target
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
 
       - name: cargo check
         run: cargo check
@@ -34,4 +48,37 @@ jobs:
         run: cargo test
 
       - name: cargo clippy
-        run: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  macos:
+    name: Build and test (macOS, --features apple)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain (stable)
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: stable
+          rustflags: ""
+          cache: false
+
+      - name: Cache cargo registry and target dir
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: . -> target
+          key: apple
+
+      # Covers the macOS-only Apple Containers path gated behind
+      # #[cfg(all(target_os = "macos", feature = "apple"))], which the
+      # ubuntu-latest job never compiles. Clippy is intentionally not enforced
+      # here yet: crates/apple-container is not clippy-clean under -D warnings.
+      - name: cargo check --features apple
+        run: cargo check --features apple
+
+      - name: cargo build --features apple
+        run: cargo build --features apple
+
+      - name: cargo test --features apple
+        run: cargo test --features apple
