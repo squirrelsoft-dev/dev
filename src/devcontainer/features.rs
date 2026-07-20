@@ -195,10 +195,22 @@ pub fn features_required_by(
 
 /// Tag for the image produced by layering `features` onto the config's base image.
 ///
-/// The digest suffix makes the tag a true cache key: it covers every input that
-/// changes the resulting image, so an image built from a different effective
-/// config (for example one that merged `~/.dev/base/devcontainer.json` when this
-/// one did not) can never be mistaken for a cache hit.
+/// The digest suffix makes the tag a true cache key, so an image built from a
+/// different effective config (for example one that merged
+/// `~/.dev/base/devcontainer.json` when this one did not) can never be mistaken
+/// for a cache hit.
+///
+/// The hashed inputs must stay in step with everything
+/// [`generate_feature_dockerfile_with_opts`] bakes into the image: the base image
+/// selector, the declared features, the `_REMOTE_USER`/`_CONTAINER_USER` build
+/// environment derived from `remoteUser`, and the `containerEnv`/`remoteEnv` maps
+/// written into the `devcontainer.metadata` label. Fields that never reach the
+/// image (`forwardPorts`, `name`, `customizations`, …) are deliberately excluded
+/// so unrelated edits do not force a rebuild.
+///
+/// `features` may be either the declared set or the post-download set including
+/// transitive dependencies; dependencies are filtered out so both yield the same
+/// digest.
 pub fn feature_image_tag(
     folder_image: &str,
     config: &DevcontainerConfig,
@@ -220,10 +232,21 @@ pub fn feature_image_tag(
             "args": b.args,
         })
     });
+    fn sorted_env(env: &Option<HashMap<String, String>>) -> Option<Vec<(&str, &str)>> {
+        env.as_ref().map(|map| {
+            let mut pairs: Vec<(&str, &str)> =
+                map.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            pairs.sort_by(|a, b| a.0.cmp(b.0));
+            pairs
+        })
+    }
     let inputs = serde_json::json!({
         "image": config.image,
         "build": build,
         "features": declared,
+        "remoteUser": config.remote_user,
+        "containerEnv": sorted_env(&config.container_env),
+        "remoteEnv": sorted_env(&config.remote_env),
     });
 
     let mut hasher = Sha256::new();
@@ -387,8 +410,30 @@ fn read_depends_on(feature: &ResolvedFeature) -> Option<HashMap<String, serde_js
     if !meta_path.exists() {
         return None;
     }
-    let content = std::fs::read_to_string(&meta_path).ok()?;
-    let meta: FeatureJsonMeta = parse_jsonc(&content).ok()?;
+    let content = match std::fs::read_to_string(&meta_path) {
+        Ok(content) => content,
+        Err(e) => {
+            eprintln!(
+                "Warning: cannot read feature metadata for '{}' at {}: {e}. \
+                 Its dependencies will be treated as absent.",
+                feature.id,
+                meta_path.display()
+            );
+            return None;
+        }
+    };
+    let meta: FeatureJsonMeta = match parse_jsonc(&content) {
+        Ok(meta) => meta,
+        Err(e) => {
+            eprintln!(
+                "Warning: cannot parse feature metadata for '{}' at {}: {e}. \
+                 Its dependencies will be treated as absent.",
+                feature.id,
+                meta_path.display()
+            );
+            return None;
+        }
+    };
     meta.depends_on
 }
 

@@ -57,6 +57,10 @@ pub enum Command {
         /// Default policy for updating the remote user's UID/GID to match the host
         #[arg(long, value_parser = ["never", "on", "off"], default_value = "on")]
         update_remote_user_uid_default: String,
+
+        /// Do not apply ~/.dev/base/devcontainer.json for this run
+        #[arg(long)]
+        no_base: bool,
     },
 
     /// Start devcontainer for current directory

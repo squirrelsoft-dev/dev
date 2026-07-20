@@ -96,7 +96,9 @@ dev base config add features ghcr.io/devcontainers/features/common-utils:2
 dev base config add remoteEnv EDITOR=vim
 ```
 
-If no base config exists, this layer is simply skipped. Pass `dev up --no-base` to skip it for a single run.
+If no base config exists, this layer is simply skipped. Pass `--no-base` to `dev up` or `dev build` to skip it for a single run.
+
+The base config is merged in memory only — it is never written into the project's `.devcontainer/devcontainer.json`, and features it contributes are kept out of the project's `devcontainer-lock.json`.
 
 ### Global templates
 
@@ -138,6 +140,20 @@ Higher-priority layers override lower ones, with merge behavior depending on the
 | Features | Union (all features combined) | `features` |
 
 **Example:** if your global template sets `image: rust:latest` and your base config sets `remoteUser: vscode` with a zsh feature, the final config gets the Rust image, the vscode user, and both sets of features combined.
+
+### Derived images and disk use
+
+When a config declares features, `dev up` and `dev build` layer them onto a derived image tagged `<folder>-features-<digest>`, where the digest covers the effective image, build, features, `remoteUser`, `containerEnv`, and `remoteEnv`. This is what keeps a cached image from silently omitting base-config changes: edit any of those and the next run builds a new image rather than reusing a stale one.
+
+The consequence is that superseded images are left behind rather than overwritten in place. `dev` does not delete them automatically, since it cannot tell which are still in use by stopped containers or other tooling. Reclaim the space with your runtime's own tooling when it starts to matter:
+
+```sh
+# List the derived images for a project
+docker image ls --filter 'reference=<folder>-features-*'
+
+# Remove images not referenced by any container
+docker image prune
+```
 
 ### Workspace vs user scope
 

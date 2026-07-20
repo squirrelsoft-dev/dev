@@ -125,10 +125,6 @@ pub(crate) fn compose_config_with_base(
 /// Also copies auxiliary files (Dockerfiles, compose files, scripts) from the
 /// global template directory so that relative paths in the config resolve correctly.
 /// Returns the path to the written file.
-pub fn compose_and_write(recipe: &Recipe, runtime_name: &str) -> anyhow::Result<PathBuf> {
-    compose_and_write_with_base(recipe, runtime_name, true)
-}
-
 pub(crate) fn compose_and_write_with_base(
     recipe: &Recipe,
     runtime_name: &str,

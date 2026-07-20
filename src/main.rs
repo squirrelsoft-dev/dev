@@ -35,8 +35,8 @@ async fn main() -> anyhow::Result<()> {
         Command::New { template, options } => {
             commands::new::run(&workspace, template.as_deref(), &options, verbose).await?;
         }
-        Command::Build { tag, no_cache, frozen_lockfile, buildkit, update_remote_user_uid_default } => {
-            commands::build::run(&workspace, runtime_override, tag.as_deref(), no_cache, verbose > 0, frozen_lockfile, buildkit, &update_remote_user_uid_default).await?;
+        Command::Build { tag, no_cache, frozen_lockfile, buildkit, update_remote_user_uid_default, no_base } => {
+            commands::build::run(&workspace, runtime_override, tag.as_deref(), no_cache, verbose > 0, frozen_lockfile, buildkit, &update_remote_user_uid_default, no_base).await?;
         }
         Command::Up { rebuild, no_cache, frozen_lockfile, buildkit, update_remote_user_uid_default, port_overrides, no_base } => {
             commands::up::run(&workspace, runtime_override, rebuild, no_cache, verbose > 0, frozen_lockfile, buildkit, &update_remote_user_uid_default, &port_overrides, no_base).await?;
