@@ -7,7 +7,7 @@ use serde_json::Value;
 use crate::devcontainer::jsonc::parse_jsonc;
 use crate::devcontainer::merge::{merge_layer, merge_layers};
 use crate::devcontainer::recipe::{is_empty_object, Recipe};
-use crate::util::paths::{base_config_dir, global_dir, runtime_config_dir};
+use crate::util::paths::DevHome;
 
 /// Read a JSON file, stripping comments and trailing commas. Returns `None` if the file doesn't exist.
 fn read_json_file(path: &Path) -> anyhow::Result<Option<Value>> {
@@ -50,11 +50,22 @@ fn substitute_template_options(value: &mut Value, options: &HashMap<String, Stri
 /// 3. Runtime config (`~/.dev/<runtime>/devcontainer.json`) (highest priority for scalars)
 ///
 /// Then inject recipe features into the composed result.
-pub fn compose_config(recipe: &Recipe, runtime_name: &str) -> anyhow::Result<Value> {
+pub(crate) fn compose_config_with_base(
+    recipe: &Recipe,
+    runtime_name: &str,
+    include_base: bool,
+) -> anyhow::Result<Value> {
+    compose_config_in(&DevHome::current(), recipe, runtime_name, include_base)
+}
+
+pub(crate) fn compose_config_in(
+    dev_home: &DevHome,
+    recipe: &Recipe,
+    runtime_name: &str,
+    include_base: bool,
+) -> anyhow::Result<Value> {
     // Layer 1: Global template
-    let global_config_path = global_dir()
-        .join(&recipe.global_template)
-        .join(".devcontainer/devcontainer.json");
+    let global_config_path = dev_home.global_template_config(&recipe.global_template);
     let mut global = read_json_file(&global_config_path)?.ok_or_else(|| {
         anyhow::anyhow!(
             "Global template '{}' not found at {}",
@@ -69,12 +80,14 @@ pub fn compose_config(recipe: &Recipe, runtime_name: &str) -> anyhow::Result<Val
     }
 
     // Layer 2: Base config
-    let base_config_path = base_config_dir().join("devcontainer.json");
-    let base = read_json_file(&base_config_path)?;
+    let base = if include_base {
+        read_json_file(&dev_home.base_config())?
+    } else {
+        None
+    };
 
     // Layer 3: Runtime config
-    let runtime_config_path = runtime_config_dir(runtime_name).join("devcontainer.json");
-    let runtime = read_json_file(&runtime_config_path)?;
+    let runtime = read_json_file(&dev_home.runtime_config(runtime_name))?;
 
     // Merge layers in priority order
     let mut layers = vec![global];
@@ -116,31 +129,43 @@ pub fn compose_config(recipe: &Recipe, runtime_name: &str) -> anyhow::Result<Val
 /// Compose the config and write it to the project's `.devcontainer/devcontainer.json`.
 /// Also copies auxiliary files (Dockerfiles, compose files, scripts) from the
 /// global template directory so that relative paths in the config resolve correctly.
-/// Returns the path to the written file.
-pub fn compose_and_write(recipe: &Recipe, runtime_name: &str) -> anyhow::Result<PathBuf> {
-    let composed = compose_config(recipe, runtime_name)?;
+/// Returns the path to the written file along with the composed value.
+///
+/// The persisted file is always the full, base-inclusive composition. A run that
+/// opts out of the base layer composes its own config in memory via
+/// [`compose_config_with_base`] instead, so `--no-base` cannot leave a base-free
+/// config behind for the next `dev config` or `dev up` to read.
+pub(crate) fn compose_and_write(
+    recipe: &Recipe,
+    runtime_name: &str,
+) -> anyhow::Result<(PathBuf, Value)> {
+    compose_and_write_in(&DevHome::current(), recipe, runtime_name)
+}
+
+pub(crate) fn compose_and_write_in(
+    dev_home: &DevHome,
+    recipe: &Recipe,
+    runtime_name: &str,
+) -> anyhow::Result<(PathBuf, Value)> {
+    let composed = compose_config_in(dev_home, recipe, runtime_name, true)?;
 
     let folder_name = Path::new(&recipe.root_folder)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "workspace".to_string());
 
-    let dest_dir = crate::util::paths::devcontainers_dir()
-        .join(&folder_name)
-        .join(".devcontainer");
+    let dest_dir = dev_home.project_devcontainer_dir(&folder_name);
     fs::create_dir_all(&dest_dir)?;
 
     // Copy auxiliary files (Dockerfiles, compose files, etc.) from the global template.
-    let global_devcontainer_dir = global_dir()
-        .join(&recipe.global_template)
-        .join(".devcontainer");
+    let global_devcontainer_dir = dev_home.global_template_dir(&recipe.global_template);
     copy_auxiliary_files(&global_devcontainer_dir, &dest_dir, &recipe.options)?;
 
     let dest_path = dest_dir.join("devcontainer.json");
     let formatted = serde_json::to_string_pretty(&composed)?;
     fs::write(&dest_path, &formatted)?;
 
-    Ok(dest_path)
+    Ok((dest_path, composed))
 }
 
 /// Copy non-config files from a global template's `.devcontainer/` directory to
@@ -188,90 +213,118 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// Set up a temp `~/.dev/` structure for testing. Returns (temp_dir, recipe).
-    /// Caller must set env or use the returned paths directly.
-    fn setup_test_env(
-        global_config: &str,
-        base_config: Option<&str>,
-        runtime_config: Option<&str>,
-        runtime_name: &str,
-    ) -> (TempDir, Value) {
-        let dir = TempDir::new().unwrap();
-        let dev_home = dir.path();
+    /// Build a temp `~/.dev/` tree and a recipe pointing at the `test-lang`
+    /// template in it. Composition then runs against this root through
+    /// [`DevHome::at`], so the assertions below exercise the real production
+    /// path rather than a re-implementation of it.
+    struct TestDevHome {
+        _dir: TempDir,
+        dev_home: DevHome,
+        workspace: PathBuf,
+    }
 
-        // Global template
-        let global_dir = dev_home.join("global/test-lang/.devcontainer");
-        fs::create_dir_all(&global_dir).unwrap();
-        fs::write(global_dir.join("devcontainer.json"), global_config).unwrap();
+    impl TestDevHome {
+        fn new(
+            global_config: &str,
+            base_config: Option<&str>,
+            runtime_config: Option<&str>,
+            runtime_name: &str,
+        ) -> Self {
+            let dir = TempDir::new().unwrap();
+            let root = dir.path().to_path_buf();
 
-        // Base config
-        if let Some(base) = base_config {
-            let base_dir = dev_home.join("base");
-            fs::create_dir_all(&base_dir).unwrap();
-            fs::write(base_dir.join("devcontainer.json"), base).unwrap();
+            let global_dir = root.join("global/test-lang/.devcontainer");
+            fs::create_dir_all(&global_dir).unwrap();
+            fs::write(global_dir.join("devcontainer.json"), global_config).unwrap();
+
+            if let Some(base) = base_config {
+                let base_dir = root.join("base");
+                fs::create_dir_all(&base_dir).unwrap();
+                fs::write(base_dir.join("devcontainer.json"), base).unwrap();
+            }
+
+            if let Some(rt) = runtime_config {
+                let rt_dir = root.join(runtime_name);
+                fs::create_dir_all(&rt_dir).unwrap();
+                fs::write(rt_dir.join("devcontainer.json"), rt).unwrap();
+            }
+
+            let workspace = root.join("projects/demo");
+            fs::create_dir_all(&workspace).unwrap();
+
+            TestDevHome {
+                dev_home: DevHome::at(root),
+                workspace,
+                _dir: dir,
+            }
         }
 
-        // Runtime config
-        if let Some(rt) = runtime_config {
-            let rt_dir = dev_home.join(runtime_name);
-            fs::create_dir_all(&rt_dir).unwrap();
-            fs::write(rt_dir.join("devcontainer.json"), rt).unwrap();
+        fn recipe(&self) -> Recipe {
+            Recipe {
+                global_template: "test-lang".to_string(),
+                features: Vec::new(),
+                options: HashMap::new(),
+                root_folder: self.workspace.to_string_lossy().to_string(),
+                customizations: serde_json::json!({}),
+            }
         }
 
-        // Manually compose using the path helpers
-        let global_path = dev_home.join("global/test-lang/.devcontainer/devcontainer.json");
-        let global = read_json_file(&global_path).unwrap().unwrap();
-
-        let base_path = dev_home.join("base/devcontainer.json");
-        let base = read_json_file(&base_path).unwrap();
-
-        let rt_path = dev_home.join(format!("{runtime_name}/devcontainer.json"));
-        let runtime = read_json_file(&rt_path).unwrap();
-
-        let mut layers = vec![global];
-        if let Some(b) = base {
-            layers.push(b);
-        }
-        if let Some(r) = runtime {
-            layers.push(r);
+        fn compose(&self, recipe: &Recipe, runtime_name: &str, include_base: bool) -> Value {
+            compose_config_in(&self.dev_home, recipe, runtime_name, include_base).unwrap()
         }
 
-        let composed = merge_layers(&layers);
-        (dir, composed)
+        fn persisted(&self) -> Value {
+            let path = self
+                .dev_home
+                .project_devcontainer_dir("demo")
+                .join("devcontainer.json");
+            read_json_file(&path)
+                .unwrap()
+                .expect("composed config should be written")
+        }
     }
 
     #[test]
-    fn test_compose_global_only() {
-        let (_dir, composed) = setup_test_env(
+    fn compose_global_only() {
+        let env = TestDevHome::new(
             r#"{"image": "rust:latest", "remoteUser": "vscode"}"#,
             None,
             None,
             "docker",
         );
+
+        let composed = env.compose(&env.recipe(), "docker", true);
+
         assert_eq!(composed["image"], "rust:latest");
         assert_eq!(composed["remoteUser"], "vscode");
     }
 
     #[test]
-    fn test_compose_base_overrides_global() {
-        let (_dir, composed) = setup_test_env(
+    fn compose_base_overrides_global() {
+        let env = TestDevHome::new(
             r#"{"image": "rust:latest", "remoteUser": "root"}"#,
             Some(r#"{"remoteUser": "vscode"}"#),
             None,
             "docker",
         );
+
+        let composed = env.compose(&env.recipe(), "docker", true);
+
         assert_eq!(composed["image"], "rust:latest");
         assert_eq!(composed["remoteUser"], "vscode");
     }
 
     #[test]
-    fn test_compose_runtime_overrides_all() {
-        let (_dir, composed) = setup_test_env(
+    fn compose_runtime_overrides_all() {
+        let env = TestDevHome::new(
             r#"{"image": "rust:latest", "runArgs": ["--init"]}"#,
             Some(r#"{"remoteUser": "vscode"}"#),
             Some(r#"{"runArgs": ["--userns=keep-id"]}"#),
             "podman",
         );
+
+        let composed = env.compose(&env.recipe(), "podman", true);
+
         assert_eq!(composed["image"], "rust:latest");
         assert_eq!(composed["remoteUser"], "vscode");
         let run_args = composed["runArgs"].as_array().unwrap();
@@ -281,64 +334,176 @@ mod tests {
     }
 
     #[test]
-    fn test_compose_features_merged() {
-        let (_dir, composed) = setup_test_env(
+    fn compose_features_merged() {
+        let env = TestDevHome::new(
             r#"{"image": "rust:latest", "features": {"ghcr.io/features/rust": {}}}"#,
             Some(r#"{"features": {"ghcr.io/features/zsh": {}}}"#),
             None,
             "docker",
         );
+
+        let composed = env.compose(&env.recipe(), "docker", true);
+
         let features = composed["features"].as_object().unwrap();
         assert!(features.contains_key("ghcr.io/features/rust"));
         assert!(features.contains_key("ghcr.io/features/zsh"));
     }
 
     #[test]
-    fn test_substitute_template_options() {
-        let mut value = serde_json::json!({
-            "image": "python:${templateOption:imageVariant}",
-            "remoteUser": "vscode"
-        });
-        let mut opts = HashMap::new();
-        opts.insert("imageVariant".to_string(), "3.11".to_string());
-        super::substitute_template_options(&mut value, &opts);
-        assert_eq!(value["image"], "python:3.11");
-        assert_eq!(value["remoteUser"], "vscode");
-    }
-
-    #[test]
-    fn test_compose_with_customizations() {
-        // Set up layers: global has remoteUser=root, base overrides to vscode
-        let (_dir, composed) = setup_test_env(
+    fn compose_injects_recipe_features_and_customizations() {
+        let env = TestDevHome::new(
             r#"{"image": "rust:latest", "remoteUser": "root", "forwardPorts": [3000]}"#,
             Some(r#"{"remoteUser": "vscode"}"#),
             None,
             "docker",
         );
-        // Base overrides global
-        assert_eq!(composed["remoteUser"], "vscode");
-
-        // Now simulate what compose_config does with customizations:
-        // customizations should override everything
-        let customizations = serde_json::json!({
+        let mut recipe = env.recipe();
+        recipe.features = vec!["ghcr.io/features/node".to_string()];
+        recipe.customizations = serde_json::json!({
             "remoteUser": "developer",
             "forwardPorts": [9090],
             "remoteEnv": {"MY_VAR": "hello"}
         });
 
-        let mut result = composed;
-        if !super::is_empty_object(&customizations) {
-            super::merge_layer(&mut result, &customizations);
-        }
+        let composed = env.compose(&recipe, "docker", true);
 
-        assert_eq!(result["remoteUser"], "developer");
-        // forwardPorts are arrays — should concatenate
-        let ports = result["forwardPorts"].as_array().unwrap();
+        assert_eq!(composed["remoteUser"], "developer");
+        assert!(composed["features"]
+            .as_object()
+            .unwrap()
+            .contains_key("ghcr.io/features/node"));
+        let ports = composed["forwardPorts"].as_array().unwrap();
         assert!(ports.contains(&Value::Number(3000.into())));
         assert!(ports.contains(&Value::Number(9090.into())));
-        // New env from customizations
-        assert_eq!(result["remoteEnv"]["MY_VAR"], "hello");
-        // image preserved from global
-        assert_eq!(result["image"], "rust:latest");
+        assert_eq!(composed["remoteEnv"]["MY_VAR"], "hello");
+        assert_eq!(composed["image"], "rust:latest");
+    }
+
+    #[test]
+    fn compose_applies_template_options() {
+        let env = TestDevHome::new(
+            r#"{"image": "python:${templateOption:imageVariant}", "remoteUser": "vscode"}"#,
+            None,
+            None,
+            "docker",
+        );
+        let mut recipe = env.recipe();
+        recipe
+            .options
+            .insert("imageVariant".to_string(), "3.11".to_string());
+
+        let composed = env.compose(&recipe, "docker", true);
+
+        assert_eq!(composed["image"], "python:3.11");
+        assert_eq!(composed["remoteUser"], "vscode");
+    }
+
+    #[test]
+    fn excluding_the_base_layer_drops_only_base_contributions() {
+        let env = TestDevHome::new(
+            r#"{"image": "rust:latest", "remoteUser": "root"}"#,
+            Some(r#"{"remoteUser": "vscode", "features": {"ghcr.io/features/zsh": {}}}"#),
+            None,
+            "docker",
+        );
+
+        let without_base = env.compose(&env.recipe(), "docker", false);
+
+        assert_eq!(without_base["image"], "rust:latest");
+        assert_eq!(without_base["remoteUser"], "root");
+        assert!(without_base.get("features").is_none());
+    }
+
+    #[test]
+    fn persisted_composition_always_includes_the_base_layer() {
+        let env = TestDevHome::new(
+            r#"{"image": "rust:latest", "remoteUser": "root"}"#,
+            Some(r#"{"remoteUser": "vscode", "features": {"ghcr.io/features/zsh": {}}}"#),
+            None,
+            "docker",
+        );
+        let recipe = env.recipe();
+
+        let (path, returned) = compose_and_write_in(&env.dev_home, &recipe, "docker").unwrap();
+
+        assert_eq!(
+            returned,
+            env.persisted(),
+            "returned value must match the file"
+        );
+        assert_eq!(returned["remoteUser"], "vscode");
+        assert!(path.ends_with("demo/.devcontainer/devcontainer.json"));
+    }
+
+    #[test]
+    fn composing_without_base_leaves_the_persisted_file_untouched() {
+        let env = TestDevHome::new(
+            r#"{"image": "rust:latest", "remoteUser": "root"}"#,
+            Some(r#"{"remoteUser": "vscode", "features": {"ghcr.io/features/zsh": {}}}"#),
+            None,
+            "docker",
+        );
+        let recipe = env.recipe();
+        compose_and_write_in(&env.dev_home, &recipe, "docker").unwrap();
+        let before = env.persisted();
+
+        let run_config = env.compose(&recipe, "docker", false);
+
+        assert_eq!(
+            run_config["remoteUser"], "root",
+            "the run drops the base layer"
+        );
+        assert_eq!(
+            env.persisted(),
+            before,
+            "--no-base must not rewrite the persisted composition"
+        );
+        assert_eq!(env.persisted()["remoteUser"], "vscode");
+    }
+
+    #[test]
+    fn compose_and_write_copies_auxiliary_template_files() {
+        let env = TestDevHome::new(
+            r#"{"build": {"dockerfile": "Dockerfile"}}"#,
+            None,
+            None,
+            "docker",
+        );
+        let aux = env
+            .dev_home
+            .global_template_dir("test-lang")
+            .join("Dockerfile");
+        fs::write(&aux, "FROM ${templateOption:base}\n").unwrap();
+        let mut recipe = env.recipe();
+        recipe
+            .options
+            .insert("base".to_string(), "rust:latest".to_string());
+
+        compose_and_write_in(&env.dev_home, &recipe, "docker").unwrap();
+
+        let copied = env
+            .dev_home
+            .project_devcontainer_dir("demo")
+            .join("Dockerfile");
+        assert_eq!(fs::read_to_string(copied).unwrap(), "FROM rust:latest\n");
+    }
+
+    #[test]
+    fn missing_global_template_names_the_path() {
+        let env = TestDevHome::new(r#"{"image": "rust:latest"}"#, None, None, "docker");
+        let mut recipe = env.recipe();
+        recipe.global_template = "absent".to_string();
+
+        let err = compose_config_in(&env.dev_home, &recipe, "docker", true).unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.contains("absent"),
+            "should name the template: {message}"
+        );
+        assert!(
+            message.contains("global/absent"),
+            "should name the searched path: {message}"
+        );
     }
 }

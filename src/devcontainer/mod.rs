@@ -1,5 +1,6 @@
 pub mod compose;
 pub mod config;
+pub mod effective;
 pub mod features;
 pub mod jsonc;
 pub mod lifecycle;
@@ -10,9 +11,6 @@ pub mod templates;
 pub mod uid;
 pub mod variables;
 
-pub use compose::compose_and_write;
-#[allow(unused_imports)]
-pub use compose::compose_config;
 pub use config::DevcontainerConfig;
 pub use features::{
     download_features, merge_feature_capabilities, resolve_features, stage_feature_context,

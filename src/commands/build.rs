@@ -1,11 +1,15 @@
 use std::path::Path;
 
 use crate::devcontainer::{
-    DevcontainerConfig, Recipe, compose_and_write, download_features,
-    resolve_features, stage_feature_context,
+    Recipe, download_features, resolve_features, stage_feature_context,
 };
-use crate::devcontainer::features::{generate_feature_dockerfile_with_opts, order_features};
-use crate::devcontainer::lockfile::{handle_lockfile, lockfile_path};
+use crate::devcontainer::compose::{compose_and_write, compose_config_with_base};
+use crate::devcontainer::effective::{
+    effective_config_from_value, load_effective_config, LockfilePolicy,
+};
+use crate::devcontainer::features::{
+    feature_image_tag, generate_feature_dockerfile_with_opts, order_features,
+};
 use crate::devcontainer::uid;
 use crate::runtime::{detect_runtime, resolve_remote_user};
 use crate::devcontainer::substitute_variables;
@@ -21,22 +25,37 @@ pub async fn run(
     frozen_lockfile: bool,
     _buildkit: bool,
     update_remote_user_uid_default: &str,
+    no_base: bool,
 ) -> anyhow::Result<()> {
     let runtime = detect_runtime(runtime_override).await?;
-    let config_path = match find_config_source(workspace)? {
-        ConfigSource::Direct(path) => path,
+    let (config_path, composed) = match find_config_source(workspace)? {
+        ConfigSource::Direct(path) => (path, None),
         ConfigSource::Recipe(recipe_path) => {
             let recipe = Recipe::from_path(&recipe_path)?;
-            compose_and_write(&recipe, runtime.runtime_name())?
+            let (path, canonical) = compose_and_write(&recipe, runtime.runtime_name())?;
+            let composed = if no_base {
+                (compose_config_with_base(&recipe, runtime.runtime_name(), false)?, false)
+            } else {
+                (canonical, true)
+            };
+            (path, Some(composed))
         }
     };
-    let config = DevcontainerConfig::from_path(&config_path)?;
+    // Recipe configs resolve their own layers, base included, so the runtime base
+    // layer would be a second application whose prune can discard a base selector
+    // the recipe deliberately kept.
+    let effective = match composed {
+        Some((value, is_persisted)) => effective_config_from_value(value, is_persisted)?,
+        None => load_effective_config(&config_path, !no_base)?,
+    };
+    let lockfile = LockfilePolicy::new(&effective, frozen_lockfile);
+    let config = effective.config;
 
     let folder_image = container_name(workspace);
     let features = resolve_features(&config)?;
     let has_features = !features.is_empty();
     let default_tag = if has_features {
-        format!("{folder_image}-features")
+        feature_image_tag(&folder_image, &config, &features)
     } else {
         folder_image.clone()
     };
@@ -84,9 +103,7 @@ pub async fn run(
         eprintln!("Downloading {} feature(s)...", features.len());
         download_features(&mut features, devcontainer_dir.as_deref()).await?;
 
-        if let Some(ref dc_dir) = devcontainer_dir {
-            handle_lockfile(&lockfile_path(dc_dir), &features, frozen_lockfile)?;
-        }
+        lockfile.apply(devcontainer_dir.as_deref(), &features)?;
 
         let ordered = order_features(&features);
         let staging_dir = stage_feature_context(&ordered)?;
@@ -159,14 +176,14 @@ pub async fn run(
             &compose_env,
         ).await?;
 
-        let feature_tag = format!("{folder_image}-features");
+        let feature_tag = feature_image_tag(&folder_image, &config, &features);
         let compose_final_tag = tag.unwrap_or(&feature_tag);
 
         let mut features = features;
         eprintln!("Downloading {} feature(s)...", features.len());
         download_features(&mut features, Some(compose_devcontainer_dir)).await?;
 
-        handle_lockfile(&lockfile_path(compose_devcontainer_dir), &features, frozen_lockfile)?;
+        lockfile.apply(Some(compose_devcontainer_dir), &features)?;
 
         let ordered = order_features(&features);
         let staging_dir = stage_feature_context(&ordered)?;
@@ -208,9 +225,7 @@ pub async fn run(
     eprintln!("Downloading {} feature(s)...", features.len());
     download_features(&mut features, devcontainer_dir.as_deref()).await?;
 
-    if let Some(ref dc_dir) = devcontainer_dir {
-        handle_lockfile(&lockfile_path(dc_dir), &features, frozen_lockfile)?;
-    }
+    lockfile.apply(devcontainer_dir.as_deref(), &features)?;
 
     let ordered = order_features(&features);
     let staging_dir = stage_feature_context(&ordered)?;

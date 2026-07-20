@@ -159,9 +159,106 @@ pub fn resolve_features(config: &DevcontainerConfig) -> Result<Vec<ResolvedFeatu
     Ok(resolved)
 }
 
+/// Ids of `roots` plus every feature they transitively require via `dependsOn`.
+///
+/// Feature provenance is not recorded on `ResolvedFeature`, so the dependency
+/// closure has to be recomputed from the downloaded metadata. Callers use this to
+/// separate the features a project owns from the ones a lower-priority layer
+/// (e.g. `~/.dev/base/devcontainer.json`) contributed.
+pub fn features_required_by(
+    features: &[ResolvedFeature],
+    roots: &HashSet<String>,
+) -> HashSet<String> {
+    let by_id: HashMap<&str, &ResolvedFeature> =
+        features.iter().map(|f| (f.id.as_str(), f)).collect();
+    let mut reachable: HashSet<String> = HashSet::new();
+    let mut queue: Vec<String> = roots.iter().cloned().collect();
+
+    while let Some(id) = queue.pop() {
+        if !reachable.insert(id.clone()) {
+            continue;
+        }
+        let Some(feature) = by_id.get(id.as_str()) else {
+            continue;
+        };
+        if let Some(deps) = read_depends_on(feature) {
+            for dep_id in deps.keys() {
+                if !reachable.contains(dep_id) {
+                    queue.push(dep_id.clone());
+                }
+            }
+        }
+    }
+
+    reachable
+}
+
+/// Tag for the image produced by layering `features` onto the config's base image.
+///
+/// The digest suffix makes the tag a true cache key, so an image built from a
+/// different effective config (for example one that merged
+/// `~/.dev/base/devcontainer.json` when this one did not) can never be mistaken
+/// for a cache hit.
+///
+/// The hashed inputs must stay in step with everything
+/// [`generate_feature_dockerfile_with_opts`] bakes into the image: the base image
+/// selector, the declared features, the `_REMOTE_USER`/`_CONTAINER_USER` build
+/// environment derived from `remoteUser`, and the `containerEnv`/`remoteEnv` maps
+/// written into the `devcontainer.metadata` label. Fields that never reach the
+/// image (`forwardPorts`, `name`, `customizations`, …) are deliberately excluded
+/// so unrelated edits do not force a rebuild.
+///
+/// `features` may be either the declared set or the post-download set including
+/// transitive dependencies; dependencies are filtered out so both yield the same
+/// digest.
+pub fn feature_image_tag(
+    folder_image: &str,
+    config: &DevcontainerConfig,
+    features: &[ResolvedFeature],
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut declared: Vec<(&str, &serde_json::Value)> = features
+        .iter()
+        .filter(|f| !f.is_dependency)
+        .map(|f| (f.id.as_str(), &f.options))
+        .collect();
+    declared.sort_by(|a, b| a.0.cmp(b.0));
+
+    let build = config.build.as_ref().map(|b| {
+        serde_json::json!({
+            "dockerfile": b.dockerfile,
+            "context": b.context,
+            "args": b.args,
+        })
+    });
+    fn sorted_env(env: &Option<HashMap<String, String>>) -> Option<Vec<(&str, &str)>> {
+        env.as_ref().map(|map| {
+            let mut pairs: Vec<(&str, &str)> =
+                map.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            pairs.sort_by(|a, b| a.0.cmp(b.0));
+            pairs
+        })
+    }
+    let inputs = serde_json::json!({
+        "image": config.image,
+        "build": build,
+        "features": declared,
+        "remoteUser": config.remote_user,
+        "containerEnv": sorted_env(&config.container_env),
+        "remoteEnv": sorted_env(&config.remote_env),
+    });
+
+    let mut hasher = Sha256::new();
+    hasher.update(inputs.to_string().as_bytes());
+    let digest = hex::encode(hasher.finalize());
+
+    format!("{folder_image}-features-{}", &digest[..12])
+}
+
 /// Classify a feature reference string into its kind.
 fn classify_feature_ref(id: &str) -> FeatureRefKind {
-    if id.starts_with("./") || id.starts_with("../") {
+    if id.starts_with("./") || id.starts_with("../") || id.starts_with('/') {
         FeatureRefKind::Local(PathBuf::from(id))
     } else if id.starts_with("https://") {
         FeatureRefKind::Tarball(id.to_string())
@@ -313,8 +410,30 @@ fn read_depends_on(feature: &ResolvedFeature) -> Option<HashMap<String, serde_js
     if !meta_path.exists() {
         return None;
     }
-    let content = std::fs::read_to_string(&meta_path).ok()?;
-    let meta: FeatureJsonMeta = parse_jsonc(&content).ok()?;
+    let content = match std::fs::read_to_string(&meta_path) {
+        Ok(content) => content,
+        Err(e) => {
+            eprintln!(
+                "Warning: cannot read feature metadata for '{}' at {}: {e}. \
+                 Its dependencies will be treated as absent.",
+                feature.id,
+                meta_path.display()
+            );
+            return None;
+        }
+    };
+    let meta: FeatureJsonMeta = match parse_jsonc(&content) {
+        Ok(meta) => meta,
+        Err(e) => {
+            eprintln!(
+                "Warning: cannot parse feature metadata for '{}' at {}: {e}. \
+                 Its dependencies will be treated as absent.",
+                feature.id,
+                meta_path.display()
+            );
+            return None;
+        }
+    };
     meta.depends_on
 }
 

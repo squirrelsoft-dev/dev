@@ -96,7 +96,11 @@ dev base config add features ghcr.io/devcontainers/features/common-utils:2
 dev base config add remoteEnv EDITOR=vim
 ```
 
-If no base config exists, this layer is simply skipped.
+If no base config exists, this layer is simply skipped. Pass `--no-base` to `dev up` or `dev build` to skip it for a single run.
+
+For a project with its own `.devcontainer/devcontainer.json`, the base config is merged in memory only — it is never written into that file, and features it contributes are kept out of the project's `devcontainer-lock.json`.
+
+Recipe-based (user-scoped) projects work differently: their layers are composed ahead of time and the result is written to `~/.dev/devcontainers/<folder>/.devcontainer/devcontainer.json`, so the base layer is baked into that composed file. `--no-base` stays local to the run either way — it never rewrites the composed file without the base layer, so `dev config` keeps showing the same config the next `dev up` will use.
 
 ### Global templates
 
@@ -128,6 +132,8 @@ When you create a workspace with `dev new` or bring one up with `dev up`, the co
 4. Per-project config  (.devcontainer/devcontainer.json or recipe)
 ```
 
+The global template and runtime layers come from a user-scoped recipe, so a project with its own `.devcontainer/devcontainer.json` merges just the base config beneath it.
+
 Higher-priority layers override lower ones, with merge behavior depending on the field type:
 
 | Field type | Merge strategy | Examples |
@@ -136,8 +142,29 @@ Higher-priority layers override lower ones, with merge behavior depending on the
 | Array | Concatenate (deduplicated) | `mounts`, `forwardPorts`, `runArgs` |
 | Map | Merge (higher priority keys win) | `remoteEnv`, `containerEnv` |
 | Features | Union (all features combined) | `features` |
+| Lifecycle commands | Named-command objects union (higher priority wins per name); string and array forms follow scalar rules | `postCreateCommand`, `onCreateCommand` |
 
 **Example:** if your global template sets `image: rust:latest` and your base config sets `remoteUser: vscode` with a zsh feature, the final config gets the Rust image, the vscode user, and both sets of features combined.
+
+Whichever of `image`, `build`, or `dockerComposeFile` a project's own `.devcontainer/devcontainer.json` declares is authoritative: the competing selectors from the base layer are dropped rather than merged, so a base config `image` cannot turn a `build`- or compose-based project into an image-based one.
+
+Command-line overrides such as `dev up --ports` are applied last, on top of the merged result.
+
+### Derived images and disk use
+
+When a config declares features, `dev up` and `dev build` layer them onto a derived image tagged `<folder>-features-<digest>`. The digest covers the effective config values that shape the image: the base image *selector* (`image`, or `build.dockerfile`/`context`/`args`), the declared `features`, `remoteUser`, `containerEnv`, and `remoteEnv`. Edit any of those and the next run builds a new image rather than reusing a stale one — which is what keeps a cached image from silently omitting base-config changes.
+
+The digest covers selectors, not the files they point at. Editing a `Dockerfile` referenced by `build.dockerfile` leaves the digest unchanged, so the cached image is reused; pass `--rebuild` or `--no-cache` after changing Dockerfile contents.
+
+The consequence is that superseded images are left behind rather than overwritten in place. `dev` does not delete them automatically, since it cannot tell which are still in use by stopped containers or other tooling. Reclaim the space with your runtime's own tooling when it starts to matter:
+
+```sh
+# List the derived images for a project
+docker image ls --filter 'reference=<folder>-features-*'
+
+# Remove images not referenced by any container
+docker image prune
+```
 
 ### Workspace vs user scope
 

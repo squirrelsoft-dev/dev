@@ -2,17 +2,20 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::devcontainer::{
-    DevcontainerConfig, Recipe, compose_and_write, download_features,
+    DevcontainerConfig, Recipe, download_features,
     merge_feature_capabilities, resolve_features,
     run_lifecycle_hooks, stage_feature_context, substitute_variables,
     substitute_variables_with_user,
 };
+use crate::devcontainer::compose::{compose_and_write, compose_config_with_base};
 use crate::devcontainer::config::MountSpec;
+use crate::devcontainer::effective::{
+    effective_config_from_value, load_effective_config, LockfilePolicy,
+};
 use crate::devcontainer::features::{
-    MergedCapabilities, ResolvedFeature, capabilities_from_metadata,
+    MergedCapabilities, ResolvedFeature, capabilities_from_metadata, feature_image_tag,
     generate_feature_dockerfile_with_opts, order_features,
 };
-use crate::devcontainer::lockfile::{handle_lockfile, lockfile_path};
 use crate::devcontainer::uid;
 use crate::runtime::{
     BindMount, ContainerConfig, ContainerRuntime, ContainerState, PortMapping, VolumeMount,
@@ -33,23 +36,39 @@ pub async fn run(
     _buildkit: bool,
     update_remote_user_uid_default: &str,
     port_overrides: &[String],
+    no_base: bool,
 ) -> anyhow::Result<()> {
     let runtime = detect_runtime(runtime_override).await?;
-    let config_path = match find_config_source(workspace)? {
-        ConfigSource::Direct(path) => path,
+    let (config_path, composed) = match find_config_source(workspace)? {
+        ConfigSource::Direct(path) => (path, None),
         ConfigSource::Recipe(recipe_path) => {
             let recipe = Recipe::from_path(&recipe_path)?;
-            compose_and_write(&recipe, runtime.runtime_name())?
+            let (path, canonical) = compose_and_write(&recipe, runtime.runtime_name())?;
+            let composed = if no_base {
+                (compose_config_with_base(&recipe, runtime.runtime_name(), false)?, false)
+            } else {
+                (canonical, true)
+            };
+            (path, Some(composed))
         }
     };
-    let config = DevcontainerConfig::from_path(&config_path)?;
+    // Recipe configs resolve their own layers, base included, so the runtime base
+    // layer would be a second application whose prune can discard a base selector
+    // the recipe deliberately kept.
+    let effective = match composed {
+        Some((value, is_persisted)) => effective_config_from_value(value, is_persisted)?,
+        None => load_effective_config(&config_path, !no_base)?,
+    };
+    let lockfile = LockfilePolicy::new(&effective, frozen_lockfile);
+    let mut config = effective.config;
+    apply_cli_overrides(&mut config, port_overrides)?;
 
     // Docker Compose configs take a completely separate code path.
     if config.is_compose() {
         return run_compose(
             workspace, &config, &config_path, runtime.as_ref(),
-            rebuild, no_cache, verbose, frozen_lockfile,
-            update_remote_user_uid_default, port_overrides,
+            rebuild, no_cache, verbose,
+            update_remote_user_uid_default, &lockfile,
         ).await;
     }
 
@@ -120,7 +139,7 @@ pub async fn run(
     let needs_build = config.build.is_some() || has_features;
     let folder_image = container_name(workspace);
     let final_tag = if has_features {
-        format!("{folder_image}-features")
+        feature_image_tag(&folder_image, &config, &initial_features)
     } else {
         folder_image.clone()
     };
@@ -196,10 +215,7 @@ pub async fn run(
             }
 
             // Lockfile handling (Gap 11).
-            if let Some(ref dc_dir) = devcontainer_dir {
-                let lf_path = lockfile_path(dc_dir);
-                handle_lockfile(&lf_path, &features, frozen_lockfile)?;
-            }
+            lockfile.apply(devcontainer_dir.as_deref(), &features)?;
 
             let ordered = order_features(&features);
             if verbose {
@@ -269,11 +285,7 @@ pub async fn run(
         }
     }
 
-    let ports: Vec<PortMapping> = if port_overrides.is_empty() {
-        config.forward_ports.clone().unwrap_or_default()
-    } else {
-        parse_port_overrides(port_overrides)?
-    };
+    let ports: Vec<PortMapping> = config.forward_ports.clone().unwrap_or_default();
     let caddy_host_ports: Vec<crate::caddy::PortEntry> = ports
         .iter()
         .map(|p| crate::caddy::PortEntry { port: p.host, custom_name: None, keepalive: None })
@@ -382,6 +394,16 @@ pub async fn run(
         eprintln!("Warning: Caddy setup failed: {e}");
     }
 
+    Ok(())
+}
+
+fn apply_cli_overrides(
+    config: &mut DevcontainerConfig,
+    port_overrides: &[String],
+) -> anyhow::Result<()> {
+    if !port_overrides.is_empty() {
+        config.forward_ports = Some(parse_port_overrides(port_overrides)?);
+    }
     Ok(())
 }
 
@@ -545,9 +567,8 @@ async fn run_compose(
     _rebuild: bool,
     no_cache: bool,
     verbose: bool,
-    frozen_lockfile: bool,
     update_remote_user_uid_default: &str,
-    port_overrides: &[String],
+    lockfile: &LockfilePolicy,
 ) -> anyhow::Result<()> {
     let compose_data = config.docker_compose_file.as_ref().unwrap();
     let compose_files = compose_data.files();
@@ -630,10 +651,7 @@ async fn run_compose(
         }
 
         // Lockfile handling.
-        if let Some(ref dc_dir) = devcontainer_dir_buf {
-            let lf_path = lockfile_path(dc_dir);
-            handle_lockfile(&lf_path, &features, frozen_lockfile)?;
-        }
+        lockfile.apply(devcontainer_dir_buf.as_deref(), &features)?;
 
         let ordered = order_features(&features);
         if verbose {
@@ -647,7 +665,7 @@ async fn run_compose(
         let feature_user = resolve_remote_user(
             runtime, &base_image, config.remote_user.as_deref(),
         ).await?;
-        let feature_tag = format!("{folder_image}-features");
+        let feature_tag = feature_image_tag(&folder_image, config, &ordered);
         let dockerfile = generate_feature_dockerfile_with_opts(
             &base_image, &ordered, feature_user.as_deref(), config,
         );
@@ -719,11 +737,7 @@ async fn run_compose(
         .map(|s| substitute_variables_with_user(s, workspace, remote_user))
         .collect();
 
-    let ports: Vec<PortMapping> = if port_overrides.is_empty() {
-        config.forward_ports.clone().unwrap_or_default()
-    } else {
-        parse_port_overrides(port_overrides)?
-    };
+    let ports: Vec<PortMapping> = config.forward_ports.clone().unwrap_or_default();
     let caddy_host_ports_compose: Vec<crate::caddy::PortEntry> = ports
         .iter()
         .map(|p| crate::caddy::PortEntry { port: p.host, custom_name: None, keepalive: None })
@@ -952,16 +966,22 @@ fn parse_volumes(volume_strings: &[String]) -> Vec<VolumeMount> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_image_present, parse_mounts, parse_single_mount, substitute_mounts};
-    use crate::devcontainer::config::{MountObject, MountSpec};
+    use super::{
+        apply_cli_overrides, ensure_image_present, parse_mounts, parse_single_mount,
+        substitute_mounts,
+    };
+    use crate::devcontainer::config::{DevcontainerConfig, MountObject, MountSpec};
+    use crate::devcontainer::effective::load_effective_config_value;
     use crate::error::DevError;
     use crate::runtime::{
         AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ExecResult,
         ImageMetadata,
     };
     use std::collections::HashMap;
+    use std::fs;
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tempfile::TempDir;
 
     fn unused<T>() -> BoxFut<'static, T> {
         Box::pin(async {
@@ -969,6 +989,57 @@ mod tests {
                 "FakeRuntime method unused by ensure_image_present".into(),
             ))
         })
+    }
+
+    fn write_project_config(dir: &TempDir, content: &str) -> std::path::PathBuf {
+        let devcontainer_dir = dir.path().join(".devcontainer");
+        fs::create_dir_all(&devcontainer_dir).unwrap();
+        let path = devcontainer_dir.join("devcontainer.json");
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    fn write_base_config(dir: &TempDir, content: &str) -> std::path::PathBuf {
+        let base_dir = dir.path().join("base");
+        fs::create_dir_all(&base_dir).unwrap();
+        let path = base_dir.join("devcontainer.json");
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    fn load_config_with_base(
+        config_path: &Path,
+        include_base: bool,
+        base_config_path: &Path,
+    ) -> DevcontainerConfig {
+        let (value, _) = load_effective_config_value(config_path, include_base, base_config_path)
+            .expect("effective config should load");
+        serde_json::from_value(value).expect("effective config should deserialize")
+    }
+
+    #[test]
+    fn cli_port_overrides_apply_last() {
+        let workspace = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let config_path = write_project_config(
+            &workspace,
+            r#"{"image": "ubuntu:24.04", "forwardPorts": [3000]}"#,
+        );
+        let base_path = write_base_config(&home, r#"{"forwardPorts": [8080]}"#);
+        let mut config = load_config_with_base(&config_path, true, &base_path);
+
+        apply_cli_overrides(
+            &mut config,
+            &["9090:90".to_string(), "7070".to_string()],
+        )
+        .unwrap();
+
+        let ports = config.forward_ports.unwrap();
+        assert_eq!(ports.len(), 2);
+        assert_eq!(ports[0].host, 9090);
+        assert_eq!(ports[0].container, 90);
+        assert_eq!(ports[1].host, 7070);
+        assert_eq!(ports[1].container, 7070);
     }
 
     /// Minimal fake runtime: records `pull_image` calls and returns a fixed
