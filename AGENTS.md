@@ -15,7 +15,8 @@
 - (add rules here as you discover repeated issues)
 
 # Learnings
-- Tests are in-file `#[cfg(test)] mod tests`; there is no `tests/` directory.
+- The `devcontainer` crate's tests are all in-file `#[cfg(test)] mod tests`; it has no `tests/`
+  directory (the vendored `crates/buildkit-client-patch` is the exception).
 - Anything that reads `~/.dev` takes a `&DevHome` in an `*_in` variant (`src/util/paths.rs`);
   test against those with `DevHome::at(tmp)` rather than the `current()`-based wrappers.
 - `cargo fmt --check` is dirty repo-wide on `main`, so it is not a useful signal.
