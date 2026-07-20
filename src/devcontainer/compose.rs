@@ -11,10 +11,10 @@ use crate::devcontainer::effective::{
 };
 use crate::devcontainer::jsonc::parse_jsonc;
 use crate::devcontainer::merge::{merge_layer, merge_layers};
-use crate::devcontainer::recipe::{is_empty_object, Recipe};
+use crate::devcontainer::recipe::{Recipe, is_empty_object};
 use crate::error::DevError;
 use crate::util::paths::DevHome;
-use crate::util::workspace::{find_config_source_in, ConfigSource};
+use crate::util::workspace::{ConfigSource, find_config_source_in};
 
 /// Read a JSON file, stripping comments and trailing commas. Returns `None` if the file doesn't exist.
 fn read_json_file(path: &Path) -> anyhow::Result<Option<Value>> {
@@ -689,10 +689,12 @@ mod tests {
         let composed = env.compose(&recipe, "docker", true);
 
         assert_eq!(composed["remoteUser"], "developer");
-        assert!(composed["features"]
-            .as_object()
-            .unwrap()
-            .contains_key("ghcr.io/features/node"));
+        assert!(
+            composed["features"]
+                .as_object()
+                .unwrap()
+                .contains_key("ghcr.io/features/node")
+        );
         let ports = composed["forwardPorts"].as_array().unwrap();
         assert!(ports.contains(&Value::Number(3000.into())));
         assert!(ports.contains(&Value::Number(9090.into())));
@@ -753,9 +755,11 @@ mod tests {
             compose_recipe_config_in(&env.dev_home, &recipe_path, &recipe, "docker", true).unwrap();
 
         assert_eq!(returned.value["remoteUser"], "vscode");
-        assert!(returned
-            .config_path
-            .ends_with("demo/.devcontainer/devcontainer.json"));
+        assert!(
+            returned
+                .config_path
+                .ends_with("demo/.devcontainer/devcontainer.json")
+        );
         assert!(
             !returned.config_path.exists(),
             "the composed devcontainer.json is a virtual path for recipe projects"
@@ -1137,10 +1141,12 @@ mod tests {
             recipe_json_before,
             "a build must not rewrite the recipe"
         );
-        assert!(Recipe::from_path(&recipe_path)
-            .unwrap()
-            .generated
-            .is_empty());
+        assert!(
+            Recipe::from_path(&recipe_path)
+                .unwrap()
+                .generated
+                .is_empty()
+        );
     }
 
     /// The deliberate consequence of the above: a file `dev up` created is

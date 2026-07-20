@@ -80,7 +80,7 @@ dev base config set remoteUser vscode
 
 ## Layered configuration
 
-`dev` uses a layered config system so you can set preferences once and have them apply everywhere. When you run `dev new` or `dev up`, these layers merge together to produce the final `devcontainer.json`.
+`dev` uses a layered config system so you can set preferences once and have them apply everywhere. When you run `dev up` or `dev build`, these layers merge together to produce the final config.
 
 ### Base config
 
@@ -98,7 +98,7 @@ dev base config add remoteEnv EDITOR=vim
 
 If no base config exists, this layer is simply skipped. Pass `--no-base` to `dev up` or `dev build` to skip it for a single run.
 
-For a project with its own `.devcontainer/devcontainer.json`, the base config is merged in memory only — it is never written into that file, and features it contributes are kept out of the project's `devcontainer-lock.json`.
+The base config is merged in memory only — it is never written into the project's own config, and features it contributes are kept out of the project's `devcontainer-lock.json`. This holds for both a project with its own `.devcontainer/devcontainer.json` and a recipe-based one.
 
 Recipe-based projects keep `recipe.json` as the durable source of truth. `dev up` and `dev build` compose the recipe in memory with the current base and runtime layers, so edits to `~/.dev/base/devcontainer.json` take effect on the next run without regenerating project state. `--no-base` stays local to that invocation.
 
@@ -123,7 +123,7 @@ dev global remove my-rust
 
 ### How layers merge
 
-When you create a workspace with `dev new` or bring one up with `dev up`, the config layers merge in this order (lowest to highest priority):
+When you bring a workspace up with `dev up` or build it with `dev build`, the config layers merge in this order (lowest to highest priority):
 
 ```
 1. Global template     (~/.dev/global/<name>/...)
@@ -132,7 +132,7 @@ When you create a workspace with `dev new` or bring one up with `dev up`, the co
 4. Per-project config  (.devcontainer/devcontainer.json or recipe)
 ```
 
-The global template and runtime layers come from a user-scoped recipe, so a project with its own `.devcontainer/devcontainer.json` merges just the base config beneath it.
+The global template and runtime layers come from a recipe, so a project with its own `.devcontainer/devcontainer.json` merges just the base config beneath it.
 
 Higher-priority layers override lower ones, with merge behavior depending on the field type:
 
@@ -147,6 +147,8 @@ Higher-priority layers override lower ones, with merge behavior depending on the
 **Example:** if your global template sets `image: rust:latest` and your base config sets `remoteUser: vscode` with a zsh feature, the final config gets the Rust image, the vscode user, and both sets of features combined.
 
 Whichever of `image`, `build`, or `dockerComposeFile` a project's own `.devcontainer/devcontainer.json` declares is authoritative: the competing selectors from the base layer are dropped rather than merged, so a base config `image` cannot turn a `build`- or compose-based project into an image-based one.
+
+A recipe project has no `devcontainer.json`, so the same rule applies to the highest layer that declares a selector — the recipe's own overrides, then the runtime layer, then the base config. `dev config set image` on a recipe therefore drops a `build` inherited from the global template.
 
 Command-line overrides such as `dev up --ports` are applied last, on top of the merged result.
 
@@ -211,7 +213,7 @@ Caddy only needs to be started once — it persists across reboots and `dev` han
 
 ### How it works
 
-When you run `dev up`, if `forwardPorts` is configured in your `devcontainer.json`, `dev` will:
+When you run `dev up`, if `forwardPorts` is configured in your merged devcontainer config, `dev` will:
 
 1. Write a Caddy config fragment to `~/.dev/caddy/sites/<appname>.caddy`
 2. Signal Caddy to reload

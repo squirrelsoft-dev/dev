@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::util::paths::{devcontainers_dir, vscode_configs_dir};
-use crate::util::workspace::{find_config_source, ConfigSource};
+use crate::util::workspace::{ConfigSource, find_config_source};
 use crate::util::workspace_folder_name;
 
 /// Re-link VS Code's remote-containers entry for a legacy user-scoped

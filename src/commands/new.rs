@@ -176,7 +176,10 @@ async fn apply_global_template(
 /// `find_config_source` rejects a directory holding both, so writing one anyway
 /// would leave every later `dev up`/`build`/`config` failing until the user
 /// deleted a file by hand.
-fn ensure_recipe_can_own_workspace(workspace: &Path, devcontainer_dir: &Path) -> anyhow::Result<()> {
+fn ensure_recipe_can_own_workspace(
+    workspace: &Path,
+    devcontainer_dir: &Path,
+) -> anyhow::Result<()> {
     for existing in [
         devcontainer_dir.join("devcontainer.json"),
         workspace.join(".devcontainer.json"),

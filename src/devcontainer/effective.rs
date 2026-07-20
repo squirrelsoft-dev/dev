@@ -1062,7 +1062,8 @@ mod tests {
 
     #[test]
     fn composed_config_reports_parse_errors() {
-        let Err(err) = effective_config_from_parts(serde_json::json!({"image": 42}), HashSet::new())
+        let Err(err) =
+            effective_config_from_parts(serde_json::json!({"image": 42}), HashSet::new())
         else {
             panic!("a non-string image must not deserialize");
         };
