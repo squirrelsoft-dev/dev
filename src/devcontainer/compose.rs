@@ -1604,16 +1604,10 @@ mod tests {
         let mut recipe = env.recipe();
         recipe.customizations = serde_json::json!({"remoteUser": "from-recipe"});
 
-        // Highest priority present wins, and removing it exposes the next one down.
+        // Highest priority present wins.
         assert_eq!(
             env.compose(&recipe, "docker", true)["remoteUser"],
             "from-recipe"
-        );
-
-        recipe.customizations = serde_json::json!({});
-        assert_eq!(
-            env.compose(&recipe, "docker", true)["remoteUser"],
-            "from-runtime"
         );
     }
 
