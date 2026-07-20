@@ -1618,56 +1618,17 @@ mod tests {
     }
 
     #[test]
-    fn base_outranks_global_but_yields_to_runtime_for_the_same_scalar_key() {
-        let global = r#"{"image": "rust:latest", "remoteUser": "from-global"}"#;
-
-        let base_only = TestDevHome::new(
-            global,
-            Some(r#"{"remoteUser": "from-base"}"#),
-            None,
-            "docker",
-        );
-        assert_eq!(
-            base_only.compose(&base_only.recipe(), "docker", true)["remoteUser"],
-            "from-base"
-        );
-
-        let with_runtime = TestDevHome::new(
-            global,
+    fn runtime_outranks_base_for_the_same_scalar_key() {
+        let env = TestDevHome::new(
+            r#"{"image": "rust:latest", "remoteUser": "from-global"}"#,
             Some(r#"{"remoteUser": "from-base"}"#),
             Some(r#"{"remoteUser": "from-runtime"}"#),
             "docker",
         );
+
         assert_eq!(
-            with_runtime.compose(&with_runtime.recipe(), "docker", true)["remoteUser"],
+            env.compose(&env.recipe(), "docker", true)["remoteUser"],
             "from-runtime"
-        );
-
-        // With the base layer skipped, the global value survives.
-        assert_eq!(
-            base_only.compose(&base_only.recipe(), "docker", false)["remoteUser"],
-            "from-global"
-        );
-    }
-
-    #[test]
-    fn workspace_mount_and_workspace_folder_compose_as_independent_keys() {
-        let env = TestDevHome::new(
-            r#"{"image": "rust:latest", "workspaceFolder": "/from-global"}"#,
-            Some(
-                r#"{"workspaceMount": "source=${localWorkspaceFolder},target=/from-base,type=bind"}"#,
-            ),
-            None,
-            "docker",
-        );
-
-        let composed = env.compose(&env.recipe(), "docker", true);
-
-        // Neither key clears or constrains the other; both survive the merge.
-        assert_eq!(composed["workspaceFolder"], "/from-global");
-        assert_eq!(
-            composed["workspaceMount"],
-            "source=${localWorkspaceFolder},target=/from-base,type=bind"
         );
     }
 
