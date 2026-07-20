@@ -1,10 +1,4 @@
-use std::fs;
-use std::path::Path;
-
 use serde_json::Value;
-
-use super::jsonc::parse_jsonc;
-use crate::util::paths::base_config_dir;
 
 /// Fields where the base config value should override the template (scalar semantics).
 const SCALAR_FIELDS: &[&str] = &["name", "image", "remoteUser", "shutdownAction", "waitFor"];
@@ -98,40 +92,6 @@ pub fn merge_layers(layers: &[Value]) -> Value {
     result
 }
 
-/// Merge the user's base config (`~/.dev/base/devcontainer.json`) into a destination
-/// devcontainer.json file. Returns `true` if a merge was performed, `false` if no
-/// base config exists.
-pub fn merge_base_config(dest: &Path) -> anyhow::Result<bool> {
-    let base_config_path = base_config_dir().join("devcontainer.json");
-    if !base_config_path.is_file() {
-        return Ok(false);
-    }
-
-    let dest_config_path = dest.join(".devcontainer/devcontainer.json");
-    if !dest_config_path.is_file() {
-        return Ok(false);
-    }
-
-    // Read base config
-    let base_raw = fs::read_to_string(&base_config_path)?;
-    let base: Value = parse_jsonc(&base_raw)?;
-
-    if base.as_object().map(|o| o.is_empty()).unwrap_or(true) {
-        return Ok(false);
-    }
-
-    // Read dest config
-    let dest_raw = fs::read_to_string(&dest_config_path)?;
-    let mut dest_json: Value = parse_jsonc(&dest_raw)?;
-
-    merge_layer(&mut dest_json, &base);
-
-    let formatted = serde_json::to_string_pretty(&dest_json)?;
-    fs::write(&dest_config_path, formatted)?;
-
-    Ok(true)
-}
-
 /// Union feature maps: base features are added to template features.
 /// If both have the same feature, base options override.
 fn merge_feature_map(dest_obj: &mut serde_json::Map<String, Value>, key: &str, base_val: &Value) {
@@ -193,6 +153,7 @@ fn merge_map(dest_obj: &mut serde_json::Map<String, Value>, key: &str, base_val:
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::Path;
     use tempfile::TempDir;
 
     fn setup_merge_test(

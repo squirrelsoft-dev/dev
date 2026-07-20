@@ -205,7 +205,7 @@ pub enum Command {
 
 #[derive(Subcommand, Debug)]
 pub enum VscodeAction {
-    /// Repair VS Code symlinks for devcontainer configs
+    /// Re-link a legacy user-scoped devcontainer.json for VS Code
     Repair,
 }
 

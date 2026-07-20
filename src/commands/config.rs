@@ -6,15 +6,19 @@ use serde_json::Value;
 
 use crate::cli::ConfigAction;
 use crate::collection::{fetch_all_features, fetch_collection_index};
+use crate::devcontainer::compose::compose_recipe_config;
 use crate::devcontainer::recipe::Recipe;
+use crate::runtime::detect_runtime;
 use crate::tui::prompts;
-use crate::util::workspace::{find_config_source, find_devcontainer_config, ConfigSource};
+use crate::util::workspace::{ConfigSource, find_config_source};
 
 /// Tracks where config changes should be written.
 struct ConfigTarget<'a> {
-    /// The composed devcontainer.json (always written for immediate effect).
-    config_path: &'a Path,
-    /// If present, also persist changes to recipe.json customizations.
+    /// The concrete devcontainer.json for direct configs.
+    config_path: Option<&'a Path>,
+    /// The effective config value for recipe configs.
+    config_value: Option<Value>,
+    /// If present, persist changes to recipe.json customizations.
     recipe_path: Option<&'a Path>,
 }
 
@@ -27,13 +31,28 @@ pub async fn run_workspace(
     match find_config_source(workspace)? {
         ConfigSource::Direct(path) => run(&path, action, verbose).await,
         ConfigSource::Recipe(recipe_path) => {
-            let config_path = find_devcontainer_config(workspace)?;
+            let recipe = Recipe::from_path(&recipe_path)?;
+            let composed =
+                compose_recipe_config(&recipe_path, &recipe, &detected_runtime_name().await, true)?;
             let target = ConfigTarget {
-                config_path: &config_path,
+                config_path: None,
+                config_value: Some(composed.value),
                 recipe_path: Some(&recipe_path),
             };
             run_with_target(&target, action, verbose).await
         }
+    }
+}
+
+/// The runtime whose `~/.dev/<runtime>/devcontainer.json` layer `dev up` would apply.
+///
+/// `dev config` only reads, so a machine with no reachable runtime should still be
+/// able to inspect its config; falling back to `docker` keeps that working and
+/// matches the layer `dev up` picks by default.
+async fn detected_runtime_name() -> String {
+    match detect_runtime(None).await {
+        Ok(runtime) => runtime.runtime_name().to_string(),
+        Err(_) => "docker".to_string(),
     }
 }
 
@@ -45,7 +64,8 @@ pub async fn run(
     verbose: u8,
 ) -> anyhow::Result<()> {
     let target = ConfigTarget {
-        config_path,
+        config_path: Some(config_path),
+        config_value: None,
         recipe_path: None,
     };
     run_with_target(&target, action, verbose).await
@@ -58,17 +78,11 @@ async fn run_with_target(
     verbose: u8,
 ) -> anyhow::Result<()> {
     match action {
-        Some(ConfigAction::Set { property, value }) => {
-            config_set(target, &property, &value)
-        }
+        Some(ConfigAction::Set { property, value }) => config_set(target, &property, &value),
         Some(ConfigAction::Unset { property }) => config_unset(target, &property),
-        Some(ConfigAction::Add { property, value }) => {
-            config_add(target, &property, &value)
-        }
-        Some(ConfigAction::Remove { property, value }) => {
-            config_remove(target, &property, &value)
-        }
-        Some(ConfigAction::List) => config_list(target.config_path),
+        Some(ConfigAction::Add { property, value }) => config_add(target, &property, &value),
+        Some(ConfigAction::Remove { property, value }) => config_remove(target, &property, &value),
+        Some(ConfigAction::List) => config_list(target),
         None => interactive(target, verbose).await,
     }
 }
@@ -116,6 +130,26 @@ fn write_config(path: &Path, json: &Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn read_target_config(target: &ConfigTarget<'_>) -> anyhow::Result<Value> {
+    if let Some(value) = &target.config_value {
+        return Ok(value.clone());
+    }
+    let path = target
+        .config_path
+        .ok_or_else(|| anyhow::anyhow!("No devcontainer.json path for config target"))?;
+    read_config(path)
+}
+
+fn write_target_config(target: &ConfigTarget<'_>, json: &Value) -> anyhow::Result<()> {
+    if target.recipe_path.is_some() {
+        return Ok(());
+    }
+    let path = target
+        .config_path
+        .ok_or_else(|| anyhow::anyhow!("No devcontainer.json path for config target"))?;
+    write_config(path, json)
+}
+
 // --- Pure mutation functions (operate on a JSON object in memory) ---
 
 fn apply_set(obj: &mut serde_json::Map<String, Value>, property: &str, value: &str) -> String {
@@ -159,9 +193,7 @@ fn apply_add(
                 .or_insert_with(|| Value::Array(Vec::new()));
             if let Some(vec) = arr.as_array_mut() {
                 if property == "forwardPorts" {
-                    let new_value = if let Some((host_str, container_str)) =
-                        value.split_once(':')
-                    {
+                    let new_value = if let Some((host_str, container_str)) = value.split_once(':') {
                         let _host: u16 = host_str
                             .parse()
                             .map_err(|_| anyhow::anyhow!("Invalid host port in: {value}"))?;
@@ -340,12 +372,12 @@ fn persist_to_recipe(
 // --- Action handlers (read file, apply mutation, write file, optionally persist to recipe) ---
 
 fn config_set(target: &ConfigTarget<'_>, property: &str, value: &str) -> anyhow::Result<()> {
-    let mut json = read_config(target.config_path)?;
+    let mut json = read_target_config(target)?;
     let obj = json
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("devcontainer.json is not a JSON object"))?;
     let msg = apply_set(obj, property, value);
-    write_config(target.config_path, &json)?;
+    write_target_config(target, &json)?;
     println!("{msg}");
 
     if let Some(recipe_path) = target.recipe_path {
@@ -358,12 +390,12 @@ fn config_set(target: &ConfigTarget<'_>, property: &str, value: &str) -> anyhow:
 }
 
 fn config_unset(target: &ConfigTarget<'_>, property: &str) -> anyhow::Result<()> {
-    let mut json = read_config(target.config_path)?;
+    let mut json = read_target_config(target)?;
     let obj = json
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("devcontainer.json is not a JSON object"))?;
     let msg = apply_unset(obj, property);
-    write_config(target.config_path, &json)?;
+    write_target_config(target, &json)?;
     println!("{msg}");
 
     if let Some(recipe_path) = target.recipe_path {
@@ -376,12 +408,12 @@ fn config_unset(target: &ConfigTarget<'_>, property: &str) -> anyhow::Result<()>
 }
 
 fn config_add(target: &ConfigTarget<'_>, property: &str, value: &str) -> anyhow::Result<()> {
-    let mut json = read_config(target.config_path)?;
+    let mut json = read_target_config(target)?;
     let obj = json
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("devcontainer.json is not a JSON object"))?;
     let msg = apply_add(obj, property, value)?;
-    write_config(target.config_path, &json)?;
+    write_target_config(target, &json)?;
     println!("{msg}");
 
     if let Some(recipe_path) = target.recipe_path {
@@ -394,12 +426,12 @@ fn config_add(target: &ConfigTarget<'_>, property: &str, value: &str) -> anyhow:
 }
 
 fn config_remove(target: &ConfigTarget<'_>, property: &str, value: &str) -> anyhow::Result<()> {
-    let mut json = read_config(target.config_path)?;
+    let mut json = read_target_config(target)?;
     let obj = json
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("devcontainer.json is not a JSON object"))?;
     let msg = apply_remove(obj, property, value)?;
-    write_config(target.config_path, &json)?;
+    write_target_config(target, &json)?;
     println!("{msg}");
 
     if let Some(recipe_path) = target.recipe_path {
@@ -411,19 +443,13 @@ fn config_remove(target: &ConfigTarget<'_>, property: &str, value: &str) -> anyh
     Ok(())
 }
 
-fn config_list(path: &Path) -> anyhow::Result<()> {
-    let json = read_config(path)?;
+fn config_list(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
+    let json = read_target_config(target)?;
     let obj = json
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("devcontainer.json is not a JSON object"))?;
 
-    let scalar_keys = [
-        "name",
-        "image",
-        "remoteUser",
-        "shutdownAction",
-        "waitFor",
-    ];
+    let scalar_keys = ["name", "image", "remoteUser", "shutdownAction", "waitFor"];
     // Scalars
     for key in &scalar_keys {
         if let Some(val) = obj.get(*key) {
@@ -541,7 +567,7 @@ async fn interactive(target: &ConfigTarget<'_>, verbose: u8) -> anyhow::Result<(
         4 => interactive_mounts(target)?,
         5 => interactive_lifecycle(target)?,
         6 => interactive_other(target)?,
-        7 => config_list(target.config_path)?,
+        7 => config_list(target)?,
         _ => unreachable!(),
     }
 
@@ -549,11 +575,8 @@ async fn interactive(target: &ConfigTarget<'_>, verbose: u8) -> anyhow::Result<(
 }
 
 fn interactive_image(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
-    let json = read_config(target.config_path)?;
-    let current = json
-        .get("image")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let json = read_target_config(target)?;
+    let current = json.get("image").and_then(|v| v.as_str()).unwrap_or("");
 
     let prompt = if current.is_empty() {
         "Container image".to_string()
@@ -598,7 +621,7 @@ async fn interactive_features(target: &ConfigTarget<'_>, _verbose: u8) -> anyhow
             }
 
             // Get currently selected features for pre-selection
-            let json = read_config(target.config_path)?;
+            let json = read_target_config(target)?;
             let preselected: Vec<String> = json
                 .get("features")
                 .and_then(|v| v.as_object())
@@ -615,7 +638,7 @@ async fn interactive_features(target: &ConfigTarget<'_>, _verbose: u8) -> anyhow
         }
         1 => {
             // Remove features
-            let json = read_config(target.config_path)?;
+            let json = read_target_config(target)?;
             let features: Vec<String> = json
                 .get("features")
                 .and_then(|v| v.as_object())
@@ -660,13 +683,11 @@ fn interactive_ports(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
 
     match selection {
         0 => {
-            let port: String = Input::new()
-                .with_prompt("Port number")
-                .interact_text()?;
+            let port: String = Input::new().with_prompt("Port number").interact_text()?;
             config_add(target, "forwardPorts", &port)?;
         }
         1 => {
-            let json = read_config(target.config_path)?;
+            let json = read_target_config(target)?;
             let ports: Vec<String> = json
                 .get("forwardPorts")
                 .and_then(|v| v.as_array())
@@ -712,13 +733,11 @@ fn interactive_env(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
 
     match action_sel {
         0 => {
-            let kv: String = Input::new()
-                .with_prompt("KEY=VALUE")
-                .interact_text()?;
+            let kv: String = Input::new().with_prompt("KEY=VALUE").interact_text()?;
             config_add(target, env_key, &kv)?;
         }
         1 => {
-            let json = read_config(target.config_path)?;
+            let json = read_target_config(target)?;
             let keys: Vec<String> = json
                 .get(env_key)
                 .and_then(|v| v.as_object())
@@ -760,7 +779,7 @@ fn interactive_mounts(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
             config_add(target, "mounts", &mount)?;
         }
         1 => {
-            let json = read_config(target.config_path)?;
+            let json = read_target_config(target)?;
             let mounts: Vec<String> = json
                 .get("mounts")
                 .and_then(|v| v.as_array())
@@ -795,7 +814,7 @@ fn interactive_lifecycle(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
 
     let key = LIFECYCLE_COMMANDS[sel];
 
-    let json = read_config(target.config_path)?;
+    let json = read_target_config(target)?;
     let current = json.get(key);
 
     // Show current value
@@ -837,23 +856,19 @@ fn interactive_lifecycle(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
 
     match action_sel {
         0 => {
-            let value: String = Input::new()
-                .with_prompt("Command")
-                .interact_text()?;
+            let value: String = Input::new().with_prompt("Command").interact_text()?;
             config_set(target, key, &value)?;
         }
         1 => {
             let label: String = Input::new()
                 .with_prompt("Label (e.g. build, test, install)")
                 .interact_text()?;
-            let cmd: String = Input::new()
-                .with_prompt("Command")
-                .interact_text()?;
+            let cmd: String = Input::new().with_prompt("Command").interact_text()?;
             config_add(target, key, &format!("{label}={cmd}"))?;
         }
         2 => {
             // Show labels to pick from
-            let json = read_config(target.config_path)?;
+            let json = read_target_config(target)?;
             if let Some(map) = json.get(key).and_then(|v| v.as_object()) {
                 let labels: Vec<String> = map.keys().cloned().collect();
                 if labels.is_empty() {
@@ -890,11 +905,8 @@ fn interactive_other(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
 
     let key = properties[sel];
 
-    let json = read_config(target.config_path)?;
-    let current = json
-        .get(key)
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let json = read_target_config(target)?;
+    let current = json.get(key).and_then(|v| v.as_str()).unwrap_or("");
 
     let prompt = if current.is_empty() {
         key.to_string()
@@ -920,7 +932,7 @@ fn interactive_other(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::fs;
     use tempfile::TempDir;
 
@@ -933,7 +945,8 @@ mod tests {
 
     fn target_for(path: &Path) -> ConfigTarget<'_> {
         ConfigTarget {
-            config_path: path,
+            config_path: Some(path),
+            config_value: None,
             recipe_path: None,
         }
     }
@@ -1031,8 +1044,7 @@ mod tests {
 
     #[test]
     fn test_config_remove_port_mapping() {
-        let (_dir, path) =
-            setup_config(r#"{"forwardPorts": [3000, "3011:3000"]}"#);
+        let (_dir, path) = setup_config(r#"{"forwardPorts": [3000, "3011:3000"]}"#);
         config_remove(&target_for(&path), "forwardPorts", "3011:3000").unwrap();
         let json = read_config(&path).unwrap();
         let ports = json["forwardPorts"].as_array().unwrap();
@@ -1117,8 +1129,7 @@ mod tests {
 
     #[test]
     fn test_config_add_lifecycle_merges_into_existing_object() {
-        let (_dir, path) =
-            setup_config(r#"{"postCreateCommand": {"build": "npm run build"}}"#);
+        let (_dir, path) = setup_config(r#"{"postCreateCommand": {"build": "npm run build"}}"#);
         config_add(&target_for(&path), "postCreateCommand", "test=npm test").unwrap();
         let json = read_config(&path).unwrap();
         let obj = json["postCreateCommand"].as_object().unwrap();
@@ -1206,14 +1217,14 @@ mod tests {
             r#"{"postCreateCommand": {"build": "npm run build", "test": "npm test"}}"#,
         );
         // Just verify it doesn't error
-        config_list(&path).unwrap();
+        config_list(&target_for(&path)).unwrap();
     }
 
     #[test]
     fn test_config_list_lifecycle_array() {
         let (_dir, path) =
             setup_config(r#"{"postCreateCommand": ["npm install", "npm run build"]}"#);
-        config_list(&path).unwrap();
+        config_list(&target_for(&path)).unwrap();
     }
 
     #[test]
@@ -1243,10 +1254,10 @@ mod tests {
             }"#,
         );
         // Just verify it doesn't error
-        config_list(&path).unwrap();
+        config_list(&target_for(&path)).unwrap();
     }
 
-    // --- Recipe dual-write tests ---
+    // --- Recipe persistence tests ---
 
     fn setup_recipe(config_content: &str) -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
         let dir = TempDir::new().unwrap();
@@ -1257,25 +1268,29 @@ mod tests {
             global_template: "test".to_string(),
             features: Vec::new(),
             options: HashMap::new(),
-            root_folder: "/tmp/proj".to_string(),
             customizations: Value::Object(serde_json::Map::new()),
+            generated: BTreeMap::new(),
         };
         recipe.write_to(&recipe_path).unwrap();
         (dir, config_path, recipe_path)
     }
 
+    fn recipe_target<'a>(config_value: Value, recipe_path: &'a Path) -> ConfigTarget<'a> {
+        ConfigTarget {
+            config_path: None,
+            config_value: Some(config_value),
+            recipe_path: Some(recipe_path),
+        }
+    }
+
     #[test]
-    fn test_recipe_dual_write_set() {
+    fn test_recipe_persistence_set_does_not_write_composed_config() {
         let (_dir, config_path, recipe_path) = setup_recipe(r#"{"image": "ubuntu"}"#);
-        let target = ConfigTarget {
-            config_path: &config_path,
-            recipe_path: Some(&recipe_path),
-        };
+        let before = fs::read_to_string(&config_path).unwrap();
+        let target = recipe_target(serde_json::json!({"image": "ubuntu"}), &recipe_path);
         config_set(&target, "remoteUser", "vscode").unwrap();
 
-        // Verify composed config
-        let json = read_config(&config_path).unwrap();
-        assert_eq!(json["remoteUser"], "vscode");
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), before);
 
         // Verify recipe customizations
         let recipe = Recipe::from_path(&recipe_path).unwrap();
@@ -1283,12 +1298,9 @@ mod tests {
     }
 
     #[test]
-    fn test_recipe_dual_write_unset() {
-        let (_dir, config_path, recipe_path) = setup_recipe(r#"{"remoteUser": "vscode"}"#);
-        let target = ConfigTarget {
-            config_path: &config_path,
-            recipe_path: Some(&recipe_path),
-        };
+    fn test_recipe_persistence_unset() {
+        let (_dir, _config_path, recipe_path) = setup_recipe(r#"{"remoteUser": "vscode"}"#);
+        let target = recipe_target(serde_json::json!({"remoteUser": "vscode"}), &recipe_path);
 
         // First set via recipe, then unset
         config_set(&target, "remoteUser", "developer").unwrap();
@@ -1299,18 +1311,13 @@ mod tests {
     }
 
     #[test]
-    fn test_recipe_dual_write_add_port() {
+    fn test_recipe_persistence_add_port() {
         let (_dir, config_path, recipe_path) = setup_recipe(r#"{"forwardPorts": [3000]}"#);
-        let target = ConfigTarget {
-            config_path: &config_path,
-            recipe_path: Some(&recipe_path),
-        };
+        let before = fs::read_to_string(&config_path).unwrap();
+        let target = recipe_target(serde_json::json!({"forwardPorts": [3000]}), &recipe_path);
         config_add(&target, "forwardPorts", "9090").unwrap();
 
-        // Verify composed config has both
-        let json = read_config(&config_path).unwrap();
-        let ports = json["forwardPorts"].as_array().unwrap();
-        assert_eq!(ports.len(), 2);
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), before);
 
         // Verify recipe customizations has only the addition
         let recipe = Recipe::from_path(&recipe_path).unwrap();
@@ -1320,12 +1327,9 @@ mod tests {
     }
 
     #[test]
-    fn test_recipe_dual_write_add_env() {
-        let (_dir, config_path, recipe_path) = setup_recipe(r#"{}"#);
-        let target = ConfigTarget {
-            config_path: &config_path,
-            recipe_path: Some(&recipe_path),
-        };
+    fn test_recipe_persistence_add_env() {
+        let (_dir, _config_path, recipe_path) = setup_recipe(r#"{}"#);
+        let target = recipe_target(serde_json::json!({}), &recipe_path);
         config_add(&target, "remoteEnv", "MY_VAR=hello").unwrap();
 
         let recipe = Recipe::from_path(&recipe_path).unwrap();
@@ -1333,12 +1337,9 @@ mod tests {
     }
 
     #[test]
-    fn test_recipe_dual_write_remove_from_customizations() {
-        let (_dir, config_path, recipe_path) = setup_recipe(r#"{"forwardPorts": [3000]}"#);
-        let target = ConfigTarget {
-            config_path: &config_path,
-            recipe_path: Some(&recipe_path),
-        };
+    fn test_recipe_persistence_remove_from_customizations() {
+        let (_dir, _config_path, recipe_path) = setup_recipe(r#"{"forwardPorts": [3000]}"#);
+        let target = recipe_target(serde_json::json!({"forwardPorts": [3000]}), &recipe_path);
         // Add then remove
         config_add(&target, "forwardPorts", "9090").unwrap();
         config_remove(&target, "forwardPorts", "9090").unwrap();

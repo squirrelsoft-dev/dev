@@ -3,4 +3,4 @@ pub mod paths;
 pub mod workspace;
 
 pub use naming::{container_name, workspace_labels};
-pub use workspace::{find_config_source, find_devcontainer_config, workspace_folder_name, ConfigSource};
+pub use workspace::{ConfigSource, find_config_source, workspace_folder_name};

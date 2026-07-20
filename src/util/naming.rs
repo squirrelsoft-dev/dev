@@ -193,7 +193,10 @@ mod tests {
         assert_eq!(normalize_docker_image_name("foo@bar!baz"), "foobarbaz");
         assert_eq!(normalize_docker_image_name("My Project@v2!"), "myprojectv2");
         // Dots and underscores are preserved
-        assert_eq!(normalize_docker_image_name("my_project.v2"), "my_project.v2");
+        assert_eq!(
+            normalize_docker_image_name("my_project.v2"),
+            "my_project.v2"
+        );
         // Separator sequences are cleaned per official regex
         assert_eq!(normalize_docker_image_name("my..project"), "my.project");
         assert_eq!(normalize_docker_image_name("a._-b"), "a.b");

@@ -1,16 +1,16 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::Path;
 
 use crate::collection::{
-    fetch_all_features, fetch_collection_index, fetch_templates, Collection, TemplateMetadata,
-    template_collections, template_tier, TemplateTier,
+    Collection, TemplateMetadata, TemplateTier, fetch_all_features, fetch_collection_index,
+    fetch_templates, template_collections, template_tier,
 };
 use crate::devcontainer::apply_template;
 use crate::devcontainer::recipe::Recipe;
 use crate::oci::download_artifact;
 use crate::tui::{picker, prompts};
-use crate::util::paths::{create_vscode_symlink, devcontainers_dir, global_dir};
+use crate::util::paths::{DevHome, devcontainers_dir, global_dir};
 use crate::util::workspace_folder_name;
 
 pub async fn run(
@@ -84,54 +84,43 @@ pub async fn run(
         }
     }
 
-    // Apply template to the chosen scope
-    let dest = match scope {
+    // Save the template as a global template so the recipe can reference the
+    // durable template config instead of baking it into this project.
+    let global_name = ensure_global_template(&selected.id, &artifact_path)?;
+
+    // Write a recipe to the chosen scope.
+    match scope {
         picker::Scope::Workspace => {
-            apply_template(&artifact_path, &opts, workspace)?;
-            workspace.to_path_buf()
-        }
-        picker::Scope::User => {
-            // Save the template as a global template so the recipe can reference it
-            let global_name = ensure_global_template(&selected.id, &artifact_path)?;
-
-            let folder_name = workspace_folder_name(workspace);
-            let user_dest = devcontainers_dir().join(&folder_name);
-            let devcontainer_dir = user_dest.join(".devcontainer");
-            fs::create_dir_all(&devcontainer_dir)?;
-
-            // Write a recipe instead of eagerly generating the config
-            let recipe = Recipe {
-                global_template: global_name,
-                features: selected_features.clone(),
-                options: opts.clone(),
-                root_folder: workspace.to_string_lossy().to_string(),
-                customizations: serde_json::Value::Object(serde_json::Map::new()),
-            };
-            recipe.write_to(&devcontainer_dir.join("recipe.json"))?;
-
-            // Create VS Code symlink if the configs dir exists
-            create_vscode_symlink(&folder_name, &user_dest);
-
+            let devcontainer_dir = workspace.join(".devcontainer");
+            ensure_recipe_can_own_workspace(workspace, &devcontainer_dir)?;
+            write_recipe(&devcontainer_dir, &global_name, selected_features, opts)?;
             println!(
                 "Recipe for template '{}' written to {}",
                 selected.id,
                 devcontainer_dir.join("recipe.json").display()
             );
-            return Ok(());
+        }
+        picker::Scope::User => {
+            let folder_name = workspace_folder_name(workspace);
+            let user_dest = devcontainers_dir().join(&folder_name);
+            let devcontainer_dir = user_dest.join(".devcontainer");
+            write_recipe(&devcontainer_dir, &global_name, selected_features, opts)?;
+            println!(
+                "Recipe for template '{}' written to {}",
+                selected.id,
+                devcontainer_dir.join("recipe.json").display()
+            );
+            print_user_scope_hint();
         }
     };
 
-    // Workspace scope: inject features and merge base as before
-    if !selected_features.is_empty() {
-        inject_features_into_config(&dest, &selected_features)?;
-    }
-
-    if crate::devcontainer::merge::merge_base_config(&dest)? {
-        eprintln!("Merged base config from ~/.dev/base/devcontainer.json");
-    }
-
-    println!("Template '{}' applied to {}", selected.id, dest.display());
     Ok(())
+}
+
+/// A user-scoped recipe has no `devcontainer.json` for VS Code's remote-containers
+/// extension to open, so point the user at the flow that does work.
+fn print_user_scope_hint() {
+    println!("Run `dev up` to start the container, then attach to it from your editor.");
 }
 
 /// Apply an existing global template to the workspace.
@@ -152,56 +141,103 @@ async fn apply_global_template(
     // Feature multi-select with existing features pre-checked
     eprintln!("Fetching feature catalog...");
     let collections = fetch_collection_index(false).await?;
-    let selected_features =
-        select_features(&collections, &existing_features, verbose).await?;
+    let selected_features = select_features(&collections, &existing_features, verbose).await?;
 
     let scope = picker::pick_scope()?;
     let opts = parse_option_args(options);
 
     match scope {
         picker::Scope::Workspace => {
-            apply_template(&global_path, &opts, workspace)?;
-
-            // Replace features with the user's full selection
-            if !selected_features.is_empty() || !existing_features.is_empty() {
-                replace_features_in_config(workspace, &selected_features)?;
-            }
-
-            // Merge base config if it exists
-            if crate::devcontainer::merge::merge_base_config(workspace)? {
-                eprintln!("Merged base config from ~/.dev/base/devcontainer.json");
-            }
-
-            println!(
-                "Global template '{global_name}' applied to {}",
-                workspace.display()
-            );
-        }
-        picker::Scope::User => {
-            let folder_name = workspace_folder_name(workspace);
-            let user_dest = devcontainers_dir().join(&folder_name);
-            let devcontainer_dir = user_dest.join(".devcontainer");
-            fs::create_dir_all(&devcontainer_dir)?;
-
-            // Write a recipe referencing the global template
-            let recipe = Recipe {
-                global_template: global_name.to_string(),
-                features: selected_features,
-                options: opts,
-                root_folder: workspace.to_string_lossy().to_string(),
-                customizations: serde_json::Value::Object(serde_json::Map::new()),
-            };
-            recipe.write_to(&devcontainer_dir.join("recipe.json"))?;
-
-            create_vscode_symlink(&folder_name, &user_dest);
-
+            let devcontainer_dir = workspace.join(".devcontainer");
+            ensure_recipe_can_own_workspace(workspace, &devcontainer_dir)?;
+            write_recipe(&devcontainer_dir, global_name, selected_features, opts)?;
             println!(
                 "Recipe for global template '{global_name}' written to {}",
                 devcontainer_dir.join("recipe.json").display()
             );
         }
+        picker::Scope::User => {
+            let folder_name = workspace_folder_name(workspace);
+            let devcontainer_dir = devcontainers_dir().join(&folder_name).join(".devcontainer");
+            write_recipe(&devcontainer_dir, global_name, selected_features, opts)?;
+            println!(
+                "Recipe for global template '{global_name}' written to {}",
+                devcontainer_dir.join("recipe.json").display()
+            );
+            print_user_scope_hint();
+        }
     }
 
+    Ok(())
+}
+
+/// Refuse to create a recipe next to a `devcontainer.json`.
+///
+/// `find_config_source` rejects a directory holding both, so writing one anyway
+/// would leave every later `dev up`/`build`/`config` failing until the user
+/// deleted a file by hand.
+fn ensure_recipe_can_own_workspace(
+    workspace: &Path,
+    devcontainer_dir: &Path,
+) -> anyhow::Result<()> {
+    for existing in [
+        devcontainer_dir.join("devcontainer.json"),
+        workspace.join(".devcontainer.json"),
+    ] {
+        if existing.is_file() {
+            anyhow::bail!(
+                "{} already exists.\n\
+                 `dev new` writes a .devcontainer/recipe.json, and a workspace cannot have both. \
+                 Move or delete the devcontainer.json first, then re-run `dev new`.",
+                existing.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn write_recipe(
+    devcontainer_dir: &Path,
+    global_template: &str,
+    features: Vec<String>,
+    options: HashMap<String, String>,
+) -> anyhow::Result<()> {
+    write_recipe_in(
+        &DevHome::current(),
+        devcontainer_dir,
+        global_template,
+        features,
+        options,
+    )
+}
+
+fn write_recipe_in(
+    dev_home: &DevHome,
+    devcontainer_dir: &Path,
+    global_template: &str,
+    features: Vec<String>,
+    options: HashMap<String, String>,
+) -> anyhow::Result<()> {
+    let recipe_path = devcontainer_dir.join("recipe.json");
+    let previous = Recipe::from_path(&recipe_path).ok();
+    let mut recipe = Recipe {
+        global_template: global_template.to_string(),
+        features,
+        options,
+        customizations: serde_json::Value::Object(serde_json::Map::new()),
+        generated: BTreeMap::new(),
+    };
+    // Auxiliary files are planned (and rejected if locally edited) before the
+    // recipe is written, so a refusal leaves the project exactly as it was.
+    recipe.generated = crate::devcontainer::compose::prepare_recipe_directory_in(
+        dev_home,
+        &recipe,
+        devcontainer_dir,
+        crate::devcontainer::compose::AuxPolicy::Refresh {
+            previous: previous.as_ref(),
+        },
+    )?;
+    recipe.write_to(&recipe_path)?;
     Ok(())
 }
 
@@ -249,7 +285,10 @@ async fn fetch_all_templates(
     verbose: u8,
 ) -> anyhow::Result<Vec<(String, TemplateMetadata)>> {
     let template_cols = template_collections(collections);
-    let fetches: Vec<_> = template_cols.iter().map(|c| fetch_templates(c, false)).collect();
+    let fetches: Vec<_> = template_cols
+        .iter()
+        .map(|c| fetch_templates(c, false))
+        .collect();
     let results = futures_util::future::join_all(fetches).await;
 
     let mut all = Vec::new();
@@ -302,33 +341,6 @@ fn list_global_template_names() -> Vec<String> {
     names
 }
 
-/// Inject feature references into devcontainer.json's "features" field.
-fn inject_features_into_config(dest: &Path, features: &[String]) -> anyhow::Result<()> {
-    let config_path = dest.join(".devcontainer/devcontainer.json");
-    if !config_path.is_file() {
-        return Ok(());
-    }
-
-    let raw = fs::read_to_string(&config_path)?;
-    let mut json: serde_json::Value = serde_json::from_str(&raw)?;
-
-    let features_obj = json
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("devcontainer.json is not a JSON object"))?
-        .entry("features")
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-
-    if let Some(obj) = features_obj.as_object_mut() {
-        for feature_ref in features {
-            obj.insert(feature_ref.clone(), serde_json::json!({}));
-        }
-    }
-
-    let formatted = serde_json::to_string_pretty(&json)?;
-    fs::write(&config_path, formatted)?;
-    Ok(())
-}
-
 /// Read feature refs from an existing devcontainer.json's "features" map.
 fn read_existing_features(template_dir: &Path) -> Vec<String> {
     let config_path = template_dir.join(".devcontainer/devcontainer.json");
@@ -346,53 +358,24 @@ fn read_existing_features(template_dir: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Replace the "features" field in devcontainer.json with exactly the given set.
-fn replace_features_in_config(dest: &Path, features: &[String]) -> anyhow::Result<()> {
-    let config_path = dest.join(".devcontainer/devcontainer.json");
-    if !config_path.is_file() {
-        return Ok(());
-    }
-
-    let raw = fs::read_to_string(&config_path)?;
-    let mut json: serde_json::Value = serde_json::from_str(&raw)?;
-
-    let obj = json
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("devcontainer.json is not a JSON object"))?;
-
-    let mut new_features = serde_json::Map::new();
-    for feature_ref in features {
-        // Preserve existing options if the feature was already present
-        let existing_opts = obj
-            .get("features")
-            .and_then(|f| f.as_object())
-            .and_then(|f| f.get(feature_ref))
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({}));
-        new_features.insert(feature_ref.clone(), existing_opts);
-    }
-    obj.insert(
-        "features".to_string(),
-        serde_json::Value::Object(new_features),
-    );
-
-    let formatted = serde_json::to_string_pretty(&json)?;
-    fs::write(&config_path, formatted)?;
-    Ok(())
-}
-
 /// Ensure a template is saved as a global template at `~/.dev/global/<name>/`.
 /// If it already exists, this is a no-op. Returns the global template name.
 fn ensure_global_template(template_id: &str, artifact_path: &Path) -> anyhow::Result<String> {
     let name = template_id.to_string();
     let global_path = global_dir().join(&name);
-    if global_path.join(".devcontainer/devcontainer.json").is_file() {
+    if global_path
+        .join(".devcontainer/devcontainer.json")
+        .is_file()
+    {
         return Ok(name);
     }
     fs::create_dir_all(&global_path)?;
     // Copy the template without substituting options — keep placeholders for reuse
     apply_template(artifact_path, &HashMap::new(), &global_path)?;
-    eprintln!("Saved as global template '{name}' at {}", global_path.display());
+    eprintln!(
+        "Saved as global template '{name}' at {}",
+        global_path.display()
+    );
     Ok(name)
 }
 
@@ -404,4 +387,135 @@ fn parse_option_args(args: &[String]) -> HashMap<String, String> {
         }
     }
     map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn write_recipe_creates_recipe_and_auxiliary_files_without_composed_config() {
+        let home = TempDir::new().unwrap();
+        let dev_home = DevHome::at(home.path());
+        let global_dir = home.path().join("global/rust/.devcontainer");
+        fs::create_dir_all(&global_dir).unwrap();
+        fs::write(
+            global_dir.join("devcontainer.json"),
+            r#"{"image":"rust:latest"}"#,
+        )
+        .unwrap();
+        fs::write(
+            global_dir.join("Dockerfile"),
+            "FROM ${templateOption:base}\n",
+        )
+        .unwrap();
+
+        let workspace = TempDir::new().unwrap();
+        let devcontainer_dir = workspace.path().join(".devcontainer");
+        write_recipe_in(
+            &dev_home,
+            &devcontainer_dir,
+            "rust",
+            vec!["ghcr.io/features/node:1".to_string()],
+            HashMap::from([("base".to_string(), "rust:latest".to_string())]),
+        )
+        .unwrap();
+
+        let recipe = Recipe::from_path(&devcontainer_dir.join("recipe.json")).unwrap();
+        assert_eq!(recipe.global_template, "rust");
+        assert_eq!(recipe.features, vec!["ghcr.io/features/node:1"]);
+        assert_eq!(recipe.options["base"], "rust:latest");
+        assert_eq!(
+            fs::read_to_string(devcontainer_dir.join("Dockerfile")).unwrap(),
+            "FROM rust:latest\n"
+        );
+        assert!(
+            !devcontainer_dir.join("devcontainer.json").exists(),
+            "dev new must not persist a composed devcontainer.json for recipe projects"
+        );
+    }
+
+    #[test]
+    fn a_written_recipe_carries_no_absolute_host_path() {
+        let home = TempDir::new().unwrap();
+        let global_dir = home.path().join("global/rust/.devcontainer");
+        fs::create_dir_all(&global_dir).unwrap();
+        fs::write(
+            global_dir.join("devcontainer.json"),
+            r#"{"image":"rust:latest"}"#,
+        )
+        .unwrap();
+
+        let workspace = TempDir::new().unwrap();
+        let devcontainer_dir = workspace.path().join(".devcontainer");
+        write_recipe_in(
+            &DevHome::at(home.path()),
+            &devcontainer_dir,
+            "rust",
+            Vec::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+
+        let raw = fs::read_to_string(devcontainer_dir.join("recipe.json")).unwrap();
+        assert!(
+            !raw.contains(workspace.path().to_str().unwrap()),
+            "a committed recipe must not pin the creating machine's path: {raw}"
+        );
+        assert!(
+            !raw.contains("rootFolder"),
+            "the unused rootFolder field must not be serialized: {raw}"
+        );
+    }
+
+    #[test]
+    fn a_workspace_devcontainer_json_blocks_recipe_creation() {
+        let workspace = TempDir::new().unwrap();
+        let devcontainer_dir = workspace.path().join(".devcontainer");
+        fs::create_dir_all(&devcontainer_dir).unwrap();
+        fs::write(
+            devcontainer_dir.join("devcontainer.json"),
+            r#"{"image":"ubuntu"}"#,
+        )
+        .unwrap();
+
+        let err = ensure_recipe_can_own_workspace(workspace.path(), &devcontainer_dir).unwrap_err();
+
+        assert!(
+            err.to_string().contains("devcontainer.json"),
+            "the refusal should name the conflicting file: {err}"
+        );
+    }
+
+    #[test]
+    fn a_root_level_devcontainer_json_blocks_recipe_creation() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(
+            workspace.path().join(".devcontainer.json"),
+            r#"{"image":"ubuntu"}"#,
+        )
+        .unwrap();
+
+        assert!(
+            ensure_recipe_can_own_workspace(
+                workspace.path(),
+                &workspace.path().join(".devcontainer")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_clean_workspace_accepts_a_recipe() {
+        let workspace = TempDir::new().unwrap();
+
+        assert!(
+            ensure_recipe_can_own_workspace(
+                workspace.path(),
+                &workspace.path().join(".devcontainer")
+            )
+            .is_ok()
+        );
+    }
 }

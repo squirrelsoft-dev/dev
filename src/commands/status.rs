@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::runtime::detect_runtime;
-use crate::util::{find_devcontainer_config, workspace_labels};
+use crate::util::{find_config_source, workspace_labels};
 
 pub async fn run(
     workspace: &Path,
@@ -9,7 +9,7 @@ pub async fn run(
     json: bool,
 ) -> anyhow::Result<()> {
     // Check for devcontainer config (informational only)
-    if find_devcontainer_config(workspace).is_err() {
+    if find_config_source(workspace).is_err() {
         if !json {
             eprintln!("No devcontainer configuration found in {}", workspace.display());
         }
