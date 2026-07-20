@@ -1585,4 +1585,138 @@ mod tests {
             "should tell the user how to recreate it: {message}"
         );
     }
+
+    /// Deserialize a composed recipe value the same way the `up`/`build`
+    /// commands do, so mount-target assertions run against a real
+    /// [`DevcontainerConfig`] rather than raw JSON.
+    fn composed_config(composed: &Value) -> DevcontainerConfig {
+        serde_json::from_value(composed.clone()).expect("composed config should deserialize")
+    }
+
+    #[test]
+    fn recipe_customizations_outrank_runtime_for_the_same_scalar_key() {
+        let env = TestDevHome::new(
+            r#"{"image": "rust:latest", "remoteUser": "from-global"}"#,
+            Some(r#"{"remoteUser": "from-base"}"#),
+            Some(r#"{"remoteUser": "from-runtime"}"#),
+            "docker",
+        );
+        let mut recipe = env.recipe();
+        recipe.customizations = serde_json::json!({"remoteUser": "from-recipe"});
+
+        // Highest priority present wins.
+        assert_eq!(
+            env.compose(&recipe, "docker", true)["remoteUser"],
+            "from-recipe"
+        );
+    }
+
+    #[test]
+    fn runtime_outranks_base_for_the_same_scalar_key() {
+        let env = TestDevHome::new(
+            r#"{"image": "rust:latest", "remoteUser": "from-global"}"#,
+            Some(r#"{"remoteUser": "from-base"}"#),
+            Some(r#"{"remoteUser": "from-runtime"}"#),
+            "docker",
+        );
+
+        assert_eq!(
+            env.compose(&env.recipe(), "docker", true)["remoteUser"],
+            "from-runtime"
+        );
+    }
+
+    #[test]
+    fn each_of_workspace_mount_and_workspace_folder_is_overridden_independently() {
+        let global_config = r#"{"image": "rust:latest", "workspaceFolder": "/from-global", "workspaceMount": "source=${localWorkspaceFolder},target=/mount-from-global,type=bind"}"#;
+
+        let env = TestDevHome::new(
+            global_config,
+            None,
+            Some(r#"{"workspaceFolder": "/from-runtime"}"#),
+            "docker",
+        );
+
+        let composed = env.compose(&env.recipe(), "docker", true);
+
+        // Overriding workspaceFolder leaves the lower-layer workspaceMount intact.
+        assert_eq!(composed["workspaceFolder"], "/from-runtime");
+        assert_eq!(
+            composed["workspaceMount"],
+            "source=${localWorkspaceFolder},target=/mount-from-global,type=bind"
+        );
+
+        // The mirror direction: overriding workspaceMount leaves workspaceFolder intact.
+        let env = TestDevHome::new(
+            global_config,
+            None,
+            Some(
+                r#"{"workspaceMount": "source=${localWorkspaceFolder},target=/mount-from-runtime,type=bind"}"#,
+            ),
+            "docker",
+        );
+
+        let composed = env.compose(&env.recipe(), "docker", true);
+
+        assert_eq!(
+            composed["workspaceMount"],
+            "source=${localWorkspaceFolder},target=/mount-from-runtime,type=bind"
+        );
+        assert_eq!(composed["workspaceFolder"], "/from-global");
+    }
+
+    #[test]
+    fn a_composed_workspace_mount_target_wins_over_a_composed_workspace_folder() {
+        let env = TestDevHome::new(
+            r#"{"image": "rust:latest", "workspaceFolder": "/from-global"}"#,
+            Some(
+                r#"{"workspaceMount": "source=${localWorkspaceFolder},target=/srv/app,type=bind"}"#,
+            ),
+            None,
+            "docker",
+        );
+
+        let composed = env.compose(&env.recipe(), "docker", true);
+        let target = composed_config(&composed)
+            .workspace_mount_target(&env.workspace, None)
+            .unwrap();
+
+        assert_eq!(target, "/srv/app");
+    }
+
+    #[test]
+    fn a_recipe_workspace_mount_target_survives_composition() {
+        let env = TestDevHome::new(
+            r#"{"image": "rust:latest", "workspaceMount": "source=${localWorkspaceFolder},target=/from-global,type=bind"}"#,
+            Some(
+                r#"{"workspaceMount": "source=${localWorkspaceFolder},target=/from-base,type=bind"}"#,
+            ),
+            None,
+            "docker",
+        );
+        let mut recipe = env.recipe();
+        recipe.customizations = serde_json::json!({
+            "workspaceMount": "source=${localWorkspaceFolder},target=/from-recipe,type=bind"
+        });
+
+        let composed = env.compose(&recipe, "docker", true);
+        let target = composed_config(&composed)
+            .workspace_mount_target(&env.workspace, None)
+            .unwrap();
+
+        assert_eq!(target, "/from-recipe");
+    }
+
+    #[test]
+    fn a_composed_config_without_either_key_falls_back_to_the_workspace_folder_name() {
+        let env = TestDevHome::new(r#"{"image": "rust:latest"}"#, None, None, "docker");
+
+        let composed = env.compose(&env.recipe(), "docker", true);
+        let target = composed_config(&composed)
+            .workspace_mount_target(&env.workspace, None)
+            .unwrap();
+
+        // The temp workspace is `<root>/projects/demo`.
+        assert_eq!(target, "/workspaces/demo");
+    }
 }
