@@ -95,9 +95,11 @@ Because a recipe project has no `devcontainer.json`, VS Code's "Reopen in Contai
 
 `dev` supports three runtimes, selected by `--runtime` or auto-detected:
 
-- **Docker** — the default on every platform
-- **Podman** — drop-in compatible, no daemon
-- **Apple Containers** — macOS native via XPC; requires a source build with `--features apple` (see [Installation](#installation))
+- **Docker** — used when it is the only one running
+- **Podman** — drop-in compatible, no daemon; preferred when both it and Docker are running
+- **Apple Containers** — macOS native via XPC; never auto-detected, so pass `--runtime apple`, and requires a source build with `--features apple` (see [Installation](#installation))
+
+Pass `--runtime docker` to pin the runtime when both Docker and Podman are up.
 
 Docker Compose projects get a full lifecycle path: build, layer features, UID remap, generate a compose override injecting labels/env/mounts/ports, start services, run lifecycle hooks.
 
