@@ -22,21 +22,24 @@ cargo build
 # Run tests
 cargo test
 
-# Lint
-cargo clippy
+# Lint (same gate CI enforces)
+cargo clippy --all-targets -- -D warnings
+
+# Check formatting
+cargo fmt --all --check
 
 # Type check
 cargo check
 ```
 
-**Note:** The `apple-container` crate requires macOS to compile. On other platforms, builds will exclude it automatically.
+**Note:** The `apple-container` crate requires macOS to compile. On other platforms, builds will exclude it automatically. CI covers that path in a separate `macos-latest` job that runs `cargo build/test --features apple`, so if you touch the Apple Containers runtime, run those on a Mac before submitting.
 
 ## Making Changes
 
 - Keep commits focused — one logical change per commit
 - Write descriptive commit messages explaining *why*, not just *what*
 - Add tests for new functionality
-- Run `cargo test` and `cargo clippy` before submitting
+- Run the checks under [Development](#development) before submitting
 
 ## Pull Requests
 
@@ -48,7 +51,7 @@ cargo check
 PRs should:
 - Pass all existing tests
 - Include tests for new behavior
-- Have no clippy warnings
+- Be clippy-clean under `-D warnings` and rustfmt-clean
 - Follow the existing code style
 
 ## Reporting Bugs
