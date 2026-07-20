@@ -74,7 +74,7 @@ dev up --no-base
 
 ### Global templates
 
-Reusable devcontainer setups you save once and apply anywhere. A "rust" template with your toolchain, a "node" template with your Node setup. Each machine needs a global template of that name in `~/.dev/global/`; on a fresh clone, `dev new` creates it.
+Reusable devcontainer setups you save once and apply anywhere. A "rust" template with your toolchain, a "node" template with your Node setup. A recipe references its template by name, so each machine needs a template of that name in `~/.dev/global/` — a fresh clone fails until one exists. Recreate it with `dev new`, picking the same template and scope; note that this rewrites `recipe.json` and drops any `dev config set` overrides it carried. To keep those, point `globalTemplate` in `recipe.json` at a template you already have instead.
 
 ```sh
 dev global new --name my-rust
@@ -159,7 +159,7 @@ Those `forwardPorts` runs are also where `dev up` checks your host setup: it pri
 | `dev forward` | Forward a local port (with `--daemon`, `--stop`, `--list`) |
 | `dev open` / `dev vscode repair` | VS Code integration |
 
-Global flags: `--workspace <path>`, `--runtime <docker|podman|apple>`, `-v` / `-vv` / `-vvv`.
+Global flags: `--workspace <path>`, `--runtime <docker|podman|apple>`, `-v` (verbose build and registry output).
 
 ## Derived images and disk use
 

@@ -1072,14 +1072,16 @@ mod tests {
         let readme = include_str!("../../README.md");
         let glob = readme
             .lines()
-            .find_map(|l| l.trim().strip_prefix("docker image ls --filter 'reference="))
+            .find_map(|l| {
+                l.trim()
+                    .strip_prefix("docker image ls --filter 'reference=")
+            })
             .and_then(|rest| rest.strip_suffix('\''))
             .expect("README.md should document a `docker image ls --filter reference=` command");
 
         // `<folder>` is a placeholder the reader substitutes; do the same here.
         let glob = glob.replace("<folder>", "webapp");
-        let folder_image =
-            crate::util::naming::container_name(std::path::Path::new("/tmp/webapp"));
+        let folder_image = crate::util::naming::container_name(std::path::Path::new("/tmp/webapp"));
         let image = feature_image_tag(&folder_image, &empty_config(), &[feature("ghcr.io/x/y")]);
 
         // Match the glob by walking its literal segments in order, with `*`
@@ -1089,7 +1091,8 @@ mod tests {
             let found = if i == 0 {
                 rest.strip_prefix(literal).map(|r| (literal, r))
             } else {
-                rest.find(literal).map(|at| (literal, &rest[at + literal.len()..]))
+                rest.find(literal)
+                    .map(|at| (literal, &rest[at + literal.len()..]))
             };
             let (_, remainder) = found.unwrap_or_else(|| {
                 panic!(
