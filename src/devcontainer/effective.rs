@@ -1073,4 +1073,115 @@ mod tests {
             "error should name the composed config: {err}"
         );
     }
+
+    #[test]
+    fn a_project_scalar_key_overrides_the_same_key_from_base() {
+        let dir = TempDir::new().unwrap();
+        let base = write_base_config(&dir, r#"{"remoteUser": "from-base"}"#);
+        let project = write_project_config(
+            &dir,
+            r#"{"image": "ubuntu:24.04", "remoteUser": "from-project"}"#,
+        );
+
+        assert_eq!(
+            load_config_with_base(&project, true, &base)
+                .remote_user
+                .as_deref(),
+            Some("from-project")
+        );
+    }
+
+    #[test]
+    fn a_base_scalar_key_survives_when_the_project_omits_it() {
+        let dir = TempDir::new().unwrap();
+        let base = write_base_config(&dir, r#"{"remoteUser": "from-base"}"#);
+        let project = write_project_config(&dir, r#"{"image": "ubuntu:24.04"}"#);
+
+        assert_eq!(
+            load_config_with_base(&project, true, &base)
+                .remote_user
+                .as_deref(),
+            Some("from-base")
+        );
+        // Opting out of the base layer drops the value entirely.
+        assert!(
+            load_config_with_base(&project, false, &base)
+                .remote_user
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn workspace_mount_and_workspace_folder_merge_as_independent_keys() {
+        let dir = TempDir::new().unwrap();
+        let base = write_base_config(
+            &dir,
+            r#"{"workspaceMount": "source=${localWorkspaceFolder},target=/from-base,type=bind"}"#,
+        );
+        let project = write_project_config(
+            &dir,
+            r#"{"image": "ubuntu:24.04", "workspaceFolder": "/from-project"}"#,
+        );
+
+        let merged = effective_value(&project, true, &base);
+
+        // The project's workspaceFolder does not clear the base's workspaceMount.
+        assert_eq!(merged["workspaceFolder"], "/from-project");
+        assert_eq!(
+            merged["workspaceMount"],
+            "source=${localWorkspaceFolder},target=/from-base,type=bind"
+        );
+    }
+
+    #[test]
+    fn a_base_workspace_mount_target_survives_effective_loading() {
+        let dir = TempDir::new().unwrap();
+        let base = write_base_config(
+            &dir,
+            r#"{"workspaceMount": "source=${localWorkspaceFolder},target=/srv/app,type=bind"}"#,
+        );
+        let project = write_project_config(
+            &dir,
+            r#"{"image": "ubuntu:24.04", "workspaceFolder": "/from-project"}"#,
+        );
+
+        let target = load_config_with_base(&project, true, &base)
+            .workspace_mount_target(dir.path(), None)
+            .unwrap();
+
+        // workspaceMount's target= outranks workspaceFolder even across layers.
+        assert_eq!(target, "/srv/app");
+    }
+
+    #[test]
+    fn a_project_workspace_mount_target_overrides_the_base_one() {
+        let dir = TempDir::new().unwrap();
+        let base = write_base_config(
+            &dir,
+            r#"{"workspaceMount": "source=${localWorkspaceFolder},target=/from-base,type=bind"}"#,
+        );
+        let project = write_project_config(
+            &dir,
+            r#"{"image": "ubuntu:24.04", "workspaceMount": "source=${localWorkspaceFolder},target=/from-project,type=bind"}"#,
+        );
+
+        let target = load_config_with_base(&project, true, &base)
+            .workspace_mount_target(dir.path(), None)
+            .unwrap();
+
+        assert_eq!(target, "/from-project");
+    }
+
+    #[test]
+    fn a_base_workspace_folder_is_used_when_no_layer_declares_a_mount() {
+        let dir = TempDir::new().unwrap();
+        let base = write_base_config(&dir, r#"{"workspaceFolder": "/from-base"}"#);
+        let project = write_project_config(&dir, r#"{"image": "ubuntu:24.04"}"#);
+
+        let target = load_config_with_base(&project, true, &base)
+            .workspace_mount_target(dir.path(), None)
+            .unwrap();
+
+        assert_eq!(target, "/from-base");
+    }
 }
