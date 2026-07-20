@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::Path;
 
@@ -26,6 +26,15 @@ pub struct Recipe {
         skip_serializing_if = "is_empty_object"
     )]
     pub customizations: Value,
+    /// SHA-256 of each auxiliary file this recipe last generated, keyed by a
+    /// slash-separated path relative to the recipe directory.
+    ///
+    /// Recomputing the expected contents from the template is not enough to tell
+    /// a generated file from an authored one: the template's own files can change
+    /// between runs. Recording what was written is the only durable proof, and its
+    /// absence means provenance is unknown rather than clean.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub generated: BTreeMap<String, String>,
 }
 
 fn default_empty_object() -> Value {
@@ -70,6 +79,7 @@ mod tests {
             features: vec!["ghcr.io/features/zsh:1".to_string()],
             options: HashMap::from([("imageVariant".to_string(), "bookworm".to_string())]),
             customizations: default_empty_object(),
+            generated: BTreeMap::new(),
         };
 
         recipe.write_to(&path).unwrap();
@@ -90,6 +100,7 @@ mod tests {
             features: Vec::new(),
             options: HashMap::new(),
             customizations: default_empty_object(),
+            generated: BTreeMap::new(),
         };
 
         recipe.write_to(&path).unwrap();
@@ -123,6 +134,7 @@ mod tests {
             features: Vec::new(),
             options: HashMap::new(),
             customizations,
+            generated: BTreeMap::new(),
         };
 
         recipe.write_to(&path).unwrap();

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::Path;
 
@@ -217,15 +217,16 @@ fn write_recipe_in(
 ) -> anyhow::Result<()> {
     let recipe_path = devcontainer_dir.join("recipe.json");
     let previous = Recipe::from_path(&recipe_path).ok();
-    let recipe = Recipe {
+    let mut recipe = Recipe {
         global_template: global_template.to_string(),
         features,
         options,
         customizations: serde_json::Value::Object(serde_json::Map::new()),
+        generated: BTreeMap::new(),
     };
     // Auxiliary files are planned (and rejected if locally edited) before the
     // recipe is written, so a refusal leaves the project exactly as it was.
-    crate::devcontainer::compose::prepare_recipe_directory_in(
+    recipe.generated = crate::devcontainer::compose::prepare_recipe_directory_in(
         dev_home,
         &recipe,
         devcontainer_dir,

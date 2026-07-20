@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::devcontainer::DevcontainerConfig;
-use crate::devcontainer::compose::load_workspace_config;
+use crate::devcontainer::compose::load_workspace_config_or_warn;
 use crate::runtime::{ContainerState, detect_runtime};
 use crate::util::{container_name, workspace_labels};
 
@@ -13,7 +13,8 @@ pub async fn run(
     let runtime = detect_runtime(runtime_override).await?;
 
     // Try compose-aware teardown first.
-    if let Ok((config_path, config)) = load_workspace_config(workspace, runtime.runtime_name())
+    if let Some((config_path, config)) =
+        load_workspace_config_or_warn(workspace, runtime.runtime_name())
         && config.is_compose()
     {
         return run_compose_down(

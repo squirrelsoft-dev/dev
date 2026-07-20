@@ -81,3 +81,13 @@ impl DevHome {
         self.root.join(runtime).join("devcontainer.json")
     }
 }
+
+/// VS Code remote-containers configs directory.
+///
+/// - macOS: `~/Library/Application Support/Code/User/globalStorage/ms-vscode-remote.remote-containers/configs/`
+/// - Linux: `~/.config/Code/User/globalStorage/ms-vscode-remote.remote-containers/configs/`
+pub fn vscode_configs_dir() -> PathBuf {
+    dirs::config_dir()
+        .expect("could not determine config directory")
+        .join("Code/User/globalStorage/ms-vscode-remote.remote-containers/configs")
+}

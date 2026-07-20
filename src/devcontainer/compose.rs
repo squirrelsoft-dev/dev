@@ -1,8 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::devcontainer::config::DevcontainerConfig;
 use crate::devcontainer::effective::{
@@ -142,21 +143,22 @@ pub(crate) fn load_workspace_config_in(
     }
 }
 
-/// Load a workspace's config for a session command, falling back to the image's
-/// defaults rather than failing.
+/// Load a workspace's config where a failure degrades behaviour rather than
+/// stopping the command — `dev shell`, `dev exec`, `dev down`.
 ///
-/// A workspace with no config at all is ordinary — a container can outlive the
-/// config that created it — but a composition failure is actionable, and its
-/// message is the only thing that explains why the session looks wrong.
-pub(crate) fn load_session_config(
+/// A workspace with no config at all is ordinary: a container can outlive the
+/// config that created it. Any other failure is actionable, and the warning is
+/// the only thing that explains why the command behaved as if there were no
+/// config — a session on the wrong user, or a teardown that skipped `compose down`.
+pub(crate) fn load_workspace_config_or_warn(
     workspace: &Path,
     runtime_name: &str,
-) -> Option<DevcontainerConfig> {
+) -> Option<(PathBuf, DevcontainerConfig)> {
     match load_workspace_config(workspace, runtime_name) {
-        Ok((_, config)) => Some(config),
+        Ok(loaded) => Some(loaded),
         Err(err) => {
             if !matches!(err.downcast_ref::<DevError>(), Some(DevError::NoConfig(_))) {
-                eprintln!("Warning: using the image's defaults for this session — {err}");
+                eprintln!("Warning: proceeding without the devcontainer config — {err}");
             }
             None
         }
@@ -188,7 +190,8 @@ pub(crate) fn materialize_recipe_directory_in(
     recipe: &Recipe,
 ) -> anyhow::Result<()> {
     let recipe_dir = recipe_dir_of(recipe_path)?;
-    prepare_recipe_directory_in(dev_home, recipe, recipe_dir, AuxPolicy::FillMissing)
+    prepare_recipe_directory_in(dev_home, recipe, recipe_dir, AuxPolicy::FillMissing)?;
+    Ok(())
 }
 
 struct ComposeDetails {
@@ -322,62 +325,52 @@ fn declared_feature_ids(value: &Value) -> HashSet<String> {
 pub(crate) enum AuxPolicy<'a> {
     /// Fill in what is missing and leave everything already on disk alone.
     FillMissing,
-    /// Regenerate for a new template or option set. A file byte-identical to what
-    /// `previous` generated is replaced; anything else is treated as authored and
+    /// Regenerate against the current template. A file matching what `previous`
+    /// recorded generating is replaced; anything else is treated as authored and
     /// aborts the whole operation.
     Refresh { previous: Option<&'a Recipe> },
 }
 
-/// The inputs that decide what an auxiliary file's contents should be.
-///
-/// Only the global template and its option substitutions feed these files —
-/// features and customizations reach the composed config instead — so two recipes
-/// agreeing on both generate byte-identical output.
-fn generates_identically(previous: &Recipe, recipe: &Recipe) -> bool {
-    previous.global_template == recipe.global_template && previous.options == recipe.options
-}
-
 struct AuxPlan<'a> {
-    template_name: &'a str,
-    options: &'a HashMap<String, String>,
-    previous_options: Option<&'a HashMap<String, String>>,
-    /// False when nothing that generates auxiliary files changed, so whatever is
-    /// already on disk stays untouched.
+    recipe: &'a Recipe,
+    /// What an earlier run recorded writing here. Empty means provenance is
+    /// unknown, which is not the same as knowing a file is clean.
+    recorded: &'a BTreeMap<String, String>,
     refresh: bool,
 }
 
+/// Write the template's auxiliary files into `dest_dir`, returning the SHA-256 of
+/// everything the template generates so the caller can record it on the recipe.
 pub(crate) fn prepare_recipe_directory_in(
     dev_home: &DevHome,
     recipe: &Recipe,
     dest_dir: &Path,
     policy: AuxPolicy<'_>,
-) -> anyhow::Result<()> {
-    let previous = match policy {
-        AuxPolicy::FillMissing => None,
-        AuxPolicy::Refresh { previous } => previous,
-    };
-    let refresh = match (&policy, previous) {
-        (AuxPolicy::FillMissing, _) => false,
-        (AuxPolicy::Refresh { .. }, Some(prev)) => !generates_identically(prev, recipe),
-        (AuxPolicy::Refresh { .. }, None) => true,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let no_provenance = BTreeMap::new();
+    let (refresh, recorded) = match policy {
+        AuxPolicy::FillMissing => (false, &no_provenance),
+        AuxPolicy::Refresh { previous } => (
+            true,
+            previous.map_or(&no_provenance, |prev| &prev.generated),
+        ),
     };
     let plan = AuxPlan {
-        template_name: &recipe.global_template,
-        options: &recipe.options,
-        previous_options: previous.map(|prev| &prev.options),
+        recipe,
+        recorded,
         refresh,
     };
 
     let src_dir = dev_home.global_template_dir(&recipe.global_template);
-    let previous_src_dir = previous.map(|prev| dev_home.global_template_dir(&prev.global_template));
-
     let mut planned = Vec::new();
+    let mut manifest = BTreeMap::new();
     plan_auxiliary_files(
         &src_dir,
-        previous_src_dir.as_deref(),
         dest_dir,
+        Path::new(""),
         &plan,
         &mut planned,
+        &mut manifest,
     )?;
 
     fs::create_dir_all(dest_dir)?;
@@ -387,7 +380,7 @@ pub(crate) fn prepare_recipe_directory_in(
         }
         fs::write(&file.dest, &file.content)?;
     }
-    Ok(())
+    Ok(manifest)
 }
 
 struct PlannedFile {
@@ -400,18 +393,15 @@ struct PlannedFile {
 /// substitutions. `devcontainer.json` and `devcontainer-template.json` are skipped
 /// because the composition pipeline owns them.
 ///
-/// `previous_src_dir` walks the template the existing files were generated from,
-/// in lockstep with `src_dir`, so provenance is judged against the right source
-/// even when the recipe switched templates.
-///
 /// Planning is separated from writing so that a rejected file aborts before any
 /// file — or the recipe itself — has been touched.
 fn plan_auxiliary_files(
     src_dir: &Path,
-    previous_src_dir: Option<&Path>,
     dest_dir: &Path,
+    rel_dir: &Path,
     plan: &AuxPlan<'_>,
     planned: &mut Vec<PlannedFile>,
+    manifest: &mut BTreeMap<String, String>,
 ) -> anyhow::Result<()> {
     if !src_dir.is_dir() {
         return Ok(());
@@ -425,20 +415,18 @@ fn plan_auxiliary_files(
         }
         let src_path = entry.path();
         let dest_path = dest_dir.join(&name);
-        let previous_src_path = previous_src_dir.map(|dir| dir.join(&name));
+        let rel_path = rel_dir.join(&name);
         if src_path.is_dir() {
-            plan_auxiliary_files(
-                &src_path,
-                previous_src_path.as_deref(),
-                &dest_path,
-                plan,
-                planned,
-            )?;
+            plan_auxiliary_files(&src_path, &dest_path, &rel_path, plan, planned, manifest)?;
             continue;
         }
 
         let source = fs::read(&src_path)?;
-        let content = substitute_bytes(&source, plan.options);
+        let content = substitute_bytes(&source, &plan.recipe.options);
+        let key = manifest_key(&rel_path);
+        let generated = hash_bytes(&content);
+        manifest.insert(key.clone(), generated.clone());
+
         let Ok(existing) = fs::read(&dest_path) else {
             planned.push(PlannedFile {
                 dest: dest_path,
@@ -449,18 +437,18 @@ fn plan_auxiliary_files(
         if existing == content || !plan.refresh {
             continue;
         }
-        if !was_generated(
-            &existing,
-            previous_src_path.as_deref(),
-            plan.previous_options,
-        ) {
+        let recorded = plan.recorded.get(&key);
+        if recorded == Some(&generated) {
+            continue;
+        }
+        if recorded != Some(&hash_bytes(&existing)) {
             anyhow::bail!(
-                "{} differs from what template '{}' generates, and no earlier recipe accounts \
-                 for its current contents, so it was left alone and nothing was changed.\n\
+                "{} is not what template '{}' last generated here, so it was left alone and \
+                 nothing was changed.\n\
                  Move or delete it and re-run to take the template's version, or keep it and \
                  edit \"options\" in {} by hand.",
                 dest_path.display(),
-                plan.template_name,
+                plan.recipe.global_template,
                 dest_dir.join("recipe.json").display()
             );
         }
@@ -472,21 +460,20 @@ fn plan_auxiliary_files(
     Ok(())
 }
 
-/// Whether a file on disk is byte-identical to what the previous template and
-/// options produced — the only available proof that it is generated rather than
-/// authored, and so safe to replace.
-fn was_generated(
-    existing: &[u8],
-    previous_src_path: Option<&Path>,
-    previous_options: Option<&HashMap<String, String>>,
-) -> bool {
-    let (Some(src), Some(options)) = (previous_src_path, previous_options) else {
-        return false;
-    };
-    let Ok(source) = fs::read(src) else {
-        return false;
-    };
-    existing == substitute_bytes(&source, options)
+/// A stable, slash-separated manifest key, so a recipe written on one platform
+/// still matches its files on another.
+fn manifest_key(rel_path: &Path) -> String {
+    rel_path
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn hash_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
 }
 
 /// Apply template option substitutions to a template file, leaving non-UTF-8
@@ -558,6 +545,7 @@ mod tests {
                 features: Vec::new(),
                 options: HashMap::new(),
                 customizations: serde_json::json!({}),
+            generated: BTreeMap::new(),
             }
         }
 
@@ -818,240 +806,272 @@ mod tests {
         assert_eq!(fs::read_to_string(copied).unwrap(), "FROM project-edited\n");
     }
 
-    #[test]
-    fn changing_options_regenerates_an_untouched_auxiliary_file() {
-        let env = TestDevHome::new(
-            r#"{"build": {"dockerfile": "Dockerfile"}}"#,
-            None,
-            None,
-            "docker",
-        );
-        let aux = env
-            .dev_home
-            .global_template_dir("test-lang")
-            .join("Dockerfile");
-        fs::write(&aux, "FROM ${templateOption:base}\n").unwrap();
+/// Run the real `dev new` sequence: generate the auxiliary files, then record
+/// on the recipe what was written, exactly as `write_recipe_in` does.
+fn generate(
+    env: &TestDevHome,
+    recipe: &mut Recipe,
+    previous: Option<&Recipe>,
+) -> anyhow::Result<()> {
+    recipe.generated = prepare_recipe_directory_in(
+        &env.dev_home,
+        recipe,
+        &env.recipe_dir(),
+        AuxPolicy::Refresh { previous },
+    )?;
+    Ok(())
+}
 
-        let mut first = env.recipe();
-        first.options.insert("base".into(), "rust:1.75".into());
-        let recipe_dir = env.recipe_dir();
-        prepare_recipe_directory_in(
-            &env.dev_home,
-            &first,
-            &recipe_dir,
-            AuxPolicy::Refresh { previous: None },
-        )
-        .unwrap();
-        assert_eq!(
-            fs::read_to_string(recipe_dir.join("Dockerfile")).unwrap(),
-            "FROM rust:1.75\n"
-        );
+fn write_template_aux(env: &TestDevHome, template: &str, name: &str, content: &str) {
+    let dir = env.dev_home.global_template_dir(template);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join(name), content).unwrap();
+}
 
-        let mut second = env.recipe();
-        second.options.insert("base".into(), "rust:1.80".into());
-        prepare_recipe_directory_in(
-            &env.dev_home,
-            &second,
-            &recipe_dir,
-            AuxPolicy::Refresh {
-                previous: Some(&first),
-            },
-        )
-        .unwrap();
+fn add_template(env: &TestDevHome, template: &str, config: &str) {
+    let dir = env.dev_home.global_template_dir(template);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("devcontainer.json"), config).unwrap();
+}
 
-        assert_eq!(
-            fs::read_to_string(recipe_dir.join("Dockerfile")).unwrap(),
-            "FROM rust:1.80\n",
-            "a file still matching the old options is template-owned and follows them"
-        );
-    }
+fn dockerfile_env() -> TestDevHome {
+    TestDevHome::new(
+        r#"{"build": {"dockerfile": "Dockerfile"}}"#,
+        None,
+        None,
+        "docker",
+    )
+}
 
-    #[test]
-    fn changing_options_refuses_to_clobber_a_locally_edited_auxiliary_file() {
-        let env = TestDevHome::new(
-            r#"{"build": {"dockerfile": "Dockerfile"}}"#,
-            None,
-            None,
-            "docker",
-        );
-        let aux = env
-            .dev_home
-            .global_template_dir("test-lang")
-            .join("Dockerfile");
-        fs::write(&aux, "FROM ${templateOption:base}\n").unwrap();
+#[test]
+fn a_recipe_records_the_files_it_generated() {
+    let env = dockerfile_env();
+    write_template_aux(&env, "test-lang", "Dockerfile", "FROM rust:latest\n");
+    let nested = env
+        .dev_home
+        .global_template_dir("test-lang")
+        .join("scripts");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("setup.sh"), "echo hi\n").unwrap();
 
-        let mut first = env.recipe();
-        first.options.insert("base".into(), "rust:1.75".into());
-        let recipe_dir = env.recipe_dir();
-        fs::create_dir_all(&recipe_dir).unwrap();
-        let dockerfile = recipe_dir.join("Dockerfile");
-        fs::write(&dockerfile, "FROM rust:1.75\nRUN cargo install just\n").unwrap();
+    let mut recipe = env.recipe();
+    generate(&env, &mut recipe, None).unwrap();
 
-        let mut second = env.recipe();
-        second.options.insert("base".into(), "rust:1.80".into());
-        let err = prepare_recipe_directory_in(
-            &env.dev_home,
-            &second,
-            &recipe_dir,
-            AuxPolicy::Refresh {
-                previous: Some(&first),
-            },
-        )
-        .unwrap_err();
+    assert_eq!(
+        recipe.generated.get("Dockerfile"),
+        Some(&hash_bytes(b"FROM rust:latest\n"))
+    );
+    assert_eq!(
+        recipe.generated.get("scripts/setup.sh"),
+        Some(&hash_bytes(b"echo hi\n")),
+        "nested files are keyed by a slash-separated relative path"
+    );
+}
 
-        assert!(
-            err.to_string().contains("Dockerfile"),
-            "the refusal should name the file: {err}"
-        );
-        assert_eq!(
-            fs::read_to_string(&dockerfile).unwrap(),
-            "FROM rust:1.75\nRUN cargo install just\n",
-            "a rejected refresh must leave the project untouched"
-        );
-    }
+#[test]
+fn changing_options_regenerates_an_untouched_auxiliary_file() {
+    let env = dockerfile_env();
+    write_template_aux(
+        &env,
+        "test-lang",
+        "Dockerfile",
+        "FROM ${templateOption:base}\n",
+    );
 
-    /// Re-running `dev new` only to add a feature changes nothing that generates
-    /// auxiliary files, so a customized Dockerfile must survive rather than
-    /// blocking the whole command.
-    #[test]
-    fn rerunning_with_unchanged_options_keeps_a_customized_auxiliary_file() {
-        let env = TestDevHome::new(
-            r#"{"build": {"dockerfile": "Dockerfile"}}"#,
-            None,
-            None,
-            "docker",
-        );
-        fs::write(
-            env.dev_home
-                .global_template_dir("test-lang")
-                .join("Dockerfile"),
-            "FROM ${templateOption:base}\n",
-        )
-        .unwrap();
+    let mut first = env.recipe();
+    first.options.insert("base".into(), "rust:1.75".into());
+    generate(&env, &mut first, None).unwrap();
+    let dockerfile = env.recipe_dir().join("Dockerfile");
+    assert_eq!(fs::read_to_string(&dockerfile).unwrap(), "FROM rust:1.75\n");
 
-        let mut first = env.recipe();
-        first.options.insert("base".into(), "rust:1.75".into());
-        let recipe_dir = env.recipe_dir();
-        fs::create_dir_all(&recipe_dir).unwrap();
-        let dockerfile = recipe_dir.join("Dockerfile");
-        fs::write(&dockerfile, "FROM rust:1.75\nRUN cargo install just\n").unwrap();
+    let mut second = env.recipe();
+    second.options.insert("base".into(), "rust:1.80".into());
+    generate(&env, &mut second, Some(&first)).unwrap();
 
-        let mut second = env.recipe();
-        second.options.insert("base".into(), "rust:1.75".into());
-        second.features = vec!["ghcr.io/features/node:1".to_string()];
+    assert_eq!(
+        fs::read_to_string(&dockerfile).unwrap(),
+        "FROM rust:1.80\n",
+        "a file still matching what was recorded is generated, so it follows the options"
+    );
+}
 
-        prepare_recipe_directory_in(
-            &env.dev_home,
-            &second,
-            &recipe_dir,
-            AuxPolicy::Refresh {
-                previous: Some(&first),
-            },
-        )
-        .unwrap();
+#[test]
+fn changing_options_refuses_to_clobber_a_locally_edited_auxiliary_file() {
+    let env = dockerfile_env();
+    write_template_aux(
+        &env,
+        "test-lang",
+        "Dockerfile",
+        "FROM ${templateOption:base}\n",
+    );
 
-        assert_eq!(
-            fs::read_to_string(&dockerfile).unwrap(),
-            "FROM rust:1.75\nRUN cargo install just\n",
-            "an unrelated rerun must not touch or reject a customized file"
-        );
-    }
+    let mut first = env.recipe();
+    first.options.insert("base".into(), "rust:1.75".into());
+    generate(&env, &mut first, None).unwrap();
+    let dockerfile = env.recipe_dir().join("Dockerfile");
+    fs::write(&dockerfile, "FROM rust:1.75\nRUN cargo install just\n").unwrap();
 
-    /// Switching templates has to judge provenance against the template the file
-    /// actually came from, not the newly selected one.
-    #[test]
-    fn switching_templates_regenerates_a_file_the_old_template_generated() {
-        let env = TestDevHome::new(
-            r#"{"build": {"dockerfile": "Dockerfile"}}"#,
-            None,
-            None,
-            "docker",
-        );
-        fs::write(
-            env.dev_home
-                .global_template_dir("test-lang")
-                .join("Dockerfile"),
-            "FROM rust:latest\n",
-        )
-        .unwrap();
-        let other_dir = env.dev_home.global_template_dir("other-lang");
-        fs::create_dir_all(&other_dir).unwrap();
-        fs::write(other_dir.join("devcontainer.json"), r#"{"image": "x"}"#).unwrap();
-        fs::write(other_dir.join("Dockerfile"), "FROM python:latest\n").unwrap();
+    let mut second = env.recipe();
+    second.options.insert("base".into(), "rust:1.80".into());
+    let err = generate(&env, &mut second, Some(&first)).unwrap_err();
 
-        let previous = {
-            let mut prev = env.recipe();
-            prev.global_template = "other-lang".to_string();
-            prev
-        };
-        let recipe_dir = env.recipe_dir();
-        fs::create_dir_all(&recipe_dir).unwrap();
-        let dockerfile = recipe_dir.join("Dockerfile");
-        fs::write(&dockerfile, "FROM python:latest\n").unwrap();
+    assert!(
+        err.to_string().contains("Dockerfile"),
+        "the refusal should name the file: {err}"
+    );
+    assert_eq!(
+        fs::read_to_string(&dockerfile).unwrap(),
+        "FROM rust:1.75\nRUN cargo install just\n",
+        "a rejected refresh must leave the project untouched"
+    );
+}
 
-        prepare_recipe_directory_in(
-            &env.dev_home,
-            &env.recipe(),
-            &recipe_dir,
-            AuxPolicy::Refresh {
-                previous: Some(&previous),
-            },
-        )
-        .unwrap();
+/// Re-running `dev new` only to add a feature changes nothing that generates
+/// auxiliary files, so a customized Dockerfile must survive rather than
+/// blocking the whole command.
+#[test]
+fn rerunning_with_unchanged_options_keeps_a_customized_auxiliary_file() {
+    let env = dockerfile_env();
+    write_template_aux(
+        &env,
+        "test-lang",
+        "Dockerfile",
+        "FROM ${templateOption:base}\n",
+    );
 
-        assert_eq!(
-            fs::read_to_string(&dockerfile).unwrap(),
-            "FROM rust:latest\n",
-            "a file matching the previous template is generated, not authored"
-        );
-    }
+    let mut first = env.recipe();
+    first.options.insert("base".into(), "rust:1.75".into());
+    generate(&env, &mut first, None).unwrap();
+    let dockerfile = env.recipe_dir().join("Dockerfile");
+    fs::write(&dockerfile, "FROM rust:1.75\nRUN cargo install just\n").unwrap();
 
-    #[test]
-    fn switching_templates_still_refuses_an_authored_file() {
-        let env = TestDevHome::new(
-            r#"{"build": {"dockerfile": "Dockerfile"}}"#,
-            None,
-            None,
-            "docker",
-        );
-        fs::write(
-            env.dev_home
-                .global_template_dir("test-lang")
-                .join("Dockerfile"),
-            "FROM rust:latest\n",
-        )
-        .unwrap();
-        let other_dir = env.dev_home.global_template_dir("other-lang");
-        fs::create_dir_all(&other_dir).unwrap();
-        fs::write(other_dir.join("devcontainer.json"), r#"{"image": "x"}"#).unwrap();
-        fs::write(other_dir.join("Dockerfile"), "FROM python:latest\n").unwrap();
+    let mut second = env.recipe();
+    second.options.insert("base".into(), "rust:1.75".into());
+    second.features = vec!["ghcr.io/features/node:1".to_string()];
+    generate(&env, &mut second, Some(&first)).unwrap();
 
-        let previous = {
-            let mut prev = env.recipe();
-            prev.global_template = "other-lang".to_string();
-            prev
-        };
-        let recipe_dir = env.recipe_dir();
-        fs::create_dir_all(&recipe_dir).unwrap();
-        let dockerfile = recipe_dir.join("Dockerfile");
-        fs::write(&dockerfile, "FROM python:latest\nRUN pip install uv\n").unwrap();
+    assert_eq!(
+        fs::read_to_string(&dockerfile).unwrap(),
+        "FROM rust:1.75\nRUN cargo install just\n",
+        "an unrelated rerun must not touch or reject a customized file"
+    );
+}
 
-        let err = prepare_recipe_directory_in(
-            &env.dev_home,
-            &env.recipe(),
-            &recipe_dir,
-            AuxPolicy::Refresh {
-                previous: Some(&previous),
-            },
-        )
-        .unwrap_err();
+/// Editing a global template is a first-class flow, and the recorded hash is
+/// what makes the resulting change detectable at all.
+#[test]
+fn editing_the_global_template_refreshes_an_untouched_auxiliary_file() {
+    let env = dockerfile_env();
+    write_template_aux(&env, "test-lang", "Dockerfile", "FROM rust:1.75\n");
 
-        assert!(err.to_string().contains("Dockerfile"), "{err}");
-        assert_eq!(
-            fs::read_to_string(&dockerfile).unwrap(),
-            "FROM python:latest\nRUN pip install uv\n"
-        );
-    }
+    let mut first = env.recipe();
+    generate(&env, &mut first, None).unwrap();
+    let dockerfile = env.recipe_dir().join("Dockerfile");
+    assert_eq!(fs::read_to_string(&dockerfile).unwrap(), "FROM rust:1.75\n");
+
+    write_template_aux(&env, "test-lang", "Dockerfile", "FROM rust:1.80\n");
+    let mut second = env.recipe();
+    generate(&env, &mut second, Some(&first)).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(&dockerfile).unwrap(),
+        "FROM rust:1.80\n",
+        "the same template and options can still generate different bytes"
+    );
+}
+
+#[test]
+fn editing_the_global_template_still_refuses_an_authored_file() {
+    let env = dockerfile_env();
+    write_template_aux(&env, "test-lang", "Dockerfile", "FROM rust:1.75\n");
+
+    let mut first = env.recipe();
+    generate(&env, &mut first, None).unwrap();
+    let dockerfile = env.recipe_dir().join("Dockerfile");
+    fs::write(&dockerfile, "FROM rust:1.75\nRUN cargo install just\n").unwrap();
+
+    write_template_aux(&env, "test-lang", "Dockerfile", "FROM rust:1.80\n");
+    let mut second = env.recipe();
+    let err = generate(&env, &mut second, Some(&first)).unwrap_err();
+
+    assert!(err.to_string().contains("Dockerfile"), "{err}");
+    assert_eq!(
+        fs::read_to_string(&dockerfile).unwrap(),
+        "FROM rust:1.75\nRUN cargo install just\n"
+    );
+}
+
+/// A recipe written before provenance was recorded cannot vouch for anything
+/// on disk, so the safe answer is to stop rather than guess.
+#[test]
+fn an_unrecorded_auxiliary_file_is_never_overwritten() {
+    let env = dockerfile_env();
+    write_template_aux(&env, "test-lang", "Dockerfile", "FROM rust:latest\n");
+    let recipe_dir = env.recipe_dir();
+    fs::create_dir_all(&recipe_dir).unwrap();
+    let dockerfile = recipe_dir.join("Dockerfile");
+    fs::write(&dockerfile, "FROM handwritten\n").unwrap();
+
+    let legacy = env.recipe();
+    assert!(legacy.generated.is_empty());
+    let mut next = env.recipe();
+    let err = generate(&env, &mut next, Some(&legacy)).unwrap_err();
+
+    assert!(err.to_string().contains("Dockerfile"), "{err}");
+    assert_eq!(
+        fs::read_to_string(&dockerfile).unwrap(),
+        "FROM handwritten\n"
+    );
+}
+
+#[test]
+fn switching_templates_regenerates_a_file_the_old_template_generated() {
+    let env = dockerfile_env();
+    write_template_aux(&env, "test-lang", "Dockerfile", "FROM rust:latest\n");
+    add_template(&env, "other-lang", r#"{"image": "x"}"#);
+    write_template_aux(&env, "other-lang", "Dockerfile", "FROM python:latest\n");
+
+    let mut previous = env.recipe();
+    previous.global_template = "other-lang".to_string();
+    generate(&env, &mut previous, None).unwrap();
+    let dockerfile = env.recipe_dir().join("Dockerfile");
+    assert_eq!(
+        fs::read_to_string(&dockerfile).unwrap(),
+        "FROM python:latest\n"
+    );
+
+    let mut switched = env.recipe();
+    generate(&env, &mut switched, Some(&previous)).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(&dockerfile).unwrap(),
+        "FROM rust:latest\n",
+        "a file matching the previous template's record is generated, not authored"
+    );
+}
+
+#[test]
+fn switching_templates_still_refuses_an_authored_file() {
+    let env = dockerfile_env();
+    write_template_aux(&env, "test-lang", "Dockerfile", "FROM rust:latest\n");
+    add_template(&env, "other-lang", r#"{"image": "x"}"#);
+    write_template_aux(&env, "other-lang", "Dockerfile", "FROM python:latest\n");
+
+    let mut previous = env.recipe();
+    previous.global_template = "other-lang".to_string();
+    generate(&env, &mut previous, None).unwrap();
+    let dockerfile = env.recipe_dir().join("Dockerfile");
+    fs::write(&dockerfile, "FROM python:latest\nRUN pip install uv\n").unwrap();
+
+    let mut switched = env.recipe();
+    let err = generate(&env, &mut switched, Some(&previous)).unwrap_err();
+
+    assert!(err.to_string().contains("Dockerfile"), "{err}");
+    assert_eq!(
+        fs::read_to_string(&dockerfile).unwrap(),
+        "FROM python:latest\nRUN pip install uv\n"
+    );
+}
 
     #[test]
     fn composing_a_recipe_writes_nothing_to_the_project() {

@@ -195,6 +195,18 @@ pub enum Command {
         #[arg(long)]
         insiders: bool,
     },
+
+    /// VS Code integration
+    Vscode {
+        #[command(subcommand)]
+        action: VscodeAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum VscodeAction {
+    /// Re-link a legacy user-scoped devcontainer.json for VS Code
+    Repair,
 }
 
 #[derive(Subcommand, Debug)]

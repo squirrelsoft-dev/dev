@@ -73,21 +73,6 @@ pub fn find_config_source_in(
     Err(DevError::NoConfig(workspace.display().to_string()))
 }
 
-/// Locate the devcontainer configuration file for a workspace.
-///
-/// Search order:
-/// 1. `<workspace>/.devcontainer/recipe.json` (returns virtual composed path)
-/// 2. `<workspace>/.devcontainer/devcontainer.json`
-/// 3. `<workspace>/.devcontainer.json`
-/// 4. `~/.dev/devcontainers/<workspace-folder>/.devcontainer/recipe.json` (returns virtual composed path)
-/// 5. `~/.dev/devcontainers/<workspace-folder>/.devcontainer/devcontainer.json`
-pub fn find_devcontainer_config(workspace: &Path) -> Result<PathBuf, DevError> {
-    match find_config_source(workspace)? {
-        ConfigSource::Direct(path) => Ok(path),
-        ConfigSource::Recipe(path) => Ok(path.with_file_name("devcontainer.json")),
-    }
-}
-
 /// Get just the directory name of the workspace path.
 pub fn workspace_folder_name(workspace: &Path) -> String {
     workspace
@@ -114,7 +99,7 @@ mod tests {
 
     #[test]
     fn test_find_config_missing() {
-        let result = find_devcontainer_config(Path::new("/nonexistent/path"));
+        let result = find_config_source(Path::new("/nonexistent/path"));
         assert!(result.is_err());
     }
 
@@ -134,10 +119,6 @@ mod tests {
             ConfigSource::Recipe(path) => assert_eq!(path, recipe_path),
             other => panic!("expected workspace recipe source, got {other:?}"),
         }
-        assert_eq!(
-            find_devcontainer_config(workspace.path()).unwrap(),
-            devcontainer_dir.join("devcontainer.json")
-        );
     }
 
     #[test]

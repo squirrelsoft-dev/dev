@@ -932,7 +932,7 @@ fn interactive_other(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::fs;
     use tempfile::TempDir;
 
@@ -1269,6 +1269,7 @@ mod tests {
             features: Vec::new(),
             options: HashMap::new(),
             customizations: Value::Object(serde_json::Map::new()),
+            generated: BTreeMap::new(),
         };
         recipe.write_to(&recipe_path).unwrap();
         (dir, config_path, recipe_path)
