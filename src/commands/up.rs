@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::devcontainer::{
@@ -10,13 +10,12 @@ use crate::devcontainer::{
 use crate::devcontainer::compose::{compose_and_write, compose_config_with_base};
 use crate::devcontainer::config::MountSpec;
 use crate::devcontainer::effective::{
-    effective_config_from_value, load_effective_config, project_owned_features,
+    effective_config_from_value, load_effective_config, LockfilePolicy,
 };
 use crate::devcontainer::features::{
     MergedCapabilities, ResolvedFeature, capabilities_from_metadata, feature_image_tag,
     generate_feature_dockerfile_with_opts, order_features,
 };
-use crate::devcontainer::lockfile::{handle_lockfile, lockfile_path};
 use crate::devcontainer::uid;
 use crate::runtime::{
     BindMount, ContainerConfig, ContainerRuntime, ContainerState, PortMapping, VolumeMount,
@@ -45,22 +44,22 @@ pub async fn run(
         ConfigSource::Recipe(recipe_path) => {
             let recipe = Recipe::from_path(&recipe_path)?;
             let (path, canonical) = compose_and_write(&recipe, runtime.runtime_name())?;
-            let value = if no_base {
-                compose_config_with_base(&recipe, runtime.runtime_name(), false)?
+            let composed = if no_base {
+                (compose_config_with_base(&recipe, runtime.runtime_name(), false)?, false)
             } else {
-                canonical
+                (canonical, true)
             };
-            (path, Some(value))
+            (path, Some(composed))
         }
     };
     // Recipe configs resolve their own layers, base included, so the runtime base
     // layer would be a second application whose prune can discard a base selector
     // the recipe deliberately kept.
     let effective = match composed {
-        Some(value) => effective_config_from_value(value)?,
+        Some((value, is_persisted)) => effective_config_from_value(value, is_persisted)?,
         None => load_effective_config(&config_path, !no_base)?,
     };
-    let base_feature_ids = effective.base_feature_ids;
+    let lockfile = LockfilePolicy::new(&effective, frozen_lockfile);
     let mut config = effective.config;
     apply_cli_overrides(&mut config, port_overrides)?;
 
@@ -68,8 +67,8 @@ pub async fn run(
     if config.is_compose() {
         return run_compose(
             workspace, &config, &config_path, runtime.as_ref(),
-            rebuild, no_cache, verbose, frozen_lockfile,
-            update_remote_user_uid_default, &base_feature_ids,
+            rebuild, no_cache, verbose,
+            update_remote_user_uid_default, &lockfile,
         ).await;
     }
 
@@ -215,15 +214,8 @@ pub async fn run(
                 );
             }
 
-            // Lockfile handling (Gap 11). The lockfile is a project artifact, so
-            // only the features the project owns are locked or verified.
-            let locked_features = project_owned_features(&features, &base_feature_ids);
-            if let Some(ref dc_dir) = devcontainer_dir
-                && !locked_features.is_empty()
-            {
-                let lf_path = lockfile_path(dc_dir);
-                handle_lockfile(&lf_path, &locked_features, frozen_lockfile)?;
-            }
+            // Lockfile handling (Gap 11).
+            lockfile.apply(devcontainer_dir.as_deref(), &features)?;
 
             let ordered = order_features(&features);
             if verbose {
@@ -575,9 +567,8 @@ async fn run_compose(
     _rebuild: bool,
     no_cache: bool,
     verbose: bool,
-    frozen_lockfile: bool,
     update_remote_user_uid_default: &str,
-    base_feature_ids: &HashSet<String>,
+    lockfile: &LockfilePolicy,
 ) -> anyhow::Result<()> {
     let compose_data = config.docker_compose_file.as_ref().unwrap();
     let compose_files = compose_data.files();
@@ -659,14 +650,8 @@ async fn run_compose(
             );
         }
 
-        // Lockfile handling. Only project-owned features are locked or verified.
-        let locked_features = project_owned_features(&features, base_feature_ids);
-        if let Some(ref dc_dir) = devcontainer_dir_buf
-            && !locked_features.is_empty()
-        {
-            let lf_path = lockfile_path(dc_dir);
-            handle_lockfile(&lf_path, &locked_features, frozen_lockfile)?;
-        }
+        // Lockfile handling.
+        lockfile.apply(devcontainer_dir_buf.as_deref(), &features)?;
 
         let ordered = order_features(&features);
         if verbose {

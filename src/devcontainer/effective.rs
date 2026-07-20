@@ -10,6 +10,7 @@ use crate::util::paths::base_config_dir;
 use super::config::DevcontainerConfig;
 use super::features::{features_required_by, ResolvedFeature};
 use super::jsonc::parse_jsonc;
+use super::lockfile::{handle_lockfile, lockfile_path};
 use super::merge::merge_layers;
 
 /// A project configuration with the base layer merged in, plus the provenance
@@ -18,6 +19,13 @@ pub(crate) struct EffectiveConfig {
     pub(crate) config: DevcontainerConfig,
     /// Feature ids the base layer contributed that the project does not declare.
     pub(crate) base_feature_ids: HashSet<String>,
+    /// Whether the lockfile beside the config path describes this run's features.
+    ///
+    /// False when the run deliberately composed something other than what is
+    /// persisted — a recipe project run with `--no-base` — so the lockfile there
+    /// must be neither rewritten from the run's narrower feature set nor verified
+    /// against it.
+    pub(crate) owns_lockfile: bool,
 }
 
 pub(crate) fn load_effective_config(config_path: &Path, include_base: bool) -> anyhow::Result<EffectiveConfig> {
@@ -26,7 +34,7 @@ pub(crate) fn load_effective_config(config_path: &Path, include_base: bool) -> a
         load_effective_config_value(config_path, include_base, &base_path)?;
     let config = serde_json::from_value(value)
         .map_err(|e| DevError::InvalidConfig(format!("Failed to parse merged config: {e}")))?;
-    Ok(EffectiveConfig { config, base_feature_ids })
+    Ok(EffectiveConfig { config, base_feature_ids, owns_lockfile: true })
 }
 
 /// Build an [`EffectiveConfig`] from an already-composed config value.
@@ -34,10 +42,68 @@ pub(crate) fn load_effective_config(config_path: &Path, include_base: bool) -> a
 /// Recipe projects compose their layers up front, so the base layer is either
 /// already baked in or was deliberately left out; either way there is nothing
 /// further to merge and no base-owned features to keep out of the lockfile.
-pub(crate) fn effective_config_from_value(value: Value) -> anyhow::Result<EffectiveConfig> {
+///
+/// `is_persisted` says whether this value is the one written to disk. A `--no-base`
+/// run composes a narrower config than the persisted file, and its lockfile must
+/// stay out of the composed directory.
+pub(crate) fn effective_config_from_value(
+    value: Value,
+    is_persisted: bool,
+) -> anyhow::Result<EffectiveConfig> {
     let config = serde_json::from_value(value)
         .map_err(|e| DevError::InvalidConfig(format!("Failed to parse composed config: {e}")))?;
-    Ok(EffectiveConfig { config, base_feature_ids: HashSet::new() })
+    Ok(EffectiveConfig {
+        config,
+        base_feature_ids: HashSet::new(),
+        owns_lockfile: is_persisted,
+    })
+}
+
+/// Everything needed to decide what a run may write to a project's lockfile.
+///
+/// The rules — exclude base-contributed features, and write nothing at all when
+/// the run's config is not the persisted one — apply identically to every build
+/// path in `dev up` and `dev build`, so they live here rather than being restated
+/// at each `handle_lockfile` call.
+pub(crate) struct LockfilePolicy {
+    pub(crate) base_feature_ids: HashSet<String>,
+    pub(crate) owns_lockfile: bool,
+    pub(crate) frozen: bool,
+}
+
+impl LockfilePolicy {
+    pub(crate) fn new(effective: &EffectiveConfig, frozen: bool) -> Self {
+        LockfilePolicy {
+            base_feature_ids: effective.base_feature_ids.clone(),
+            owns_lockfile: effective.owns_lockfile,
+            frozen,
+        }
+    }
+
+    /// Reconcile the lockfile in `devcontainer_dir` against this run's features.
+    pub(crate) fn apply(
+        &self,
+        devcontainer_dir: Option<&Path>,
+        features: &[ResolvedFeature],
+    ) -> anyhow::Result<()> {
+        let Some(dir) = devcontainer_dir else {
+            return Ok(());
+        };
+        if !self.owns_lockfile {
+            eprintln!(
+                "Leaving {} untouched: this run composed a narrower config than the \
+                 one stored there, so its features are not the lockfile's.",
+                lockfile_path(dir).display()
+            );
+            return Ok(());
+        }
+        let owned = project_owned_features(features, &self.base_feature_ids);
+        if owned.is_empty() {
+            return Ok(());
+        }
+        handle_lockfile(&lockfile_path(dir), &owned, self.frozen)?;
+        Ok(())
+    }
 }
 
 /// Features that belong to the project: everything it declares, plus the
@@ -275,8 +341,9 @@ fn prune_lower_priority_definitions(
 mod tests {
     use super::{
         absolutize_mount_string, effective_config_from_value, load_effective_config_value,
-        project_owned_features,
+        project_owned_features, LockfilePolicy,
     };
+    use crate::devcontainer::lockfile::lockfile_path;
     use crate::devcontainer::config::{DevcontainerConfig, LifecycleCommand};
     use crate::devcontainer::features::{feature_image_tag, ResolvedFeature};
     use crate::devcontainer::resolve_features;
@@ -988,7 +1055,7 @@ mod tests {
             }
         });
 
-        let effective = effective_config_from_value(composed).unwrap();
+        let effective = effective_config_from_value(composed, true).unwrap();
 
         assert_eq!(effective.config.image.as_deref(), Some("rust:latest"));
         assert_eq!(effective.config.remote_user.as_deref(), Some("vscode"));
@@ -1005,8 +1072,51 @@ mod tests {
     }
 
     #[test]
+    fn a_non_persisted_composition_never_touches_the_lockfile() {
+        let dir = TempDir::new().unwrap();
+        let features = vec![make_test_feature("ghcr.io/f/node:1", false)];
+        let effective =
+            effective_config_from_value(serde_json::json!({"image": "ubuntu:24.04"}), false)
+                .unwrap();
+
+        let policy = LockfilePolicy::new(&effective, false);
+        policy.apply(Some(dir.path()), &features).unwrap();
+
+        assert!(
+            !lockfile_path(dir.path()).exists(),
+            "a --no-base recipe run must not write a lockfile beside the persisted config"
+        );
+    }
+
+    #[test]
+    fn a_non_persisted_composition_skips_frozen_verification() {
+        let dir = TempDir::new().unwrap();
+        let features = vec![make_test_feature("ghcr.io/f/node:1", false)];
+        let effective =
+            effective_config_from_value(serde_json::json!({"image": "ubuntu:24.04"}), false)
+                .unwrap();
+
+        let policy = LockfilePolicy::new(&effective, true);
+
+        assert!(
+            policy.apply(Some(dir.path()), &features).is_ok(),
+            "--frozen-lockfile must not fail on a lockfile this run does not own"
+        );
+        assert!(!lockfile_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn a_persisted_composition_owns_its_lockfile() {
+        let effective =
+            effective_config_from_value(serde_json::json!({"image": "ubuntu:24.04"}), true)
+                .unwrap();
+
+        assert!(LockfilePolicy::new(&effective, false).owns_lockfile);
+    }
+
+    #[test]
     fn composed_config_reports_parse_errors() {
-        let Err(err) = effective_config_from_value(serde_json::json!({"image": 42})) else {
+        let Err(err) = effective_config_from_value(serde_json::json!({"image": 42}), true) else {
             panic!("a non-string image must not deserialize");
         };
 
