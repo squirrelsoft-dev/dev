@@ -18,7 +18,9 @@ pub async fn run(
     let container = containers
         .iter()
         .find(|c| c.state == ContainerState::Running)
-        .ok_or_else(|| anyhow::anyhow!("No running container found for this workspace. Run `dev up` first."))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("No running container found for this workspace. Run `dev up` first.")
+        })?;
 
     // Use explicit --user flag, falling back to remoteUser from config or image metadata
     let resolved_user = if user.is_some() {
@@ -26,11 +28,7 @@ pub async fn run(
     } else {
         let config_user = load_workspace_config_or_warn(workspace, runtime.runtime_name())
             .and_then(|(_, config)| config.remote_user);
-        resolve_remote_user(
-            runtime.as_ref(),
-            &container.image,
-            config_user.as_deref(),
-        ).await?
+        resolve_remote_user(runtime.as_ref(), &container.image, config_user.as_deref()).await?
     };
     let effective_user = resolved_user.as_deref();
 

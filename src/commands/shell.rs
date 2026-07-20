@@ -18,17 +18,16 @@ pub async fn run(
     let container = containers
         .iter()
         .find(|c| c.state == ContainerState::Running)
-        .ok_or_else(|| anyhow::anyhow!("No running container found for this workspace. Run `dev up` first."))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("No running container found for this workspace. Run `dev up` first.")
+        })?;
 
     // Resolve remoteUser and workspaceFolder from config or image metadata
     let config =
         load_workspace_config_or_warn(workspace, runtime.runtime_name()).map(|(_, config)| config);
     let config_user = config.as_ref().and_then(|c| c.remote_user.clone());
-    let user = resolve_remote_user(
-        runtime.as_ref(),
-        &container.image,
-        config_user.as_deref(),
-    ).await?;
+    let user =
+        resolve_remote_user(runtime.as_ref(), &container.image, config_user.as_deref()).await?;
 
     let shell_cmd = if let Some(s) = shell {
         s.to_string()
@@ -51,7 +50,8 @@ pub async fn run(
     // falling back to the default /workspaces/{folder_name}.
     let folder_name = workspace_folder_name(workspace);
     let workdir = substitute_variables(
-        config.as_ref()
+        config
+            .as_ref()
             .and_then(|c| c.workspace_folder.as_deref())
             .unwrap_or(&format!("/workspaces/{folder_name}")),
         workspace,

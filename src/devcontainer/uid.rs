@@ -106,7 +106,14 @@ pub async fn build_uid_image(
 
     eprintln!("Building UID remapping image (uid={uid}, gid={gid})...");
     let result = runtime
-        .build_image(UPDATE_UID_DOCKERFILE, context, &tag, &build_args, no_cache, verbose)
+        .build_image(
+            UPDATE_UID_DOCKERFILE,
+            context,
+            &tag,
+            &build_args,
+            no_cache,
+            verbose,
+        )
         .await;
     let _ = std::fs::remove_dir_all(&tmp_dir);
     result.map_err(|e| anyhow::anyhow!("Failed to build UID image: {e}"))?;

@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::error::AppleContainerError;
 use crate::models::{ContainerSnapshot, RuntimeStatus};
-use crate::routes::{ImageRoute, XpcKey, XpcRoute, IMAGE_SERVICE_NAME};
+use crate::routes::{IMAGE_SERVICE_NAME, ImageRoute, XpcKey, XpcRoute};
 use crate::xpc::connection::XpcConnection;
 use crate::xpc::message::XpcMessage;
 
@@ -14,8 +14,8 @@ pub mod proto {
 
 use proto::builder_client::BuilderClient;
 use proto::{
-    BuildTransfer, ClientStream, ImageTransfer, ServerStream, TransferDirection,
-    client_stream, server_stream,
+    BuildTransfer, ClientStream, ImageTransfer, ServerStream, TransferDirection, client_stream,
+    server_stream,
 };
 
 /// Container ID for the Apple Containers builder VM.
@@ -90,9 +90,9 @@ pub async fn build_image(
             }
             Err(e) => {
                 if attempt == 29 {
-                    return Err(AppleContainerError::XpcError(
-                        format!("builder gRPC server not ready after 30s: {e}"),
-                    ));
+                    return Err(AppleContainerError::XpcError(format!(
+                        "builder gRPC server not ready after 30s: {e}"
+                    )));
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
@@ -101,13 +101,11 @@ pub async fn build_image(
     let _client = client.unwrap();
 
     // Step 3: Resolve context path.
-    let abs_context = std::fs::canonicalize(context)
-        .map_err(AppleContainerError::Io)?;
+    let abs_context = std::fs::canonicalize(context).map_err(AppleContainerError::Io)?;
 
     // Step 4: Build via PerformBuild bidirectional stream.
     let build_id = uuid::Uuid::new_v4().to_string();
     let context_str = abs_context.to_string_lossy().to_string();
-
 
     // Dial a fresh connection for PerformBuild. The info() call completes
     // the HTTP/2 handshake — every successful test had this warmup.
@@ -117,7 +115,9 @@ pub async fn build_image(
     let ch2 = dial_builder_channel(fd2).await?;
     let mut build_client = BuilderClient::new(ch2);
 
-    build_client.info(proto::InfoRequest {}).await
+    build_client
+        .info(proto::InfoRequest {})
+        .await
         .map_err(|e| AppleContainerError::XpcError(format!("fresh info() failed: {e}")))?;
 
     // All headers matching the Swift reference client.
@@ -143,20 +143,33 @@ pub async fn build_image(
     let response = match tokio::time::timeout(
         std::time::Duration::from_secs(300),
         build_client.perform_build(request),
-    ).await {
+    )
+    .await
+    {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
-            return Err(AppleContainerError::XpcError(format!("PerformBuild failed: {e}")));
+            return Err(AppleContainerError::XpcError(format!(
+                "PerformBuild failed: {e}"
+            )));
         }
         Err(_) => {
-            return Err(AppleContainerError::XpcError("PerformBuild timed out".to_string()));
+            return Err(AppleContainerError::XpcError(
+                "PerformBuild timed out".to_string(),
+            ));
         }
     };
 
     let mut server_stream = response.into_inner();
 
     // Process the bidirectional stream.
-    process_build_stream(&mut server_stream, client_tx, &build_id, &abs_context, verbose).await
+    process_build_stream(
+        &mut server_stream,
+        client_tx,
+        &build_id,
+        &abs_context,
+        verbose,
+    )
+    .await
 }
 
 /// Process the PerformBuild bidirectional stream.
@@ -173,9 +186,8 @@ async fn process_build_stream(
     use tokio_stream::StreamExt;
 
     while let Some(msg) = server_stream.next().await {
-        let msg = msg.map_err(|e| {
-            AppleContainerError::XpcError(format!("build stream error: {e}"))
-        })?;
+        let msg =
+            msg.map_err(|e| AppleContainerError::XpcError(format!("build stream error: {e}")))?;
 
         // CRITICAL: The server registers a demux handler keyed by
         // ServerStream.build_id (a per-request UUID, NOT the overall build ID).
@@ -192,18 +204,26 @@ async fn process_build_stream(
                 send_io_ack(&client_tx, reply_id).await?;
             }
             Some(server_stream::PacketType::BuildError(err)) => {
-                return Err(AppleContainerError::XpcError(
-                    format!("Build failed: {}", err.message)
-                ));
+                return Err(AppleContainerError::XpcError(format!(
+                    "Build failed: {}",
+                    err.message
+                )));
             }
-            Some(server_stream::PacketType::CommandComplete(ref _cmd)) => {
-            }
+            Some(server_stream::PacketType::CommandComplete(ref _cmd)) => {}
             Some(server_stream::PacketType::BuildTransfer(transfer)) => {
                 handle_build_transfer(&transfer, &client_tx, reply_id, context, verbose).await?;
             }
             Some(server_stream::PacketType::ImageTransfer(ref transfer)) => {
-                let stage = transfer.metadata.get("stage").map(|s| s.as_str()).unwrap_or("");
-                let method = transfer.metadata.get("method").map(|s| s.as_str()).unwrap_or("");
+                let stage = transfer
+                    .metadata
+                    .get("stage")
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                let method = transfer
+                    .metadata
+                    .get("method")
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
                 if stage == "resolver" && method == "/resolve" {
                     handle_image_resolve(transfer, &client_tx, reply_id).await?;
                 } else if stage == "content-store" {
@@ -211,8 +231,7 @@ async fn process_build_stream(
                 } else {
                 }
             }
-            None => {
-            }
+            None => {}
         }
     }
 
@@ -257,9 +276,10 @@ async fn send_io_ack(
         })),
     };
 
-    client_tx.send(response).await.map_err(|e| {
-        AppleContainerError::XpcError(format!("failed to send IO ack: {e}"))
-    })
+    client_tx
+        .send(response)
+        .await
+        .map_err(|e| AppleContainerError::XpcError(format!("failed to send IO ack: {e}")))
 }
 
 /// Handle BuildTransfer packets — the server asking for file data (fssync).
@@ -276,8 +296,16 @@ async fn handle_build_transfer(
     context: &Path,
     _verbose: bool,
 ) -> Result<(), AppleContainerError> {
-    let stage = transfer.metadata.get("stage").map(|s| s.as_str()).unwrap_or("");
-    let method = transfer.metadata.get("method").map(|s| s.as_str()).unwrap_or("");
+    let stage = transfer
+        .metadata
+        .get("stage")
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let method = transfer
+        .metadata
+        .get("method")
+        .map(|s| s.as_str())
+        .unwrap_or("");
 
     if stage != "fssync" {
         return Ok(());
@@ -294,8 +322,7 @@ async fn handle_build_transfer(
         "info" | "Info" => {
             handle_info(transfer, client_tx, build_id, context).await?;
         }
-        _ => {
-        }
+        _ => {}
     }
 
     Ok(())
@@ -309,15 +336,16 @@ async fn handle_walk(
     build_id: &str,
     context: &Path,
 ) -> Result<(), AppleContainerError> {
-    let include_patterns: Vec<String> = transfer.metadata.get("includePatterns")
+    let include_patterns: Vec<String> = transfer
+        .metadata
+        .get("includePatterns")
         .map(|s| serde_json::from_str(s).unwrap_or_default())
         .unwrap_or_default();
 
     let mut entries = Vec::new();
     walk_dir(context, context, &include_patterns, &mut entries)?;
 
-    let data = serde_json::to_vec(&entries)
-        .map_err(AppleContainerError::Serialization)?;
+    let data = serde_json::to_vec(&entries).map_err(AppleContainerError::Serialization)?;
 
     let mut metadata = std::collections::HashMap::new();
     metadata.insert("stage".to_string(), "fssync".to_string());
@@ -374,10 +402,14 @@ async fn handle_read(
     let path = resolve_path(context, source);
 
     let data = if path.is_file() {
-        let offset = transfer.metadata.get("offset")
+        let offset = transfer
+            .metadata
+            .get("offset")
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
-        let len = transfer.metadata.get("len")
+        let len = transfer
+            .metadata
+            .get("len")
             .and_then(|s| s.parse::<u64>().ok());
 
         let full = std::fs::read(&path).map_err(AppleContainerError::Io)?;
@@ -469,31 +501,46 @@ async fn handle_image_resolve(
     build_id: &str,
 ) -> Result<(), AppleContainerError> {
     // The image reference is in metadata "ref" or the tag field.
-    let reference = transfer.metadata.get("ref")
-        .or_else(|| if transfer.tag.is_empty() { None } else { Some(&transfer.tag) })
+    let reference = transfer
+        .metadata
+        .get("ref")
+        .or_else(|| {
+            if transfer.tag.is_empty() {
+                None
+            } else {
+                Some(&transfer.tag)
+            }
+        })
         .ok_or_else(|| AppleContainerError::XpcError("image resolve: missing ref".into()))?;
-    let platform_str = transfer.metadata.get("platform").map(|s| s.as_str()).unwrap_or("linux/arm64");
+    let platform_str = transfer
+        .metadata
+        .get("platform")
+        .map(|s| s.as_str())
+        .unwrap_or("linux/arm64");
 
-
-    let oci_ref: oci_client::Reference = reference.parse()
-        .map_err(|e: oci_client::ParseError| {
+    let oci_ref: oci_client::Reference =
+        reference.parse().map_err(|e: oci_client::ParseError| {
             AppleContainerError::XpcError(format!("invalid image ref: {e}"))
         })?;
 
     let client = oci_client::Client::default();
     let auth = oci_client::secrets::RegistryAuth::Anonymous;
-    client.auth(&oci_ref, &auth, oci_client::RegistryOperation::Pull).await
-        .map_err(|e| {
-            AppleContainerError::XpcError(format!("registry auth failed: {e}"))
-        })?;
+    client
+        .auth(&oci_ref, &auth, oci_client::RegistryOperation::Pull)
+        .await
+        .map_err(|e| AppleContainerError::XpcError(format!("registry auth failed: {e}")))?;
 
-    let (manifest, digest) = client.pull_image_manifest(&oci_ref, &auth).await
+    let (manifest, digest) = client
+        .pull_image_manifest(&oci_ref, &auth)
+        .await
         .map_err(|e| {
             AppleContainerError::XpcError(format!("failed to pull manifest for {reference}: {e}"))
         })?;
 
     let mut config_data = Vec::new();
-    client.pull_blob(&oci_ref, manifest.config.digest.as_str(), &mut config_data).await
+    client
+        .pull_blob(&oci_ref, manifest.config.digest.as_str(), &mut config_data)
+        .await
         .map_err(|e| {
             AppleContainerError::XpcError(format!("failed to pull config for {reference}: {e}"))
         })?;
@@ -538,14 +585,26 @@ async fn handle_content_store(
 ) -> Result<(), AppleContainerError> {
     let digest = if !transfer.tag.is_empty() {
         &transfer.tag
-    } else if transfer.descriptor.as_ref().map_or(true, |d| d.digest.is_empty()) {
+    } else if transfer
+        .descriptor
+        .as_ref()
+        .map_or(true, |d| d.digest.is_empty())
+    {
         return Ok(());
     } else {
         &transfer.descriptor.as_ref().unwrap().digest
     };
 
-    let _offset = transfer.metadata.get("offset").map(|s| s.as_str()).unwrap_or("0");
-    let _length = transfer.metadata.get("length").map(|s| s.as_str()).unwrap_or("0");
+    let _offset = transfer
+        .metadata
+        .get("offset")
+        .map(|s| s.as_str())
+        .unwrap_or("0");
+    let _length = transfer
+        .metadata
+        .get("length")
+        .map(|s| s.as_str())
+        .unwrap_or("0");
 
     match method {
         "/containerd.services.content.v1.Content/Info" => {
@@ -568,10 +627,8 @@ async fn handle_content_store(
             };
             let _ = client_tx.send(response).await;
         }
-        "/containerd.services.content.v1.Content/ReaderAt" => {
-        }
-        _ => {
-        }
+        "/containerd.services.content.v1.Content/ReaderAt" => {}
+        _ => {}
     }
 
     Ok(())
@@ -595,14 +652,13 @@ fn walk_dir(
 ) -> Result<(), AppleContainerError> {
     let read_dir = std::fs::read_dir(dir).map_err(AppleContainerError::Io)?;
 
-    let mut items: Vec<_> = read_dir
-        .filter_map(|e| e.ok())
-        .collect();
+    let mut items: Vec<_> = read_dir.filter_map(|e| e.ok()).collect();
     items.sort_by_key(|e| e.file_name());
 
     for entry in items {
         let path = entry.path();
-        let name = path.strip_prefix(root)
+        let name = path
+            .strip_prefix(root)
             .unwrap_or(&path)
             .to_string_lossy()
             .to_string();
@@ -647,7 +703,8 @@ impl FileInfo {
         use std::os::unix::fs::MetadataExt;
         use std::time::UNIX_EPOCH;
 
-        let mod_time = meta.modified()
+        let mod_time = meta
+            .modified()
             .ok()
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64)
@@ -689,11 +746,17 @@ const B64_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvw
 
 impl<W: std::io::Write> Base64Encoder<W> {
     fn new(writer: W) -> Self {
-        Self { writer, buf: [0; 3], len: 0 }
+        Self {
+            writer,
+            buf: [0; 3],
+            len: 0,
+        }
     }
 
     fn flush_buf(&mut self) -> std::io::Result<()> {
-        if self.len == 0 { return Ok(()); }
+        if self.len == 0 {
+            return Ok(());
+        }
         let b = &self.buf;
         let mut out = [b'='; 4];
         out[0] = B64_CHARS[(b[0] >> 2) as usize];
@@ -748,9 +811,9 @@ pub async fn dial_container(
     let reply = conn.send_async(&msg).await?;
     reply.check_error()?;
 
-    reply.dup_fd(XpcKey::FD).ok_or_else(|| {
-        AppleContainerError::XpcError("containerDial reply missing fd".to_string())
-    })
+    reply
+        .dup_fd(XpcKey::FD)
+        .ok_or_else(|| AppleContainerError::XpcError("containerDial reply missing fd".to_string()))
 }
 
 /// Create a tonic gRPC channel from a vsock file descriptor.
@@ -762,21 +825,27 @@ async fn dial_builder_channel(
         let send_buf: libc::c_int = 4 << 20; // 4 MB
         let recv_buf: libc::c_int = 2 << 20; // 2 MB
         libc::setsockopt(
-            fd, libc::SOL_SOCKET, libc::SO_SNDBUF,
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
             &send_buf as *const _ as *const libc::c_void,
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         );
         libc::setsockopt(
-            fd, libc::SOL_SOCKET, libc::SO_RCVBUF,
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
             &recv_buf as *const _ as *const libc::c_void,
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         );
     }
 
     let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
-    std_stream.set_nonblocking(true).map_err(AppleContainerError::Io)?;
-    let tokio_stream = tokio::net::UnixStream::from_std(std_stream)
+    std_stream
+        .set_nonblocking(true)
         .map_err(AppleContainerError::Io)?;
+    let tokio_stream =
+        tokio::net::UnixStream::from_std(std_stream).map_err(AppleContainerError::Io)?;
 
     let stream_slot = std::sync::Arc::new(tokio::sync::Mutex::new(Some(tokio_stream)));
     let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -852,9 +921,7 @@ pub async fn unpack_image(
 ///
 /// Returns the raw JSON bytes of the `Kernel` struct, which can be passed
 /// directly to `containerCreate` without deserialization.
-async fn get_default_kernel(
-    conn: &XpcConnection,
-) -> Result<Vec<u8>, AppleContainerError> {
+async fn get_default_kernel(conn: &XpcConnection) -> Result<Vec<u8>, AppleContainerError> {
     let msg = XpcMessage::with_route(XpcRoute::GetDefaultKernel.as_str());
 
     let platform_json = serde_json::to_vec(&serde_json::json!({
@@ -875,9 +942,7 @@ async fn get_default_kernel(
 const BUILDER_IMAGE: &str = "ghcr.io/apple/container-builder-shim/builder:0.8.0";
 
 /// Ensure the builder VM exists and is running via XPC.
-pub async fn ensure_builder(
-    conn: &XpcConnection,
-) -> Result<(), AppleContainerError> {
+pub async fn ensure_builder(conn: &XpcConnection) -> Result<(), AppleContainerError> {
     // Step 1: Check if the builder container already exists.
     let snapshot = get_container(conn, BUILDER_CONTAINER_ID).await;
 
@@ -999,10 +1064,7 @@ pub async fn ensure_builder(
 ///
 /// Uses `containerList` and filters by ID, since the list route returns
 /// snapshot data under a well-known key (`containers`).
-async fn get_container(
-    conn: &XpcConnection,
-    id: &str,
-) -> Option<ContainerSnapshot> {
+async fn get_container(conn: &XpcConnection, id: &str) -> Option<ContainerSnapshot> {
     let msg = XpcMessage::with_route(XpcRoute::ContainerList.as_str());
 
     let reply = conn.send_async(&msg).await.ok()?;
@@ -1016,12 +1078,8 @@ async fn get_container(
 }
 
 /// Bootstrap a container with /dev/null stdio fds.
-async fn bootstrap_container(
-    conn: &XpcConnection,
-    id: &str,
-) -> Result<(), AppleContainerError> {
-    let devnull = std::fs::File::open("/dev/null")
-        .map_err(AppleContainerError::Io)?;
+async fn bootstrap_container(conn: &XpcConnection, id: &str) -> Result<(), AppleContainerError> {
+    let devnull = std::fs::File::open("/dev/null").map_err(AppleContainerError::Io)?;
     let fd = devnull.as_raw_fd();
 
     let msg = XpcMessage::with_route(XpcRoute::ContainerBootstrap.as_str());
@@ -1036,10 +1094,7 @@ async fn bootstrap_container(
 }
 
 /// Start the init process inside a bootstrapped container.
-async fn start_process(
-    conn: &XpcConnection,
-    id: &str,
-) -> Result<(), AppleContainerError> {
+async fn start_process(conn: &XpcConnection, id: &str) -> Result<(), AppleContainerError> {
     let msg = XpcMessage::with_route(XpcRoute::ContainerStartProcess.as_str());
     msg.set_string(XpcKey::ID, id);
     msg.set_string(XpcKey::PROCESS_IDENTIFIER, id);
@@ -1050,10 +1105,7 @@ async fn start_process(
 }
 
 /// Poll until the container reaches Running status (up to ~30 seconds).
-async fn wait_for_running(
-    conn: &XpcConnection,
-    id: &str,
-) -> Result<(), AppleContainerError> {
+async fn wait_for_running(conn: &XpcConnection, id: &str) -> Result<(), AppleContainerError> {
     for _ in 0..30 {
         if let Some(snap) = get_container(conn, id).await {
             if snap.status == RuntimeStatus::Running {

@@ -1,6 +1,4 @@
-use crate::collection::{
-    fetch_collection_index, fetch_features, fetch_templates,
-};
+use crate::collection::{fetch_collection_index, fetch_features, fetch_templates};
 
 pub async fn run(
     kind: &str,
@@ -30,7 +28,10 @@ pub async fn run(
                     Ok(_) => {}
                     Err(e) => {
                         if verbose > 0 {
-                            eprintln!("Warning: failed to fetch templates from '{}': {e}", collection.name);
+                            eprintln!(
+                                "Warning: failed to fetch templates from '{}': {e}",
+                                collection.name
+                            );
                         }
                     }
                 }
@@ -87,7 +88,10 @@ pub async fn run(
                     Ok(_) => {}
                     Err(e) => {
                         if verbose > 0 {
-                            eprintln!("Warning: failed to fetch features from '{}': {e}", collection.name);
+                            eprintln!(
+                                "Warning: failed to fetch features from '{}': {e}",
+                                collection.name
+                            );
                         }
                     }
                 }

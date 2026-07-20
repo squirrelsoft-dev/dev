@@ -6,8 +6,8 @@ use dialoguer::{Confirm, Input};
 
 use crate::cli::ConfigAction;
 use crate::collection::{
-    fetch_all_features, fetch_collection_index, fetch_templates, Collection, TemplateMetadata,
-    template_collections, template_tier, TemplateTier,
+    Collection, TemplateMetadata, TemplateTier, fetch_all_features, fetch_collection_index,
+    fetch_templates, template_collections, template_tier,
 };
 use crate::devcontainer::apply_template;
 use crate::oci::download_artifact;
@@ -15,11 +15,7 @@ use crate::tui::{picker, prompts};
 use crate::util::paths::global_dir;
 
 /// Create a new global template at `~/.dev/global/<name>/`.
-pub async fn new(
-    template: Option<&str>,
-    name: Option<&str>,
-    verbose: u8,
-) -> anyhow::Result<()> {
+pub async fn new(template: Option<&str>, name: Option<&str>, verbose: u8) -> anyhow::Result<()> {
     // Fetch template catalog
     eprintln!("Fetching template catalog...");
     let collections = fetch_collection_index(false).await?;
@@ -89,9 +85,7 @@ pub fn list() -> anyhow::Result<()> {
         let entry = entry?;
         if entry.file_type()?.is_dir() {
             let name = entry.file_name().to_string_lossy().to_string();
-            let config_path = entry
-                .path()
-                .join(".devcontainer/devcontainer.json");
+            let config_path = entry.path().join(".devcontainer/devcontainer.json");
             let detail = if config_path.is_file() {
                 peek_config_image(&config_path).unwrap_or_default()
             } else {
@@ -158,11 +152,7 @@ pub fn remove(name: &str) -> anyhow::Result<()> {
 }
 
 /// View or modify a global template's devcontainer configuration.
-pub async fn config(
-    name: &str,
-    action: Option<ConfigAction>,
-    verbose: u8,
-) -> anyhow::Result<()> {
+pub async fn config(name: &str, action: Option<ConfigAction>, verbose: u8) -> anyhow::Result<()> {
     let config_path = global_dir()
         .join(name)
         .join(".devcontainer/devcontainer.json");
@@ -241,7 +231,10 @@ async fn fetch_all_templates(
     verbose: u8,
 ) -> anyhow::Result<Vec<(String, TemplateMetadata)>> {
     let template_cols = template_collections(collections);
-    let fetches: Vec<_> = template_cols.iter().map(|c| fetch_templates(c, false)).collect();
+    let fetches: Vec<_> = template_cols
+        .iter()
+        .map(|c| fetch_templates(c, false))
+        .collect();
     let results = futures_util::future::join_all(fetches).await;
 
     let mut all = Vec::new();
@@ -263,10 +256,7 @@ async fn fetch_all_templates(
 }
 
 /// Fetch features from all feature collections and present multi-select.
-async fn select_features(
-    collections: &[Collection],
-    _verbose: u8,
-) -> anyhow::Result<Vec<String>> {
+async fn select_features(collections: &[Collection], _verbose: u8) -> anyhow::Result<Vec<String>> {
     let features = fetch_all_features(collections, false).await;
     if features.is_empty() {
         return Ok(Vec::new());

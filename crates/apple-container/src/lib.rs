@@ -8,8 +8,11 @@ use std::os::fd::RawFd;
 use std::path::Path;
 
 use error::AppleContainerError;
-use models::{ContainerConfiguration, ContainerSnapshot, ContainerStats, ImageDescription, ProcessConfiguration};
-use routes::{ImageRoute, XpcKey, XpcRoute, IMAGE_SERVICE_NAME, SERVICE_NAME};
+use models::{
+    ContainerConfiguration, ContainerSnapshot, ContainerStats, ImageDescription,
+    ProcessConfiguration,
+};
+use routes::{IMAGE_SERVICE_NAME, ImageRoute, SERVICE_NAME, XpcKey, XpcRoute};
 use xpc::connection::XpcConnection;
 use xpc::message::XpcMessage;
 
@@ -241,9 +244,9 @@ impl AppleContainerClient {
         let reply = self.connection.send_async(&msg).await?;
         reply.check_error()?;
 
-        let data = reply.get_data(XpcKey::STATISTICS).ok_or_else(|| {
-            AppleContainerError::XpcError("stats reply missing data".to_string())
-        })?;
+        let data = reply
+            .get_data(XpcKey::STATISTICS)
+            .ok_or_else(|| AppleContainerError::XpcError("stats reply missing data".to_string()))?;
         let stats: ContainerStats = serde_json::from_slice(&data)?;
         Ok(stats)
     }
@@ -262,7 +265,15 @@ impl AppleContainerClient {
         no_cache: bool,
         verbose: bool,
     ) -> Result<(), AppleContainerError> {
-        build::build_image(&self.connection, dockerfile, context, tag, no_cache, verbose).await
+        build::build_image(
+            &self.connection,
+            dockerfile,
+            context,
+            tag,
+            no_cache,
+            verbose,
+        )
+        .await
     }
 
     /// List locally available images.
