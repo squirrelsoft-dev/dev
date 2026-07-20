@@ -57,7 +57,7 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
   macos:
-    name: Build and test (macOS, --features apple)
+    name: Build, test, and lint (macOS, --features apple)
     runs-on: macos-latest
     steps:
       - name: Checkout sources
@@ -89,7 +89,7 @@ jobs:
       # `-p devcontainer --no-deps` scopes the gate to the root package, so
       # src/runtime/apple.rs is linted while crates/apple-container is only
       # built as a dependency. That crate has outstanding lints under
-      # -D warnings; cleaning it up is tracked separately, and until then it
-      # stays out of scope here rather than blocking this gate.
+      # -D warnings; cleaning it up is out of scope for this issue, so it stays
+      # excluded here rather than blocking this gate.
       - name: cargo clippy --features apple
         run: cargo clippy -p devcontainer --features apple --all-targets --no-deps -- -D warnings
