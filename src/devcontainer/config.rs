@@ -263,17 +263,19 @@ impl DevcontainerConfig {
 /// Accepts Docker's three accepted key names: `target`, `dst`, `destination`.
 /// Returns `None` if no destination segment is found.
 ///
-/// Handles comma-separated key=value pairs. Only the first `=` after the key
-/// is the split, so values containing `=` are preserved. Does not attempt to
-/// handle quoted values containing commas — Docker's own parser has the same
-/// limitation, and devcontainer configs don't use it.
+/// Handles comma-separated key=value pairs. Trims whitespace on both sides of
+/// the `=` separator, so `"key = value"`, `"key =value"`, and `"key= value"`
+/// all parse. Values containing `=` are preserved (only the first `=` is the
+/// split). Does not attempt to handle quoted values containing commas —
+/// Docker's own parser has the same limitation, and devcontainer configs
+/// don't use it.
 fn parse_mount_target(mount: &str) -> Option<String> {
     for segment in mount.split(',') {
-        let segment = segment.trim();
-        for key in ["target", "dst", "destination"] {
-            if let Some(rest) = segment.strip_prefix(&format!("{key}=")) {
-                return Some(rest.to_string());
-            }
+        // Split on the first `=` and trim whitespace from each side independently.
+        let (raw_key, raw_value) = segment.split_once('=')?;
+        let key = raw_key.trim();
+        if matches!(key, "target" | "dst" | "destination") {
+            return Some(raw_value.trim().to_string());
         }
     }
     None
@@ -404,15 +406,27 @@ mod workspace_mount_tests {
 
     #[test]
     fn parse_mount_target_handles_spaces_around_equals() {
-        // Real configs occasionally have spaces around the = in mount strings.
-        // The outer trim() in the parser is what handles "key =value" forms.
-        // "key = value" (space on both sides) is not currently supported and
-        // would return None — this test documents the current tolerance.
+        // The parser trims whitespace on both sides of the `=` separator, so
+        // all of these forms are accepted.
         assert_eq!(
             parse_mount_target("source=/host, target=/x,type=bind"),
             Some("/x".to_string()),
         );
+        assert_eq!(
+            parse_mount_target("source=/host, target = /y,type=bind"),
+            Some("/y".to_string()),
+        );
+        assert_eq!(
+            parse_mount_target("source=/host, target =/z,type=bind"),
+            Some("/z".to_string()),
+        );
+        assert_eq!(
+            parse_mount_target("source=/host, target =/w ,type=bind"),
+            Some("/w".to_string()),
+        );
         assert_eq!(parse_mount_target("type=bind,readonly"), None);
+        // Keys other than target/dst/destination are not destinations.
+        assert_eq!(parse_mount_target("source=/host,readonly"), None);
     }
 }
 
