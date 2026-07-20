@@ -98,7 +98,9 @@ dev base config add remoteEnv EDITOR=vim
 
 If no base config exists, this layer is simply skipped. Pass `--no-base` to `dev up` or `dev build` to skip it for a single run.
 
-The base config is merged in memory only — it is never written into the project's `.devcontainer/devcontainer.json`, and features it contributes are kept out of the project's `devcontainer-lock.json`.
+For a project with its own `.devcontainer/devcontainer.json`, the base config is merged in memory only — it is never written into that file, and features it contributes are kept out of the project's `devcontainer-lock.json`.
+
+Recipe-based (user-scoped) projects work differently: their layers are composed ahead of time and the result is written to `~/.dev/devcontainers/<folder>/.devcontainer/devcontainer.json`, so the base layer is baked into that composed file. `--no-base` stays local to the run either way — it never rewrites the composed file without the base layer, so `dev config` keeps showing the same config the next `dev up` will use.
 
 ### Global templates
 
@@ -143,7 +145,9 @@ Higher-priority layers override lower ones, with merge behavior depending on the
 
 ### Derived images and disk use
 
-When a config declares features, `dev up` and `dev build` layer them onto a derived image tagged `<folder>-features-<digest>`, where the digest covers the effective image, build, features, `remoteUser`, `containerEnv`, and `remoteEnv`. This is what keeps a cached image from silently omitting base-config changes: edit any of those and the next run builds a new image rather than reusing a stale one.
+When a config declares features, `dev up` and `dev build` layer them onto a derived image tagged `<folder>-features-<digest>`. The digest covers the effective config values that shape the image: the base image *selector* (`image`, or `build.dockerfile`/`context`/`args`), the declared `features`, `remoteUser`, `containerEnv`, and `remoteEnv`. Edit any of those and the next run builds a new image rather than reusing a stale one — which is what keeps a cached image from silently omitting base-config changes.
+
+The digest covers selectors, not the files they point at. Editing a `Dockerfile` referenced by `build.dockerfile` leaves the digest unchanged, so the cached image is reused; pass `--rebuild` or `--no-cache` after changing Dockerfile contents.
 
 The consequence is that superseded images are left behind rather than overwritten in place. `dev` does not delete them automatically, since it cannot tell which are still in use by stopped containers or other tooling. Reclaim the space with your runtime's own tooling when it starts to matter:
 

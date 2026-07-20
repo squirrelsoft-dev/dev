@@ -3,7 +3,10 @@ use std::path::Path;
 use crate::devcontainer::{
     Recipe, download_features, resolve_features, stage_feature_context,
 };
-use crate::devcontainer::effective::{load_effective_config, project_owned_features};
+use crate::devcontainer::compose::{compose_and_write, compose_config_with_base};
+use crate::devcontainer::effective::{
+    effective_config_from_value, load_effective_config, project_owned_features,
+};
 use crate::devcontainer::features::{
     feature_image_tag, generate_feature_dockerfile_with_opts, order_features,
 };
@@ -26,22 +29,26 @@ pub async fn run(
     no_base: bool,
 ) -> anyhow::Result<()> {
     let runtime = detect_runtime(runtime_override).await?;
-    let (config_path, from_recipe) = match find_config_source(workspace)? {
-        ConfigSource::Direct(path) => (path, false),
+    let (config_path, composed) = match find_config_source(workspace)? {
+        ConfigSource::Direct(path) => (path, None),
         ConfigSource::Recipe(recipe_path) => {
             let recipe = Recipe::from_path(&recipe_path)?;
-            let composed = crate::devcontainer::compose::compose_and_write_with_base(
-                &recipe,
-                runtime.runtime_name(),
-                !no_base,
-            )?;
-            (composed, true)
+            let (path, canonical) = compose_and_write(&recipe, runtime.runtime_name())?;
+            let value = if no_base {
+                compose_config_with_base(&recipe, runtime.runtime_name(), false)?
+            } else {
+                canonical
+            };
+            (path, Some(value))
         }
     };
-    // Recipe configs already merged the base layer into the composed file, so
-    // re-applying it here would let the prune discard a base selector the recipe
-    // deliberately kept.
-    let effective = load_effective_config(&config_path, !no_base && !from_recipe)?;
+    // Recipe configs resolve their own layers, base included, so the runtime base
+    // layer would be a second application whose prune can discard a base selector
+    // the recipe deliberately kept.
+    let effective = match composed {
+        Some(value) => effective_config_from_value(value)?,
+        None => load_effective_config(&config_path, !no_base)?,
+    };
     let base_feature_ids = effective.base_feature_ids;
     let config = effective.config;
 

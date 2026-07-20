@@ -124,13 +124,17 @@ pub(crate) fn compose_config_with_base(
 /// Compose the config and write it to the project's `.devcontainer/devcontainer.json`.
 /// Also copies auxiliary files (Dockerfiles, compose files, scripts) from the
 /// global template directory so that relative paths in the config resolve correctly.
-/// Returns the path to the written file.
-pub(crate) fn compose_and_write_with_base(
+/// Returns the path to the written file along with the composed value.
+///
+/// The persisted file is always the full, base-inclusive composition. A run that
+/// opts out of the base layer composes its own config in memory via
+/// [`compose_config_with_base`] instead, so `--no-base` cannot leave a base-free
+/// config behind for the next `dev config` or `dev up` to read.
+pub(crate) fn compose_and_write(
     recipe: &Recipe,
     runtime_name: &str,
-    include_base: bool,
-) -> anyhow::Result<PathBuf> {
-    let composed = compose_config_with_base(recipe, runtime_name, include_base)?;
+) -> anyhow::Result<(PathBuf, Value)> {
+    let composed = compose_config_with_base(recipe, runtime_name, true)?;
 
     let folder_name = Path::new(&recipe.root_folder)
         .file_name()
@@ -152,7 +156,7 @@ pub(crate) fn compose_and_write_with_base(
     let formatted = serde_json::to_string_pretty(&composed)?;
     fs::write(&dest_path, &formatted)?;
 
-    Ok(dest_path)
+    Ok((dest_path, composed))
 }
 
 /// Copy non-config files from a global template's `.devcontainer/` directory to

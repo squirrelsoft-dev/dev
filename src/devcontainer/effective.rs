@@ -29,6 +29,17 @@ pub(crate) fn load_effective_config(config_path: &Path, include_base: bool) -> a
     Ok(EffectiveConfig { config, base_feature_ids })
 }
 
+/// Build an [`EffectiveConfig`] from an already-composed config value.
+///
+/// Recipe projects compose their layers up front, so the base layer is either
+/// already baked in or was deliberately left out; either way there is nothing
+/// further to merge and no base-owned features to keep out of the lockfile.
+pub(crate) fn effective_config_from_value(value: Value) -> anyhow::Result<EffectiveConfig> {
+    let config = serde_json::from_value(value)
+        .map_err(|e| DevError::InvalidConfig(format!("Failed to parse composed config: {e}")))?;
+    Ok(EffectiveConfig { config, base_feature_ids: HashSet::new() })
+}
+
 /// Features that belong to the project: everything it declares, plus the
 /// dependency closure of those declarations. Base-contributed features and any
 /// dependency pulled in only by them are excluded.
@@ -263,7 +274,8 @@ fn prune_lower_priority_definitions(
 #[cfg(test)]
 mod tests {
     use super::{
-        absolutize_mount_string, load_effective_config_value, project_owned_features,
+        absolutize_mount_string, effective_config_from_value, load_effective_config_value,
+        project_owned_features,
     };
     use crate::devcontainer::config::{DevcontainerConfig, LifecycleCommand};
     use crate::devcontainer::features::{feature_image_tag, ResolvedFeature};
@@ -962,6 +974,45 @@ mod tests {
         assert_eq!(
             feature_image_tag("vsc-demo", &config_a, &resolve_features(&config_a).unwrap()),
             feature_image_tag("vsc-demo", &config_b, &resolve_features(&config_b).unwrap()),
+        );
+    }
+
+    #[test]
+    fn composed_config_contributes_no_base_owned_features() {
+        let composed = serde_json::json!({
+            "image": "rust:latest",
+            "remoteUser": "vscode",
+            "features": {
+                "ghcr.io/f/node:1": {},
+                "ghcr.io/f/gh:1": {}
+            }
+        });
+
+        let effective = effective_config_from_value(composed).unwrap();
+
+        assert_eq!(effective.config.image.as_deref(), Some("rust:latest"));
+        assert_eq!(effective.config.remote_user.as_deref(), Some("vscode"));
+        assert!(
+            effective.base_feature_ids.is_empty(),
+            "a recipe composes its own layers, so nothing is withheld from its lockfile"
+        );
+
+        let features = resolve_features(&effective.config).unwrap();
+        assert_eq!(
+            project_owned_features(&features, &effective.base_feature_ids).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn composed_config_reports_parse_errors() {
+        let Err(err) = effective_config_from_value(serde_json::json!({"image": 42})) else {
+            panic!("a non-string image must not deserialize");
+        };
+
+        assert!(
+            err.to_string().contains("composed config"),
+            "error should name the composed config: {err}"
         );
     }
 }
