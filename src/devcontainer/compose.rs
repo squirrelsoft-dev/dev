@@ -1594,7 +1594,7 @@ mod tests {
     }
 
     #[test]
-    fn every_layer_overrides_the_one_below_it_for_an_identical_scalar_key() {
+    fn recipe_customizations_outrank_runtime_for_the_same_scalar_key() {
         let env = TestDevHome::new(
             r#"{"image": "rust:latest", "remoteUser": "from-global"}"#,
             Some(r#"{"remoteUser": "from-base"}"#),

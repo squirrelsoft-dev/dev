@@ -1075,43 +1075,6 @@ mod tests {
     }
 
     #[test]
-    fn a_project_scalar_key_overrides_the_same_key_from_base() {
-        let dir = TempDir::new().unwrap();
-        let base = write_base_config(&dir, r#"{"remoteUser": "from-base"}"#);
-        let project = write_project_config(
-            &dir,
-            r#"{"image": "ubuntu:24.04", "remoteUser": "from-project"}"#,
-        );
-
-        assert_eq!(
-            load_config_with_base(&project, true, &base)
-                .remote_user
-                .as_deref(),
-            Some("from-project")
-        );
-    }
-
-    #[test]
-    fn a_base_scalar_key_survives_when_the_project_omits_it() {
-        let dir = TempDir::new().unwrap();
-        let base = write_base_config(&dir, r#"{"remoteUser": "from-base"}"#);
-        let project = write_project_config(&dir, r#"{"image": "ubuntu:24.04"}"#);
-
-        assert_eq!(
-            load_config_with_base(&project, true, &base)
-                .remote_user
-                .as_deref(),
-            Some("from-base")
-        );
-        // Opting out of the base layer drops the value entirely.
-        assert!(
-            load_config_with_base(&project, false, &base)
-                .remote_user
-                .is_none()
-        );
-    }
-
-    #[test]
     fn workspace_mount_and_workspace_folder_merge_as_independent_keys() {
         let dir = TempDir::new().unwrap();
         let base = write_base_config(
