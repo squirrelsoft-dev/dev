@@ -170,10 +170,14 @@ docker image prune
 
 `dev new` lets you choose where the config lives:
 
-- **Workspace scope** — writes `.devcontainer/recipe.json` plus any template auxiliary files in the project
+- **Workspace scope** — writes `.devcontainer/recipe.json` plus any template auxiliary files in the project (committed to git, shared with the team)
 - **User scope** — writes a lightweight recipe to `~/.dev/devcontainers/<folder>/` (keeps the workspace clean, personal to you)
 
 Recipes reference a global template by name and store any per-project overrides. The full config is composed at build/run time.
+
+A recipe names its global template rather than copying it, so **each machine needs a global template of that name** in `~/.dev/global/`. On a fresh clone, run `dev new` and pick the same template to create it; `dev up` names the missing template and where it looked if it isn't there yet.
+
+Because a recipe project has no `devcontainer.json` on disk, VS Code's "Reopen in Container" has nothing to read. Run `dev up` and attach your editor to the running container instead.
 
 ## Local domain routing
 

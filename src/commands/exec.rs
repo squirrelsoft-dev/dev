@@ -1,8 +1,8 @@
 use std::path::Path;
 
-use crate::devcontainer::DevcontainerConfig;
+use crate::devcontainer::compose::load_workspace_config;
 use crate::runtime::{ContainerState, detect_runtime, resolve_remote_user};
-use crate::util::{find_devcontainer_config, workspace_labels};
+use crate::util::workspace_labels;
 
 pub async fn run(
     workspace: &Path,
@@ -24,10 +24,9 @@ pub async fn run(
     let resolved_user = if user.is_some() {
         user.map(|u| u.to_string())
     } else {
-        let config_user = find_devcontainer_config(workspace)
+        let config_user = load_workspace_config(workspace, runtime.runtime_name())
             .ok()
-            .and_then(|p| DevcontainerConfig::from_path(&p).ok())
-            .and_then(|c| c.remote_user);
+            .and_then(|(_, config)| config.remote_user);
         resolve_remote_user(
             runtime.as_ref(),
             &container.image,

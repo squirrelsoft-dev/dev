@@ -10,7 +10,7 @@ use crate::devcontainer::apply_template;
 use crate::devcontainer::recipe::Recipe;
 use crate::oci::download_artifact;
 use crate::tui::{picker, prompts};
-use crate::util::paths::{DevHome, create_vscode_symlink, devcontainers_dir, global_dir};
+use crate::util::paths::{DevHome, devcontainers_dir, global_dir};
 use crate::util::workspace_folder_name;
 
 pub async fn run(
@@ -92,13 +92,8 @@ pub async fn run(
     match scope {
         picker::Scope::Workspace => {
             let devcontainer_dir = workspace.join(".devcontainer");
-            write_recipe(
-                workspace,
-                &devcontainer_dir,
-                &global_name,
-                selected_features,
-                opts,
-            )?;
+            ensure_recipe_can_own_workspace(workspace, &devcontainer_dir)?;
+            write_recipe(&devcontainer_dir, &global_name, selected_features, opts)?;
             println!(
                 "Recipe for template '{}' written to {}",
                 selected.id,
@@ -109,26 +104,23 @@ pub async fn run(
             let folder_name = workspace_folder_name(workspace);
             let user_dest = devcontainers_dir().join(&folder_name);
             let devcontainer_dir = user_dest.join(".devcontainer");
-            write_recipe(
-                workspace,
-                &devcontainer_dir,
-                &global_name,
-                selected_features,
-                opts,
-            )?;
-
-            // Create VS Code symlink if the configs dir exists
-            create_vscode_symlink(&folder_name, &user_dest);
-
+            write_recipe(&devcontainer_dir, &global_name, selected_features, opts)?;
             println!(
                 "Recipe for template '{}' written to {}",
                 selected.id,
                 devcontainer_dir.join("recipe.json").display()
             );
+            print_user_scope_hint();
         }
     };
 
     Ok(())
+}
+
+/// A user-scoped recipe has no `devcontainer.json` for VS Code's remote-containers
+/// extension to open, so point the user at the flow that does work.
+fn print_user_scope_hint() {
+    println!("Run `dev up` to start the container, then attach to it from your editor.");
 }
 
 /// Apply an existing global template to the workspace.
@@ -157,13 +149,8 @@ async fn apply_global_template(
     match scope {
         picker::Scope::Workspace => {
             let devcontainer_dir = workspace.join(".devcontainer");
-            write_recipe(
-                workspace,
-                &devcontainer_dir,
-                global_name,
-                selected_features,
-                opts,
-            )?;
+            ensure_recipe_can_own_workspace(workspace, &devcontainer_dir)?;
+            write_recipe(&devcontainer_dir, global_name, selected_features, opts)?;
             println!(
                 "Recipe for global template '{global_name}' written to {}",
                 devcontainer_dir.join("recipe.json").display()
@@ -171,30 +158,48 @@ async fn apply_global_template(
         }
         picker::Scope::User => {
             let folder_name = workspace_folder_name(workspace);
-            let user_dest = devcontainers_dir().join(&folder_name);
-            let devcontainer_dir = user_dest.join(".devcontainer");
-            write_recipe(
-                workspace,
-                &devcontainer_dir,
-                global_name,
-                selected_features,
-                opts,
-            )?;
-
-            create_vscode_symlink(&folder_name, &user_dest);
-
+            let devcontainer_dir = devcontainers_dir().join(&folder_name).join(".devcontainer");
+            write_recipe(&devcontainer_dir, global_name, selected_features, opts)?;
             println!(
                 "Recipe for global template '{global_name}' written to {}",
                 devcontainer_dir.join("recipe.json").display()
             );
+            print_user_scope_hint();
         }
     }
 
     Ok(())
 }
 
+/// A recipe describes the workspace it belongs to relatively, so the same
+/// `recipe.json` works for every clone of a repository. Baking the creating
+/// machine's absolute path in here would make a committed recipe unusable to
+/// anyone else.
+const WORKSPACE_ROOT: &str = "${localWorkspaceFolder}";
+
+/// Refuse to create a recipe next to a `devcontainer.json`.
+///
+/// `find_config_source` rejects a directory holding both, so writing one anyway
+/// would leave every later `dev up`/`build`/`config` failing until the user
+/// deleted a file by hand.
+fn ensure_recipe_can_own_workspace(workspace: &Path, devcontainer_dir: &Path) -> anyhow::Result<()> {
+    for existing in [
+        devcontainer_dir.join("devcontainer.json"),
+        workspace.join(".devcontainer.json"),
+    ] {
+        if existing.is_file() {
+            anyhow::bail!(
+                "{} already exists.\n\
+                 `dev new` writes a .devcontainer/recipe.json, and a workspace cannot have both. \
+                 Move or delete the devcontainer.json first, then re-run `dev new`.",
+                existing.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn write_recipe(
-    workspace: &Path,
     devcontainer_dir: &Path,
     global_template: &str,
     features: Vec<String>,
@@ -202,7 +207,6 @@ fn write_recipe(
 ) -> anyhow::Result<()> {
     write_recipe_in(
         &DevHome::current(),
-        workspace,
         devcontainer_dir,
         global_template,
         features,
@@ -212,22 +216,31 @@ fn write_recipe(
 
 fn write_recipe_in(
     dev_home: &DevHome,
-    workspace: &Path,
     devcontainer_dir: &Path,
     global_template: &str,
     features: Vec<String>,
     options: HashMap<String, String>,
 ) -> anyhow::Result<()> {
-    fs::create_dir_all(devcontainer_dir)?;
+    let recipe_path = devcontainer_dir.join("recipe.json");
+    let previous = Recipe::from_path(&recipe_path).ok();
     let recipe = Recipe {
         global_template: global_template.to_string(),
         features,
         options,
-        root_folder: workspace.to_string_lossy().to_string(),
+        root_folder: WORKSPACE_ROOT.to_string(),
         customizations: serde_json::Value::Object(serde_json::Map::new()),
     };
-    crate::devcontainer::compose::prepare_recipe_directory_in(dev_home, &recipe, devcontainer_dir)?;
-    recipe.write_to(&devcontainer_dir.join("recipe.json"))?;
+    // Auxiliary files are planned (and rejected if locally edited) before the
+    // recipe is written, so a refusal leaves the project exactly as it was.
+    crate::devcontainer::compose::prepare_recipe_directory_in(
+        dev_home,
+        &recipe,
+        devcontainer_dir,
+        crate::devcontainer::compose::AuxPolicy::Refresh {
+            previous: previous.as_ref(),
+        },
+    )?;
+    recipe.write_to(&recipe_path)?;
     Ok(())
 }
 
@@ -405,7 +418,6 @@ mod tests {
         let devcontainer_dir = workspace.path().join(".devcontainer");
         write_recipe_in(
             &dev_home,
-            workspace.path(),
             &devcontainer_dir,
             "rust",
             vec!["ghcr.io/features/node:1".to_string()],
@@ -424,6 +436,87 @@ mod tests {
         assert!(
             !devcontainer_dir.join("devcontainer.json").exists(),
             "dev new must not persist a composed devcontainer.json for recipe projects"
+        );
+    }
+
+    #[test]
+    fn a_written_recipe_carries_no_absolute_host_path() {
+        let home = TempDir::new().unwrap();
+        let global_dir = home.path().join("global/rust/.devcontainer");
+        fs::create_dir_all(&global_dir).unwrap();
+        fs::write(
+            global_dir.join("devcontainer.json"),
+            r#"{"image":"rust:latest"}"#,
+        )
+        .unwrap();
+
+        let workspace = TempDir::new().unwrap();
+        let devcontainer_dir = workspace.path().join(".devcontainer");
+        write_recipe_in(
+            &DevHome::at(home.path()),
+            &devcontainer_dir,
+            "rust",
+            Vec::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+
+        let raw = fs::read_to_string(devcontainer_dir.join("recipe.json")).unwrap();
+        assert!(
+            !raw.contains(workspace.path().to_str().unwrap()),
+            "a committed recipe must not pin the creating machine's path: {raw}"
+        );
+        let recipe = Recipe::from_path(&devcontainer_dir.join("recipe.json")).unwrap();
+        assert_eq!(recipe.root_folder, WORKSPACE_ROOT);
+    }
+
+    #[test]
+    fn a_workspace_devcontainer_json_blocks_recipe_creation() {
+        let workspace = TempDir::new().unwrap();
+        let devcontainer_dir = workspace.path().join(".devcontainer");
+        fs::create_dir_all(&devcontainer_dir).unwrap();
+        fs::write(
+            devcontainer_dir.join("devcontainer.json"),
+            r#"{"image":"ubuntu"}"#,
+        )
+        .unwrap();
+
+        let err = ensure_recipe_can_own_workspace(workspace.path(), &devcontainer_dir).unwrap_err();
+
+        assert!(
+            err.to_string().contains("devcontainer.json"),
+            "the refusal should name the conflicting file: {err}"
+        );
+    }
+
+    #[test]
+    fn a_root_level_devcontainer_json_blocks_recipe_creation() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(
+            workspace.path().join(".devcontainer.json"),
+            r#"{"image":"ubuntu"}"#,
+        )
+        .unwrap();
+
+        assert!(
+            ensure_recipe_can_own_workspace(
+                workspace.path(),
+                &workspace.path().join(".devcontainer")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_clean_workspace_accepts_a_recipe() {
+        let workspace = TempDir::new().unwrap();
+
+        assert!(
+            ensure_recipe_can_own_workspace(
+                workspace.path(),
+                &workspace.path().join(".devcontainer")
+            )
+            .is_ok()
         );
     }
 }

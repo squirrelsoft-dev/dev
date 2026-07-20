@@ -8,6 +8,7 @@ use crate::cli::ConfigAction;
 use crate::collection::{fetch_all_features, fetch_collection_index};
 use crate::devcontainer::compose::compose_recipe_config;
 use crate::devcontainer::recipe::Recipe;
+use crate::runtime::detect_runtime;
 use crate::tui::prompts;
 use crate::util::workspace::{ConfigSource, find_config_source};
 
@@ -31,7 +32,8 @@ pub async fn run_workspace(
         ConfigSource::Direct(path) => run(&path, action, verbose).await,
         ConfigSource::Recipe(recipe_path) => {
             let recipe = Recipe::from_path(&recipe_path)?;
-            let composed = compose_recipe_config(&recipe_path, &recipe, "docker", true)?;
+            let composed =
+                compose_recipe_config(&recipe_path, &recipe, &detected_runtime_name().await, true)?;
             let target = ConfigTarget {
                 config_path: None,
                 config_value: Some(composed.value),
@@ -39,6 +41,18 @@ pub async fn run_workspace(
             };
             run_with_target(&target, action, verbose).await
         }
+    }
+}
+
+/// The runtime whose `~/.dev/<runtime>/devcontainer.json` layer `dev up` would apply.
+///
+/// `dev config` only reads, so a machine with no reachable runtime should still be
+/// able to inspect its config; falling back to `docker` keeps that working and
+/// matches the layer `dev up` picks by default.
+async fn detected_runtime_name() -> String {
+    match detect_runtime(None).await {
+        Ok(runtime) => runtime.runtime_name().to_string(),
+        Err(_) => "docker".to_string(),
     }
 }
 

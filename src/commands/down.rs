@@ -1,8 +1,9 @@
 use std::path::Path;
 
 use crate::devcontainer::DevcontainerConfig;
+use crate::devcontainer::compose::load_workspace_config;
 use crate::runtime::{ContainerState, detect_runtime};
-use crate::util::{container_name, find_devcontainer_config, workspace_labels};
+use crate::util::{container_name, workspace_labels};
 
 pub async fn run(
     workspace: &Path,
@@ -12,19 +13,17 @@ pub async fn run(
     let runtime = detect_runtime(runtime_override).await?;
 
     // Try compose-aware teardown first.
-    if let Ok(config_path) = find_devcontainer_config(workspace) {
-        if let Ok(config) = DevcontainerConfig::from_path(&config_path) {
-            if config.is_compose() {
-                return run_compose_down(
-                    workspace,
-                    &config,
-                    &config_path,
-                    runtime.runtime_name(),
-                    remove,
-                )
-                .await;
-            }
-        }
+    if let Ok((config_path, config)) = load_workspace_config(workspace, runtime.runtime_name())
+        && config.is_compose()
+    {
+        return run_compose_down(
+            workspace,
+            &config,
+            &config_path,
+            runtime.runtime_name(),
+            remove,
+        )
+        .await;
     }
 
     // Non-compose: label-based container stop/remove.

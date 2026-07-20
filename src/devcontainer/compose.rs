@@ -4,13 +4,15 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::devcontainer::config::DevcontainerConfig;
 use crate::devcontainer::effective::{
     absolutize_config_paths, config_definition, prune_lower_priority_definitions,
 };
 use crate::devcontainer::jsonc::parse_jsonc;
 use crate::devcontainer::merge::{merge_layer, merge_layers};
-use crate::devcontainer::recipe::{Recipe, is_empty_object};
+use crate::devcontainer::recipe::{is_empty_object, Recipe};
 use crate::util::paths::DevHome;
+use crate::util::workspace::{find_config_source, ConfigSource};
 
 /// Read a JSON file, stripping comments and trailing commas. Returns `None` if the file doesn't exist.
 fn read_json_file(path: &Path) -> anyhow::Result<Option<Value>> {
@@ -96,16 +98,75 @@ pub(crate) fn compose_recipe_config_in(
     runtime_name: &str,
     include_base: bool,
 ) -> anyhow::Result<RecipeConfig> {
-    let recipe_dir = recipe_path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("recipe path has no parent: {}", recipe_path.display()))?;
-    prepare_recipe_directory_in(dev_home, recipe, recipe_dir)?;
+    let recipe_dir = recipe_dir_of(recipe_path)?;
     let details = compose_config_details_in(dev_home, recipe, runtime_name, include_base)?;
     Ok(RecipeConfig {
         config_path: recipe_dir.join("devcontainer.json"),
         value: details.value,
         base_feature_ids: details.base_feature_ids,
     })
+}
+
+/// Load a workspace's effective devcontainer config for read-only consumers such
+/// as `dev shell` and `dev exec`.
+///
+/// Recipe projects keep no `devcontainer.json` on disk, so resolving them by path
+/// alone yields nothing and callers silently fall back to the image's defaults.
+/// Composing here keeps `remoteUser` and `workspaceFolder` identical to the ones
+/// `dev up` built the container with.
+pub(crate) fn load_workspace_config(
+    workspace: &Path,
+    runtime_name: &str,
+) -> anyhow::Result<(PathBuf, DevcontainerConfig)> {
+    load_workspace_config_in(&DevHome::current(), workspace, runtime_name)
+}
+
+pub(crate) fn load_workspace_config_in(
+    dev_home: &DevHome,
+    workspace: &Path,
+    runtime_name: &str,
+) -> anyhow::Result<(PathBuf, DevcontainerConfig)> {
+    match find_config_source(workspace)? {
+        ConfigSource::Direct(path) => {
+            let config = DevcontainerConfig::from_path(&path)?;
+            Ok((path, config))
+        }
+        ConfigSource::Recipe(recipe_path) => {
+            let recipe = Recipe::from_path(&recipe_path)?;
+            let composed =
+                compose_recipe_config_in(dev_home, &recipe_path, &recipe, runtime_name, true)?;
+            let config = serde_json::from_value(composed.value)?;
+            Ok((composed.config_path, config))
+        }
+    }
+}
+
+fn recipe_dir_of(recipe_path: &Path) -> anyhow::Result<&Path> {
+    recipe_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("recipe path has no parent: {}", recipe_path.display()))
+}
+
+/// Put the template's auxiliary files (Dockerfiles, compose files, scripts) beside
+/// a recipe so a build has the context it references.
+///
+/// Composition is read-only, so the commands that actually build — `dev up` and
+/// `dev build` — call this first; `dev config` and the read-only config lookups
+/// compose without it and never touch the project directory.
+pub(crate) fn materialize_recipe_directory(
+    recipe_path: &Path,
+    recipe: &Recipe,
+) -> anyhow::Result<()> {
+    materialize_recipe_directory_in(&DevHome::current(), recipe_path, recipe)
+}
+
+pub(crate) fn materialize_recipe_directory_in(
+    dev_home: &DevHome,
+    recipe_path: &Path,
+    recipe: &Recipe,
+) -> anyhow::Result<()> {
+    let recipe_dir = recipe_dir_of(recipe_path)?;
+    prepare_recipe_directory_in(dev_home, recipe, recipe_dir, AuxPolicy::FillMissing)
 }
 
 struct ComposeDetails {
@@ -123,9 +184,14 @@ fn compose_config_details_in(
     let global_config_path = dev_home.global_template_config(&recipe.global_template);
     let mut global = read_json_file(&global_config_path)?.ok_or_else(|| {
         anyhow::anyhow!(
-            "Global template '{}' not found at {}",
+            "Global template '{}' not found at {}.\n\
+             A recipe references its template by name, so a template of that name has to exist \
+             on this machine. Run `dev new`, pick the same template, and choose the same scope to \
+             recreate it — or point \"globalTemplate\" in recipe.json at one of your existing \
+             templates in {}.",
             recipe.global_template,
-            global_config_path.display()
+            global_config_path.display(),
+            dev_home.global_dir().display()
         )
     })?;
 
@@ -230,27 +296,54 @@ fn declared_feature_ids(value: &Value) -> HashSet<String> {
         .unwrap_or_default()
 }
 
+/// What to do with an auxiliary file that is already present in the recipe directory.
+pub(crate) enum AuxPolicy<'a> {
+    /// Fill in what is missing and leave everything already on disk alone.
+    FillMissing,
+    /// Re-substitute the template for a changed option set. A file that still
+    /// matches what `previous` produced is regenerated; anything else is a local
+    /// edit and aborts the whole operation.
+    Refresh { previous: Option<&'a Recipe> },
+}
+
 pub(crate) fn prepare_recipe_directory_in(
     dev_home: &DevHome,
     recipe: &Recipe,
     dest_dir: &Path,
+    policy: AuxPolicy<'_>,
 ) -> anyhow::Result<()> {
-    fs::create_dir_all(dest_dir)?;
+    let src_dir = dev_home.global_template_dir(&recipe.global_template);
+    let mut planned = Vec::new();
+    plan_auxiliary_files(&src_dir, dest_dir, recipe, &policy, &mut planned)?;
 
-    // Copy auxiliary files (Dockerfiles, compose files, etc.) from the global template.
-    let global_devcontainer_dir = dev_home.global_template_dir(&recipe.global_template);
-    copy_auxiliary_files(&global_devcontainer_dir, dest_dir, &recipe.options)?;
+    fs::create_dir_all(dest_dir)?;
+    for file in planned {
+        if let Some(parent) = file.dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&file.dest, &file.content)?;
+    }
     Ok(())
 }
 
-/// Copy non-config files from a global template's `.devcontainer/` directory to
-/// the destination directory, applying `${templateOption:...}` substitutions to
-/// text files. Skips `devcontainer.json` and `devcontainer-template.json` since
-/// those are handled by the composition pipeline.
-fn copy_auxiliary_files(
+struct PlannedFile {
+    dest: PathBuf,
+    content: Vec<u8>,
+}
+
+/// Decide what every non-config file in a global template's `.devcontainer/`
+/// should become in the destination directory, applying `${templateOption:...}`
+/// substitutions. `devcontainer.json` and `devcontainer-template.json` are skipped
+/// because the composition pipeline owns them.
+///
+/// Planning is separated from writing so that a rejected local edit aborts before
+/// any file — or the recipe itself — has been touched.
+fn plan_auxiliary_files(
     src_dir: &Path,
     dest_dir: &Path,
-    options: &HashMap<String, String>,
+    recipe: &Recipe,
+    policy: &AuxPolicy<'_>,
+    planned: &mut Vec<PlannedFile>,
 ) -> anyhow::Result<()> {
     if !src_dir.is_dir() {
         return Ok(());
@@ -265,24 +358,55 @@ fn copy_auxiliary_files(
         let src_path = entry.path();
         let dest_path = dest_dir.join(&name);
         if src_path.is_dir() {
-            fs::create_dir_all(&dest_path)?;
-            copy_auxiliary_files(&src_path, &dest_path, options)?;
-        } else if dest_path.exists() {
+            plan_auxiliary_files(&src_path, &dest_path, recipe, policy, planned)?;
             continue;
-        } else {
-            match fs::read_to_string(&src_path) {
-                Ok(content) => {
-                    let substituted =
-                        crate::devcontainer::templates::substitute_options(&content, options);
-                    fs::write(&dest_path, substituted)?;
+        }
+
+        let source = fs::read(&src_path)?;
+        let content = substitute_bytes(&source, &recipe.options);
+        let Ok(existing) = fs::read(&dest_path) else {
+            planned.push(PlannedFile {
+                dest: dest_path,
+                content,
+            });
+            continue;
+        };
+        if existing == content {
+            continue;
+        }
+        match policy {
+            AuxPolicy::FillMissing => continue,
+            AuxPolicy::Refresh { previous } => {
+                let regenerable = previous
+                    .map(|prev| existing == substitute_bytes(&source, &prev.options))
+                    .unwrap_or(false);
+                if !regenerable {
+                    anyhow::bail!(
+                        "{} does not match template '{}' and would be overwritten by the new options.\n\
+                         It looks locally edited, so nothing was changed. Move or delete it and re-run, \
+                         or keep it and set the options in {} by hand.",
+                        dest_path.display(),
+                        recipe.global_template,
+                        dest_dir.join("recipe.json").display()
+                    );
                 }
-                Err(_) => {
-                    fs::copy(&src_path, &dest_path)?;
-                }
+                planned.push(PlannedFile {
+                    dest: dest_path,
+                    content,
+                });
             }
         }
     }
     Ok(())
+}
+
+/// Apply template option substitutions to a template file, leaving non-UTF-8
+/// files (images, archives) byte-identical.
+fn substitute_bytes(source: &[u8], options: &HashMap<String, String>) -> Vec<u8> {
+    match std::str::from_utf8(source) {
+        Ok(text) => crate::devcontainer::templates::substitute_options(text, options).into_bytes(),
+        Err(_) => source.to_vec(),
+    }
 }
 
 #[cfg(test)]
@@ -442,12 +566,10 @@ mod tests {
         let composed = env.compose(&recipe, "docker", true);
 
         assert_eq!(composed["remoteUser"], "developer");
-        assert!(
-            composed["features"]
-                .as_object()
-                .unwrap()
-                .contains_key("ghcr.io/features/node")
-        );
+        assert!(composed["features"]
+            .as_object()
+            .unwrap()
+            .contains_key("ghcr.io/features/node"));
         let ports = composed["forwardPorts"].as_array().unwrap();
         assert!(ports.contains(&Value::Number(3000.into())));
         assert!(ports.contains(&Value::Number(9090.into())));
@@ -508,11 +630,9 @@ mod tests {
             compose_recipe_config_in(&env.dev_home, &recipe_path, &recipe, "docker", true).unwrap();
 
         assert_eq!(returned.value["remoteUser"], "vscode");
-        assert!(
-            returned
-                .config_path
-                .ends_with("demo/.devcontainer/devcontainer.json")
-        );
+        assert!(returned
+            .config_path
+            .ends_with("demo/.devcontainer/devcontainer.json"));
         assert!(
             !returned.config_path.exists(),
             "the composed devcontainer.json is a virtual path for recipe projects"
@@ -569,7 +689,13 @@ mod tests {
             .insert("base".to_string(), "rust:latest".to_string());
 
         let recipe_dir = env.recipe_dir();
-        prepare_recipe_directory_in(&env.dev_home, &recipe, &recipe_dir).unwrap();
+        prepare_recipe_directory_in(
+            &env.dev_home,
+            &recipe,
+            &recipe_dir,
+            AuxPolicy::Refresh { previous: None },
+        )
+        .unwrap();
 
         let copied = recipe_dir.join("Dockerfile");
         assert_eq!(fs::read_to_string(copied).unwrap(), "FROM rust:latest\n");
@@ -580,7 +706,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_recipe_directory_does_not_overwrite_existing_auxiliary_files() {
+    fn materializing_a_recipe_directory_leaves_existing_auxiliary_files_alone() {
         let env = TestDevHome::new(
             r#"{"build": {"dockerfile": "Dockerfile"}}"#,
             None,
@@ -598,9 +724,136 @@ mod tests {
         let copied = recipe_dir.join("Dockerfile");
         fs::write(&copied, "FROM project-edited\n").unwrap();
 
-        prepare_recipe_directory_in(&env.dev_home, &recipe, &recipe_dir).unwrap();
+        materialize_recipe_directory_in(&env.dev_home, &recipe_dir.join("recipe.json"), &recipe)
+            .unwrap();
 
         assert_eq!(fs::read_to_string(copied).unwrap(), "FROM project-edited\n");
+    }
+
+    #[test]
+    fn changing_options_regenerates_an_untouched_auxiliary_file() {
+        let env = TestDevHome::new(
+            r#"{"build": {"dockerfile": "Dockerfile"}}"#,
+            None,
+            None,
+            "docker",
+        );
+        let aux = env
+            .dev_home
+            .global_template_dir("test-lang")
+            .join("Dockerfile");
+        fs::write(&aux, "FROM ${templateOption:base}\n").unwrap();
+
+        let mut first = env.recipe();
+        first.options.insert("base".into(), "rust:1.75".into());
+        let recipe_dir = env.recipe_dir();
+        prepare_recipe_directory_in(
+            &env.dev_home,
+            &first,
+            &recipe_dir,
+            AuxPolicy::Refresh { previous: None },
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(recipe_dir.join("Dockerfile")).unwrap(),
+            "FROM rust:1.75\n"
+        );
+
+        let mut second = env.recipe();
+        second.options.insert("base".into(), "rust:1.80".into());
+        prepare_recipe_directory_in(
+            &env.dev_home,
+            &second,
+            &recipe_dir,
+            AuxPolicy::Refresh {
+                previous: Some(&first),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(recipe_dir.join("Dockerfile")).unwrap(),
+            "FROM rust:1.80\n",
+            "a file still matching the old options is template-owned and follows them"
+        );
+    }
+
+    #[test]
+    fn changing_options_refuses_to_clobber_a_locally_edited_auxiliary_file() {
+        let env = TestDevHome::new(
+            r#"{"build": {"dockerfile": "Dockerfile"}}"#,
+            None,
+            None,
+            "docker",
+        );
+        let aux = env
+            .dev_home
+            .global_template_dir("test-lang")
+            .join("Dockerfile");
+        fs::write(&aux, "FROM ${templateOption:base}\n").unwrap();
+
+        let mut first = env.recipe();
+        first.options.insert("base".into(), "rust:1.75".into());
+        let recipe_dir = env.recipe_dir();
+        fs::create_dir_all(&recipe_dir).unwrap();
+        let dockerfile = recipe_dir.join("Dockerfile");
+        fs::write(&dockerfile, "FROM rust:1.75\nRUN cargo install just\n").unwrap();
+
+        let mut second = env.recipe();
+        second.options.insert("base".into(), "rust:1.80".into());
+        let err = prepare_recipe_directory_in(
+            &env.dev_home,
+            &second,
+            &recipe_dir,
+            AuxPolicy::Refresh {
+                previous: Some(&first),
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("Dockerfile"),
+            "the refusal should name the file: {err}"
+        );
+        assert_eq!(
+            fs::read_to_string(&dockerfile).unwrap(),
+            "FROM rust:1.75\nRUN cargo install just\n",
+            "a rejected refresh must leave the project untouched"
+        );
+    }
+
+    #[test]
+    fn composing_a_recipe_writes_nothing_to_the_project() {
+        let env = TestDevHome::new(
+            r#"{"build": {"dockerfile": "Dockerfile"}}"#,
+            None,
+            None,
+            "docker",
+        );
+        fs::write(
+            env.dev_home
+                .global_template_dir("test-lang")
+                .join("Dockerfile"),
+            "FROM rust:latest\n",
+        )
+        .unwrap();
+        let recipe = env.recipe();
+        let recipe_dir = env.recipe_dir();
+        fs::create_dir_all(&recipe_dir).unwrap();
+        let recipe_path = recipe_dir.join("recipe.json");
+        recipe.write_to(&recipe_path).unwrap();
+
+        compose_recipe_config_in(&env.dev_home, &recipe_path, &recipe, "docker", true).unwrap();
+
+        let entries: Vec<_> = fs::read_dir(&recipe_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from("recipe.json")],
+            "read-only composition must not materialize template files"
+        );
     }
 
     #[test]
@@ -777,6 +1030,72 @@ mod tests {
         assert!(composed.get("image").is_none());
     }
 
+    /// `dev shell` and `dev exec` resolve the session user and working directory
+    /// through this. A recipe project has no `devcontainer.json` to read, so if
+    /// this stops composing they silently fall back to the image's defaults —
+    /// a root shell in the wrong directory.
+    #[test]
+    fn a_recipe_project_resolves_its_remote_user_and_workspace_folder() {
+        let env = TestDevHome::new(
+            r#"{
+                "image": "rust:latest",
+                "remoteUser": "vscode",
+                "workspaceFolder": "/srv/app"
+            }"#,
+            None,
+            None,
+            "docker",
+        );
+        let recipe = env.recipe();
+        let recipe_dir = env.recipe_dir();
+        fs::create_dir_all(&recipe_dir).unwrap();
+        recipe.write_to(&recipe_dir.join("recipe.json")).unwrap();
+
+        let (config_path, config) =
+            load_workspace_config_in(&env.dev_home, &env.workspace, "docker").unwrap();
+
+        assert_eq!(config.remote_user.as_deref(), Some("vscode"));
+        assert_eq!(config.workspace_folder.as_deref(), Some("/srv/app"));
+        assert!(config_path.ends_with("demo/.devcontainer/devcontainer.json"));
+    }
+
+    #[test]
+    fn a_recipe_project_picks_up_the_base_layer_the_container_was_built_with() {
+        let env = TestDevHome::new(
+            r#"{"image": "rust:latest", "remoteUser": "root"}"#,
+            Some(r#"{"remoteUser": "vscode"}"#),
+            None,
+            "docker",
+        );
+        let recipe = env.recipe();
+        let recipe_dir = env.recipe_dir();
+        fs::create_dir_all(&recipe_dir).unwrap();
+        recipe.write_to(&recipe_dir.join("recipe.json")).unwrap();
+
+        let (_, config) =
+            load_workspace_config_in(&env.dev_home, &env.workspace, "docker").unwrap();
+
+        assert_eq!(config.remote_user.as_deref(), Some("vscode"));
+    }
+
+    #[test]
+    fn a_direct_project_still_loads_its_own_devcontainer_json() {
+        let env = TestDevHome::new(r#"{"image": "unused"}"#, None, None, "docker");
+        let devcontainer_dir = env.workspace.join(".devcontainer");
+        fs::create_dir_all(&devcontainer_dir).unwrap();
+        fs::write(
+            devcontainer_dir.join("devcontainer.json"),
+            r#"{"image": "ubuntu:24.04", "remoteUser": "dev"}"#,
+        )
+        .unwrap();
+
+        let (config_path, config) =
+            load_workspace_config_in(&env.dev_home, &env.workspace, "docker").unwrap();
+
+        assert_eq!(config.remote_user.as_deref(), Some("dev"));
+        assert_eq!(config_path, devcontainer_dir.join("devcontainer.json"));
+    }
+
     #[test]
     fn missing_global_template_names_the_path() {
         let env = TestDevHome::new(r#"{"image": "rust:latest"}"#, None, None, "docker");
@@ -793,6 +1112,10 @@ mod tests {
         assert!(
             message.contains("global/absent"),
             "should name the searched path: {message}"
+        );
+        assert!(
+            message.contains("dev new"),
+            "should tell the user how to recreate it: {message}"
         );
     }
 }

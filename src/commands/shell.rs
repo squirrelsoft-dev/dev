@@ -1,8 +1,9 @@
 use std::path::Path;
 
-use crate::devcontainer::{DevcontainerConfig, substitute_variables};
+use crate::devcontainer::compose::load_workspace_config;
+use crate::devcontainer::substitute_variables;
 use crate::runtime::{ContainerState, detect_runtime, resolve_remote_user};
-use crate::util::{find_devcontainer_config, workspace_folder_name, workspace_labels};
+use crate::util::{workspace_folder_name, workspace_labels};
 
 pub async fn run(
     workspace: &Path,
@@ -20,9 +21,9 @@ pub async fn run(
         .ok_or_else(|| anyhow::anyhow!("No running container found for this workspace. Run `dev up` first."))?;
 
     // Resolve remoteUser and workspaceFolder from config or image metadata
-    let config = find_devcontainer_config(workspace)
+    let config = load_workspace_config(workspace, runtime.runtime_name())
         .ok()
-        .and_then(|p| DevcontainerConfig::from_path(&p).ok());
+        .map(|(_, config)| config);
     let config_user = config.as_ref().and_then(|c| c.remote_user.clone());
     let user = resolve_remote_user(
         runtime.as_ref(),

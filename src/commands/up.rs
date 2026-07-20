@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::devcontainer::compose::compose_recipe_config;
+use crate::devcontainer::compose::{compose_recipe_config, materialize_recipe_directory};
 use crate::devcontainer::config::MountSpec;
 use crate::devcontainer::effective::{
     LockfilePolicy, effective_config_from_parts, load_effective_config,
@@ -42,6 +42,7 @@ pub async fn run(
         ConfigSource::Direct(path) => (path, None),
         ConfigSource::Recipe(recipe_path) => {
             let recipe = Recipe::from_path(&recipe_path)?;
+            materialize_recipe_directory(&recipe_path, &recipe)?;
             let composed =
                 compose_recipe_config(&recipe_path, &recipe, runtime.runtime_name(), !no_base)?;
             (composed.config_path.clone(), Some(composed))
@@ -52,7 +53,7 @@ pub async fn run(
     // the recipe deliberately kept.
     let effective = match recipe_config {
         Some(recipe_config) => {
-            effective_config_from_parts(recipe_config.value, recipe_config.base_feature_ids, true)?
+            effective_config_from_parts(recipe_config.value, recipe_config.base_feature_ids)?
         }
         None => load_effective_config(&config_path, !no_base)?,
     };
