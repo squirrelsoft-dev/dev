@@ -77,6 +77,15 @@ jobs:
           workspaces: . -> target
           key: apple
 
+      # crates/apple-container's build script runs tonic-build, which shells
+      # out to `protoc`. macOS runners do not ship it, and the ubuntu job never
+      # compiles this crate, so this is the only job that needs it.
+      - name: Install protoc
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+          HOMEBREW_NO_INSTALL_CLEANUP: 1
+        run: brew install protobuf
+
       # Covers the macOS-only Apple Containers path gated behind
       # #[cfg(all(target_os = "macos", feature = "apple"))], which the
       # ubuntu-latest job never compiles.
