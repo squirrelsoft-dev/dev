@@ -50,11 +50,6 @@ fn substitute_template_options(value: &mut Value, options: &HashMap<String, Stri
 /// 3. Runtime config (`~/.dev/<runtime>/devcontainer.json`) (highest priority for scalars)
 ///
 /// Then inject recipe features into the composed result.
-#[allow(dead_code)]
-pub fn compose_config(recipe: &Recipe, runtime_name: &str) -> anyhow::Result<Value> {
-    compose_config_with_base(recipe, runtime_name, true)
-}
-
 pub(crate) fn compose_config_with_base(
     recipe: &Recipe,
     runtime_name: &str,

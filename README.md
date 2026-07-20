@@ -96,7 +96,7 @@ dev base config add features ghcr.io/devcontainers/features/common-utils:2
 dev base config add remoteEnv EDITOR=vim
 ```
 
-If no base config exists, this layer is simply skipped.
+If no base config exists, this layer is simply skipped. Pass `dev up --no-base` to skip it for a single run.
 
 ### Global templates
 

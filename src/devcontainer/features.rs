@@ -159,9 +159,83 @@ pub fn resolve_features(config: &DevcontainerConfig) -> Result<Vec<ResolvedFeatu
     Ok(resolved)
 }
 
+/// Ids of `roots` plus every feature they transitively require via `dependsOn`.
+///
+/// Feature provenance is not recorded on `ResolvedFeature`, so the dependency
+/// closure has to be recomputed from the downloaded metadata. Callers use this to
+/// separate the features a project owns from the ones a lower-priority layer
+/// (e.g. `~/.dev/base/devcontainer.json`) contributed.
+pub fn features_required_by(
+    features: &[ResolvedFeature],
+    roots: &HashSet<String>,
+) -> HashSet<String> {
+    let by_id: HashMap<&str, &ResolvedFeature> =
+        features.iter().map(|f| (f.id.as_str(), f)).collect();
+    let mut reachable: HashSet<String> = HashSet::new();
+    let mut queue: Vec<String> = roots.iter().cloned().collect();
+
+    while let Some(id) = queue.pop() {
+        if !reachable.insert(id.clone()) {
+            continue;
+        }
+        let Some(feature) = by_id.get(id.as_str()) else {
+            continue;
+        };
+        if let Some(deps) = read_depends_on(feature) {
+            for dep_id in deps.keys() {
+                if !reachable.contains(dep_id) {
+                    queue.push(dep_id.clone());
+                }
+            }
+        }
+    }
+
+    reachable
+}
+
+/// Tag for the image produced by layering `features` onto the config's base image.
+///
+/// The digest suffix makes the tag a true cache key: it covers every input that
+/// changes the resulting image, so an image built from a different effective
+/// config (for example one that merged `~/.dev/base/devcontainer.json` when this
+/// one did not) can never be mistaken for a cache hit.
+pub fn feature_image_tag(
+    folder_image: &str,
+    config: &DevcontainerConfig,
+    features: &[ResolvedFeature],
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut declared: Vec<(&str, &serde_json::Value)> = features
+        .iter()
+        .filter(|f| !f.is_dependency)
+        .map(|f| (f.id.as_str(), &f.options))
+        .collect();
+    declared.sort_by(|a, b| a.0.cmp(b.0));
+
+    let build = config.build.as_ref().map(|b| {
+        serde_json::json!({
+            "dockerfile": b.dockerfile,
+            "context": b.context,
+            "args": b.args,
+        })
+    });
+    let inputs = serde_json::json!({
+        "image": config.image,
+        "build": build,
+        "features": declared,
+    });
+
+    let mut hasher = Sha256::new();
+    hasher.update(inputs.to_string().as_bytes());
+    let digest = hex::encode(hasher.finalize());
+
+    format!("{folder_image}-features-{}", &digest[..12])
+}
+
 /// Classify a feature reference string into its kind.
 fn classify_feature_ref(id: &str) -> FeatureRefKind {
-    if id.starts_with("./") || id.starts_with("../") {
+    if id.starts_with("./") || id.starts_with("../") || id.starts_with('/') {
         FeatureRefKind::Local(PathBuf::from(id))
     } else if id.starts_with("https://") {
         FeatureRefKind::Tarball(id.to_string())

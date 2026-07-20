@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -12,8 +12,8 @@ use crate::devcontainer::{
 };
 use crate::devcontainer::config::MountSpec;
 use crate::devcontainer::features::{
-    MergedCapabilities, ResolvedFeature, capabilities_from_metadata,
-    generate_feature_dockerfile_with_opts, order_features,
+    MergedCapabilities, ResolvedFeature, capabilities_from_metadata, feature_image_tag,
+    features_required_by, generate_feature_dockerfile_with_opts, order_features,
 };
 use crate::devcontainer::jsonc::parse_jsonc;
 use crate::devcontainer::lockfile::{handle_lockfile, lockfile_path};
@@ -43,18 +43,24 @@ pub async fn run(
     no_base: bool,
 ) -> anyhow::Result<()> {
     let runtime = detect_runtime(runtime_override).await?;
-    let config_path = match find_config_source(workspace)? {
-        ConfigSource::Direct(path) => path,
+    let (config_path, from_recipe) = match find_config_source(workspace)? {
+        ConfigSource::Direct(path) => (path, false),
         ConfigSource::Recipe(recipe_path) => {
             let recipe = Recipe::from_path(&recipe_path)?;
-            crate::devcontainer::compose::compose_and_write_with_base(
+            let composed = crate::devcontainer::compose::compose_and_write_with_base(
                 &recipe,
                 runtime.runtime_name(),
                 !no_base,
-            )?
+            )?;
+            (composed, true)
         }
     };
-    let mut config = load_effective_config(&config_path, !no_base)?;
+    // Recipe configs already merged the base layer into the composed file, so
+    // re-applying it here would let the prune discard a base selector the recipe
+    // deliberately kept.
+    let effective = load_effective_config(&config_path, !no_base && !from_recipe)?;
+    let base_feature_ids = effective.base_feature_ids;
+    let mut config = effective.config;
     apply_cli_overrides(&mut config, port_overrides)?;
 
     // Docker Compose configs take a completely separate code path.
@@ -62,7 +68,7 @@ pub async fn run(
         return run_compose(
             workspace, &config, &config_path, runtime.as_ref(),
             rebuild, no_cache, verbose, frozen_lockfile,
-            update_remote_user_uid_default, port_overrides,
+            update_remote_user_uid_default, &base_feature_ids,
         ).await;
     }
 
@@ -133,7 +139,7 @@ pub async fn run(
     let needs_build = config.build.is_some() || has_features;
     let folder_image = container_name(workspace);
     let final_tag = if has_features {
-        format!("{folder_image}-features")
+        feature_image_tag(&folder_image, &config, &initial_features)
     } else {
         folder_image.clone()
     };
@@ -208,10 +214,14 @@ pub async fn run(
                 );
             }
 
-            // Lockfile handling (Gap 11).
-            if let Some(ref dc_dir) = devcontainer_dir {
+            // Lockfile handling (Gap 11). The lockfile is a project artifact, so
+            // only the features the project owns are locked or verified.
+            let locked_features = project_owned_features(&features, &base_feature_ids);
+            if let Some(ref dc_dir) = devcontainer_dir
+                && !locked_features.is_empty()
+            {
                 let lf_path = lockfile_path(dc_dir);
-                handle_lockfile(&lf_path, &features, frozen_lockfile)?;
+                handle_lockfile(&lf_path, &locked_features, frozen_lockfile)?;
             }
 
             let ordered = order_features(&features);
@@ -394,11 +404,44 @@ pub async fn run(
     Ok(())
 }
 
-fn load_effective_config(config_path: &Path, include_base: bool) -> anyhow::Result<DevcontainerConfig> {
+/// A project configuration with the base layer merged in, plus the provenance
+/// needed to keep base-contributed state out of project-owned artifacts.
+struct EffectiveConfig {
+    config: DevcontainerConfig,
+    /// Feature ids the base layer contributed that the project does not declare.
+    base_feature_ids: HashSet<String>,
+}
+
+fn load_effective_config(config_path: &Path, include_base: bool) -> anyhow::Result<EffectiveConfig> {
     let base_path = base_config_dir().join("devcontainer.json");
-    let value = load_effective_config_value(config_path, include_base, &base_path)?;
-    serde_json::from_value(value)
-        .map_err(|e| DevError::InvalidConfig(format!("Failed to parse merged config: {e}")).into())
+    let (value, base_feature_ids) =
+        load_effective_config_value(config_path, include_base, &base_path)?;
+    let config = serde_json::from_value(value)
+        .map_err(|e| DevError::InvalidConfig(format!("Failed to parse merged config: {e}")))?;
+    Ok(EffectiveConfig { config, base_feature_ids })
+}
+
+/// Features that belong to the project: everything it declares, plus the
+/// dependency closure of those declarations. Base-contributed features and any
+/// dependency pulled in only by them are excluded.
+fn project_owned_features(
+    features: &[ResolvedFeature],
+    base_feature_ids: &HashSet<String>,
+) -> Vec<ResolvedFeature> {
+    if base_feature_ids.is_empty() {
+        return features.to_vec();
+    }
+    let roots: HashSet<String> = features
+        .iter()
+        .filter(|f| !f.is_dependency && !base_feature_ids.contains(&f.id))
+        .map(|f| f.id.clone())
+        .collect();
+    let owned = features_required_by(features, &roots);
+    features
+        .iter()
+        .filter(|f| owned.contains(&f.id))
+        .cloned()
+        .collect()
 }
 
 fn apply_cli_overrides(
@@ -415,22 +458,143 @@ fn load_effective_config_value(
     config_path: &Path,
     include_base: bool,
     base_config_path: &Path,
-) -> anyhow::Result<Value> {
+) -> anyhow::Result<(Value, HashSet<String>)> {
     let mut layers = Vec::new();
+    let mut base_feature_ids = HashSet::new();
     if include_base && base_config_path.is_file() {
-        let base = read_json_file(base_config_path)?;
+        let mut base = read_json_file(base_config_path)?;
         if !base.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+            if let Some(base_dir) = base_config_path.parent() {
+                absolutize_base_paths(&mut base, base_dir);
+            }
+            base_feature_ids = declared_feature_ids(&base);
             layers.push(base);
         }
     }
 
     let project = read_json_file(config_path)?;
     let project_definition = config_definition(&project);
+    for id in declared_feature_ids(&project) {
+        base_feature_ids.remove(&id);
+    }
     layers.push(project);
 
     let mut merged = merge_layers(&layers);
     prune_lower_priority_definitions(&mut merged, project_definition);
-    Ok(merged)
+    Ok((merged, base_feature_ids))
+}
+
+fn declared_feature_ids(value: &Value) -> HashSet<String> {
+    value
+        .get("features")
+        .and_then(Value::as_object)
+        .map(|obj| obj.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Rewrite relative paths in the base config so they resolve against the base
+/// config's own directory rather than the project's `.devcontainer/`.
+///
+/// The base layer is merged in memory beneath a project config that lives
+/// somewhere else entirely, so every downstream consumer (Dockerfile reads, bind
+/// mount sources, local feature lookups) would otherwise resolve base paths
+/// against the wrong root and fail with a bare "no such file or directory".
+fn absolutize_base_paths(base: &mut Value, base_dir: &Path) {
+    let Some(obj) = base.as_object_mut() else {
+        return;
+    };
+
+    if let Some(build) = obj.get_mut("build").and_then(Value::as_object_mut) {
+        for key in ["dockerfile", "context"] {
+            if let Some(Value::String(path)) = build.get(key)
+                && let Some(abs) = resolve_against_base(path, base_dir)
+            {
+                build.insert(key.to_string(), Value::String(abs));
+            }
+        }
+    }
+
+    match obj.get_mut("dockerComposeFile") {
+        Some(Value::String(path)) => {
+            if let Some(abs) = resolve_against_base(path, base_dir) {
+                obj.insert("dockerComposeFile".to_string(), Value::String(abs));
+            }
+        }
+        Some(Value::Array(paths)) => {
+            for entry in paths.iter_mut() {
+                if let Value::String(path) = entry
+                    && let Some(abs) = resolve_against_base(path, base_dir)
+                {
+                    *entry = Value::String(abs);
+                }
+            }
+        }
+        _ => {}
+    }
+
+    if let Some(Value::Object(features)) = obj.get("features") {
+        let rebased: serde_json::Map<String, Value> = features
+            .iter()
+            .map(|(id, options)| {
+                let key = resolve_local_ref(id, base_dir).unwrap_or_else(|| id.clone());
+                (key, options.clone())
+            })
+            .collect();
+        obj.insert("features".to_string(), Value::Object(rebased));
+    }
+
+    if let Some(Value::Array(mounts)) = obj.get_mut("mounts") {
+        for mount in mounts.iter_mut() {
+            match mount {
+                Value::String(spec) => *spec = absolutize_mount_string(spec, base_dir),
+                Value::Object(fields) => {
+                    if let Some(Value::String(source)) = fields.get("source")
+                        && let Some(abs) = resolve_local_ref(source, base_dir)
+                    {
+                        fields.insert("source".to_string(), Value::String(abs));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Absolutize a relative path against the base config directory. Returns `None`
+/// for absolute paths and for values carrying a `${...}` variable, which is
+/// substituted later against the workspace.
+fn resolve_against_base(value: &str, base_dir: &Path) -> Option<String> {
+    if value.contains("${") || !Path::new(value).is_relative() {
+        return None;
+    }
+    Some(base_dir.join(value).to_string_lossy().into_owned())
+}
+
+/// Absolutize only explicitly-relative (`./`, `../`) references. Used where a
+/// bare name means something other than a path — an OCI feature id, or a named
+/// volume in a mount source.
+fn resolve_local_ref(value: &str, base_dir: &Path) -> Option<String> {
+    if !value.starts_with("./") && !value.starts_with("../") {
+        return None;
+    }
+    resolve_against_base(value, base_dir)
+}
+
+fn absolutize_mount_string(spec: &str, base_dir: &Path) -> String {
+    spec.split(',')
+        .map(|part| {
+            let Some((key, value)) = part.split_once('=') else {
+                return part.to_string();
+            };
+            if matches!(key.trim(), "source" | "src")
+                && let Some(abs) = resolve_local_ref(value, base_dir)
+            {
+                return format!("{key}={abs}");
+            }
+            part.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn read_json_file(path: &Path) -> anyhow::Result<Value> {
@@ -647,7 +811,7 @@ async fn run_compose(
     verbose: bool,
     frozen_lockfile: bool,
     update_remote_user_uid_default: &str,
-    _port_overrides: &[String],
+    base_feature_ids: &HashSet<String>,
 ) -> anyhow::Result<()> {
     let compose_data = config.docker_compose_file.as_ref().unwrap();
     let compose_files = compose_data.files();
@@ -729,10 +893,13 @@ async fn run_compose(
             );
         }
 
-        // Lockfile handling.
-        if let Some(ref dc_dir) = devcontainer_dir_buf {
+        // Lockfile handling. Only project-owned features are locked or verified.
+        let locked_features = project_owned_features(&features, base_feature_ids);
+        if let Some(ref dc_dir) = devcontainer_dir_buf
+            && !locked_features.is_empty()
+        {
             let lf_path = lockfile_path(dc_dir);
-            handle_lockfile(&lf_path, &features, frozen_lockfile)?;
+            handle_lockfile(&lf_path, &locked_features, frozen_lockfile)?;
         }
 
         let ordered = order_features(&features);
@@ -747,7 +914,7 @@ async fn run_compose(
         let feature_user = resolve_remote_user(
             runtime, &base_image, config.remote_user.as_deref(),
         ).await?;
-        let feature_tag = format!("{folder_image}-features");
+        let feature_tag = feature_image_tag(&folder_image, config, &ordered);
         let dockerfile = generate_feature_dockerfile_with_opts(
             &base_image, &ordered, feature_user.as_deref(), config,
         );
@@ -1049,9 +1216,10 @@ fn parse_volumes(volume_strings: &[String]) -> Vec<VolumeMount> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_cli_overrides, ensure_image_present, load_effective_config_value, parse_mounts,
-        parse_single_mount, substitute_mounts,
+        apply_cli_overrides, ensure_image_present, load_effective_config_value,
+        parse_mounts, parse_single_mount, project_owned_features, substitute_mounts,
     };
+    use crate::devcontainer::features::{feature_image_tag, ResolvedFeature};
     use crate::devcontainer::config::{DevcontainerConfig, LifecycleCommand, MountObject, MountSpec};
     use crate::error::DevError;
     use crate::runtime::{
@@ -1093,9 +1261,49 @@ mod tests {
         include_base: bool,
         base_config_path: &Path,
     ) -> DevcontainerConfig {
-        let value = load_effective_config_value(config_path, include_base, base_config_path)
+        let (value, _) = load_effective_config_value(config_path, include_base, base_config_path)
             .expect("effective config should load");
         serde_json::from_value(value).expect("effective config should deserialize")
+    }
+
+    fn effective_value(
+        config_path: &Path,
+        include_base: bool,
+        base_config_path: &Path,
+    ) -> serde_json::Value {
+        load_effective_config_value(config_path, include_base, base_config_path)
+            .expect("effective config should load")
+            .0
+    }
+
+    fn base_feature_ids(
+        config_path: &Path,
+        include_base: bool,
+        base_config_path: &Path,
+    ) -> std::collections::HashSet<String> {
+        load_effective_config_value(config_path, include_base, base_config_path)
+            .expect("effective config should load")
+            .1
+    }
+
+    fn make_test_feature(id: &str, is_dependency: bool) -> ResolvedFeature {
+        ResolvedFeature {
+            id: id.to_string(),
+            oci_ref: id.to_string(),
+            version: "1".to_string(),
+            options: serde_json::Value::Null,
+            install_script_path: std::path::PathBuf::new(),
+            install_after: Vec::new(),
+            container_env: HashMap::new(),
+            mounts: Vec::new(),
+            init: false,
+            privileged: false,
+            cap_add: Vec::new(),
+            security_opt: Vec::new(),
+            entrypoint: None,
+            lifecycle_hooks: Default::default(),
+            is_dependency,
+        }
     }
 
     #[test]
@@ -1264,7 +1472,7 @@ mod tests {
             }"#,
         );
 
-        let value = load_effective_config_value(&config_path, true, &base_path).unwrap();
+        let value = effective_value(&config_path, true, &base_path);
 
         assert_eq!(value["image"], "project:latest");
         assert_eq!(value["remoteUser"], "project");
@@ -1286,7 +1494,7 @@ mod tests {
         );
         let missing_base = home.path().join("base/devcontainer.json");
 
-        let value = load_effective_config_value(&config_path, true, &missing_base).unwrap();
+        let value = effective_value(&config_path, true, &missing_base);
 
         assert_eq!(value["image"], "ubuntu:24.04");
         assert_eq!(value["containerEnv"]["APP_ENV"], "dev");
@@ -1303,7 +1511,7 @@ mod tests {
             r#"{"containerEnv": {"EDITOR": "nvim"}, "features": {"ghcr.io/features/gh": {}}}"#,
         );
 
-        let value = load_effective_config_value(&config_path, false, &base_path).unwrap();
+        let value = effective_value(&config_path, false, &base_path);
 
         assert_eq!(value["image"], "ubuntu:24.04");
         assert!(value.get("containerEnv").is_none());
@@ -1367,6 +1575,225 @@ mod tests {
         assert_eq!(commands["dotfiles"], "install-dotfiles");
         assert_eq!(commands["project"], "cargo fetch");
         assert_eq!(commands["shared"], "project");
+    }
+
+    #[test]
+    fn feature_image_tag_differs_when_base_contributes_features() {
+        let workspace = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let config_path = write_project_config(
+            &workspace,
+            r#"{
+                "image": "ubuntu:24.04",
+                "features": {"ghcr.io/devcontainers/features/node:1": {}}
+            }"#,
+        );
+        let base_path = write_base_config(
+            &home,
+            r#"{"features": {"ghcr.io/devcontainers/features/github-cli:1": {}}}"#,
+        );
+
+        let with_base = load_config_with_base(&config_path, true, &base_path);
+        let without_base = load_config_with_base(&config_path, false, &base_path);
+
+        let with_base_tag = feature_image_tag(
+            "vsc-demo",
+            &with_base,
+            &crate::devcontainer::resolve_features(&with_base).unwrap(),
+        );
+        let without_base_tag = feature_image_tag(
+            "vsc-demo",
+            &without_base,
+            &crate::devcontainer::resolve_features(&without_base).unwrap(),
+        );
+
+        assert_ne!(
+            with_base_tag, without_base_tag,
+            "a cached image built without the base features must not look like a cache hit"
+        );
+        assert!(with_base_tag.starts_with("vsc-demo-features-"));
+    }
+
+    #[test]
+    fn feature_image_tag_is_stable_for_identical_configs() {
+        let workspace = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let config_path = write_project_config(
+            &workspace,
+            r#"{
+                "image": "ubuntu:24.04",
+                "features": {"ghcr.io/devcontainers/features/node:1": {"version": "22"}}
+            }"#,
+        );
+        let missing_base = home.path().join("base/devcontainer.json");
+
+        let config = load_config_with_base(&config_path, true, &missing_base);
+        let features = crate::devcontainer::resolve_features(&config).unwrap();
+
+        assert_eq!(
+            feature_image_tag("vsc-demo", &config, &features),
+            feature_image_tag("vsc-demo", &config, &features)
+        );
+    }
+
+    #[test]
+    fn feature_image_tag_changes_when_the_image_changes() {
+        let workspace = TempDir::new().unwrap();
+        let other = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let missing_base = home.path().join("base/devcontainer.json");
+        let a = write_project_config(
+            &workspace,
+            r#"{"image": "ubuntu:24.04", "features": {"ghcr.io/f/node:1": {}}}"#,
+        );
+        let b = write_project_config(
+            &other,
+            r#"{"image": "debian:12", "features": {"ghcr.io/f/node:1": {}}}"#,
+        );
+
+        let config_a = load_config_with_base(&a, true, &missing_base);
+        let config_b = load_config_with_base(&b, true, &missing_base);
+
+        assert_ne!(
+            feature_image_tag(
+                "vsc-demo",
+                &config_a,
+                &crate::devcontainer::resolve_features(&config_a).unwrap()
+            ),
+            feature_image_tag(
+                "vsc-demo",
+                &config_b,
+                &crate::devcontainer::resolve_features(&config_b).unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn base_only_features_are_reported_as_base_owned() {
+        let workspace = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let config_path = write_project_config(
+            &workspace,
+            r#"{
+                "image": "ubuntu:24.04",
+                "features": {"ghcr.io/f/node:1": {}, "ghcr.io/f/shared:1": {}}
+            }"#,
+        );
+        let base_path = write_base_config(
+            &home,
+            r#"{"features": {"ghcr.io/f/gh:1": {}, "ghcr.io/f/shared:1": {}}}"#,
+        );
+
+        let ids = base_feature_ids(&config_path, true, &base_path);
+
+        assert!(ids.contains("ghcr.io/f/gh:1"));
+        assert!(
+            !ids.contains("ghcr.io/f/shared:1"),
+            "a feature the project also declares is project-owned"
+        );
+        assert!(!ids.contains("ghcr.io/f/node:1"));
+        assert!(base_feature_ids(&config_path, false, &base_path).is_empty());
+    }
+
+    #[test]
+    fn project_owned_features_excludes_base_features() {
+        let features = vec![
+            make_test_feature("ghcr.io/f/node:1", false),
+            make_test_feature("ghcr.io/f/gh:1", false),
+            make_test_feature("ghcr.io/f/common:1", true),
+        ];
+        let base_ids: std::collections::HashSet<String> =
+            ["ghcr.io/f/gh:1".to_string()].into_iter().collect();
+
+        let owned = project_owned_features(&features, &base_ids);
+        let ids: Vec<&str> = owned.iter().map(|f| f.id.as_str()).collect();
+
+        assert!(ids.contains(&"ghcr.io/f/node:1"));
+        assert!(!ids.contains(&"ghcr.io/f/gh:1"));
+        assert!(
+            !ids.contains(&"ghcr.io/f/common:1"),
+            "a dependency reachable only from a base feature stays out of the project lockfile"
+        );
+    }
+
+    #[test]
+    fn project_owned_features_is_identity_without_a_base_layer() {
+        let features = vec![
+            make_test_feature("ghcr.io/f/node:1", false),
+            make_test_feature("ghcr.io/f/common:1", true),
+        ];
+
+        let owned = project_owned_features(&features, &std::collections::HashSet::new());
+
+        assert_eq!(owned.len(), 2);
+    }
+
+    #[test]
+    fn base_relative_paths_resolve_against_the_base_directory() {
+        let workspace = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let config_path = write_project_config(&workspace, r#"{"containerEnv": {"A": "b"}}"#);
+        let base_path = write_base_config(
+            &home,
+            r#"{
+                "build": {"dockerfile": "Base.Dockerfile", "context": "."},
+                "features": {"./local-feature": {}, "ghcr.io/f/gh:1": {}},
+                "mounts": [
+                    "source=./cache,target=/cache,type=bind",
+                    "source=named-volume,target=/data,type=volume"
+                ]
+            }"#,
+        );
+        let base_dir = base_path.parent().unwrap();
+
+        let value = effective_value(&config_path, true, &base_path);
+
+        assert_eq!(
+            value["build"]["dockerfile"],
+            base_dir.join("Base.Dockerfile").to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            value["build"]["context"],
+            base_dir.join(".").to_string_lossy().as_ref()
+        );
+        let features = value["features"].as_object().unwrap();
+        assert!(features.contains_key(
+            base_dir.join("./local-feature").to_string_lossy().as_ref()
+        ));
+        assert!(
+            features.contains_key("ghcr.io/f/gh:1"),
+            "OCI references must not be treated as paths"
+        );
+        let mounts = value["mounts"].as_array().unwrap();
+        assert_eq!(
+            mounts[0],
+            format!(
+                "source={},target=/cache,type=bind",
+                base_dir.join("./cache").to_string_lossy()
+            )
+        );
+        assert_eq!(
+            mounts[1], "source=named-volume,target=/data,type=volume",
+            "named volumes must not be rewritten into paths"
+        );
+    }
+
+    #[test]
+    fn base_paths_with_variables_are_left_for_later_substitution() {
+        let workspace = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let config_path = write_project_config(&workspace, r#"{"image": "ubuntu:24.04"}"#);
+        let base_path = write_base_config(
+            &home,
+            r#"{"mounts": ["source=${localWorkspaceFolder}/.cache,target=/cache,type=bind"]}"#,
+        );
+
+        let value = effective_value(&config_path, true, &base_path);
+
+        assert_eq!(
+            value["mounts"][0],
+            "source=${localWorkspaceFolder}/.cache,target=/cache,type=bind"
+        );
     }
 
     /// Minimal fake runtime: records `pull_image` calls and returns a fixed

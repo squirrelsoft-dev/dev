@@ -4,7 +4,9 @@ use crate::devcontainer::{
     DevcontainerConfig, Recipe, compose_and_write, download_features,
     resolve_features, stage_feature_context,
 };
-use crate::devcontainer::features::{generate_feature_dockerfile_with_opts, order_features};
+use crate::devcontainer::features::{
+    feature_image_tag, generate_feature_dockerfile_with_opts, order_features,
+};
 use crate::devcontainer::lockfile::{handle_lockfile, lockfile_path};
 use crate::devcontainer::uid;
 use crate::runtime::{detect_runtime, resolve_remote_user};
@@ -36,7 +38,7 @@ pub async fn run(
     let features = resolve_features(&config)?;
     let has_features = !features.is_empty();
     let default_tag = if has_features {
-        format!("{folder_image}-features")
+        feature_image_tag(&folder_image, &config, &features)
     } else {
         folder_image.clone()
     };
@@ -159,7 +161,7 @@ pub async fn run(
             &compose_env,
         ).await?;
 
-        let feature_tag = format!("{folder_image}-features");
+        let feature_tag = feature_image_tag(&folder_image, &config, &features);
         let compose_final_tag = tag.unwrap_or(&feature_tag);
 
         let mut features = features;
