@@ -29,10 +29,7 @@ unsafe extern "C" {
         flags: u64,
     ) -> xpc_connection_t;
 
-    pub fn xpc_connection_set_event_handler(
-        connection: xpc_connection_t,
-        handler: xpc_handler_t,
-    );
+    pub fn xpc_connection_set_event_handler(connection: xpc_connection_t, handler: xpc_handler_t);
 
     pub fn xpc_connection_resume(connection: xpc_connection_t);
     pub fn xpc_connection_cancel(connection: xpc_connection_t);

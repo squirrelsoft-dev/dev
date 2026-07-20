@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::DevError;
 use super::features::ResolvedFeature;
+use crate::error::DevError;
 
 /// A lockfile entry for a single feature, pinning its version and content digest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,10 +331,7 @@ mod tests {
         let lockfile = Lockfile::from_features(&features_a);
 
         // Now verify against both "a" and "b"
-        let features_ab = vec![
-            make_feature("a", "1", dir_a),
-            make_feature("b", "1", dir_b),
-        ];
+        let features_ab = vec![make_feature("a", "1", dir_a), make_feature("b", "1", dir_b)];
         let mismatches = lockfile.verify(&features_ab);
         assert_eq!(mismatches, vec!["b"]);
     }
@@ -395,7 +392,10 @@ mod tests {
     #[test]
     fn test_lockfile_path() {
         let p = lockfile_path(Path::new("/project/.devcontainer"));
-        assert_eq!(p, PathBuf::from("/project/.devcontainer/devcontainer-lock.json"));
+        assert_eq!(
+            p,
+            PathBuf::from("/project/.devcontainer/devcontainer-lock.json")
+        );
     }
 
     // ── handle_lockfile ────────────────────────────────────────

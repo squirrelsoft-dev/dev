@@ -8,6 +8,8 @@ use crate::runtime::{ContainerRuntime, ContainerState, detect_runtime};
 use crate::util::paths::dev_home;
 use crate::util::workspace_labels;
 
+// CLI entry point: arity mirrors the `dev forward` flag surface.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     workspace: &Path,
     runtime_override: Option<&str>,
@@ -112,7 +114,11 @@ fn remove_custom_name(workspace: &Path, host_port: u16) {
 }
 
 fn keepalive_file_path(workspace: &Path, host_port: u16) -> std::path::PathBuf {
-    forward_dir().join(format!("{}-{}.keepalive", workspace_hash(workspace), host_port))
+    forward_dir().join(format!(
+        "{}-{}.keepalive",
+        workspace_hash(workspace),
+        host_port
+    ))
 }
 
 fn save_keepalive(workspace: &Path, host_port: u16, value: &str) -> anyhow::Result<()> {
@@ -150,16 +156,15 @@ fn active_entries_for_workspace(workspace: &Path) -> Vec<crate::caddy::PortEntry
             continue;
         }
         let middle = &name[prefix.len() + 1..name.len() - 4];
-        if let Ok(port) = middle.parse::<u16>() {
-            if let Ok(pid) = read_pid_file(&entry.path()) {
-                if is_process_alive(pid) {
-                    entries.push(crate::caddy::PortEntry {
-                        port,
-                        custom_name: load_custom_name(workspace, port),
-                        keepalive: load_keepalive(workspace, port),
-                    });
-                }
-            }
+        if let Ok(port) = middle.parse::<u16>()
+            && let Ok(pid) = read_pid_file(&entry.path())
+            && is_process_alive(pid)
+        {
+            entries.push(crate::caddy::PortEntry {
+                port,
+                custom_name: load_custom_name(workspace, port),
+                keepalive: load_keepalive(workspace, port),
+            });
         }
     }
 
@@ -324,9 +329,7 @@ async fn run_forwarder(
         .await
         .map_err(|e| anyhow::anyhow!("Could not bind port {host_port}: {e}"))?;
 
-    eprintln!(
-        "Forwarding 127.0.0.1:{host_port} -> container:{container_port}"
-    );
+    eprintln!("Forwarding 127.0.0.1:{host_port} -> container:{container_port}");
 
     let mut all_entries = active_entries_for_workspace(workspace);
     if !all_entries.iter().any(|e| e.port == host_port) {
@@ -385,17 +388,10 @@ async fn run_forwarder(
     Ok(())
 }
 
-async fn find_netcat(
-    runtime: &dyn ContainerRuntime,
-    container_id: &str,
-) -> anyhow::Result<String> {
+async fn find_netcat(runtime: &dyn ContainerRuntime, container_id: &str) -> anyhow::Result<String> {
     for name in &["nc", "ncat", "netcat"] {
         let result = runtime
-            .exec(
-                container_id,
-                &["which".to_string(), name.to_string()],
-                None,
-            )
+            .exec(container_id, &["which".to_string(), name.to_string()], None)
             .await?;
         if result.exit_code == 0 {
             return Ok(name.to_string());

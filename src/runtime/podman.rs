@@ -32,19 +32,17 @@ fn podman_socket_path() -> Result<String, DevError> {
     }
 
     // macOS via Homebrew podman machine
-    if cfg!(target_os = "macos") {
-        if let Ok(home) = std::env::var("HOME") {
-            let path = format!("{home}/.local/share/containers/podman/machine/podman.sock");
-            if std::path::Path::new(&path).exists() {
-                return Ok(path);
-            }
+    if cfg!(target_os = "macos")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        let path = format!("{home}/.local/share/containers/podman/machine/podman.sock");
+        if std::path::Path::new(&path).exists() {
+            return Ok(path);
         }
     }
 
     // Linux fallback
-    let uid_path = format!("/run/user/{}/podman/podman.sock", unsafe {
-        libc::getuid()
-    });
+    let uid_path = format!("/run/user/{}/podman/podman.sock", unsafe { libc::getuid() });
     if std::path::Path::new(&uid_path).exists() {
         return Ok(uid_path);
     }
@@ -72,7 +70,8 @@ impl ContainerRuntime for PodmanRuntime {
         no_cache: bool,
         verbose: bool,
     ) -> BoxFut<'_, ()> {
-        self.0.build_image(dockerfile, context, tag, build_args, no_cache, verbose)
+        self.0
+            .build_image(dockerfile, context, tag, build_args, no_cache, verbose)
     }
 
     fn create_container(&self, config: &ContainerConfig) -> BoxFut<'_, String> {
@@ -110,11 +109,11 @@ impl ContainerRuntime for PodmanRuntime {
             args.push(id);
             args.extend(cmd);
 
-            let err = std::process::Command::new("podman")
-                .args(&args)
-                .exec();
+            let err = std::process::Command::new("podman").args(&args).exec();
             // exec() only returns on error
-            Err(DevError::Runtime(format!("Failed to exec into container: {err}")))
+            Err(DevError::Runtime(format!(
+                "Failed to exec into container: {err}"
+            )))
         })
     }
 

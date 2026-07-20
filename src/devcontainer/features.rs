@@ -278,8 +278,8 @@ pub async fn download_features(
     devcontainer_dir: Option<&std::path::Path>,
 ) -> Result<(), DevError> {
     // First pass: download all explicitly listed features.
-    for i in 0..features.len() {
-        download_single_feature(&mut features[i], devcontainer_dir).await?;
+    for feature in features.iter_mut() {
+        download_single_feature(feature, devcontainer_dir).await?;
     }
 
     // Second pass: resolve transitive dependsOn dependencies.
@@ -311,9 +311,7 @@ async fn download_single_feature(
             }
             abs_path
         }
-        FeatureRefKind::Tarball(url) => {
-            download_tarball_feature(&url).await?
-        }
+        FeatureRefKind::Tarball(url) => download_tarball_feature(&url).await?,
         FeatureRefKind::Oci { .. } => {
             let result = download_artifact(&feature.oci_ref, &feature.version).await;
             match result {
@@ -406,7 +404,9 @@ fn apply_feature_metadata(feature: &mut ResolvedFeature, meta: &FeatureJsonMeta)
 
 /// Read `depends_on` from a feature's `devcontainer-feature.json`, if present.
 fn read_depends_on(feature: &ResolvedFeature) -> Option<HashMap<String, serde_json::Value>> {
-    let meta_path = feature.install_script_path.join("devcontainer-feature.json");
+    let meta_path = feature
+        .install_script_path
+        .join("devcontainer-feature.json");
     if !meta_path.exists() {
         return None;
     }
@@ -505,10 +505,10 @@ async fn resolve_depends_on(
         // Add the dependency as an install_after for feature(s) that depend on it,
         // using the cached metadata instead of re-reading files.
         for f in features.iter_mut() {
-            if let Some(deps) = deps_cache.get(&f.id) {
-                if deps.contains_key(&dep_id) {
-                    f.install_after.push(dep_id.clone());
-                }
+            if let Some(deps) = deps_cache.get(&f.id)
+                && deps.contains_key(&dep_id)
+            {
+                f.install_after.push(dep_id.clone());
             }
         }
 
@@ -604,10 +604,20 @@ fn create_tar(src_dir: &std::path::Path, tar_path: &std::path::Path) -> Result<(
 fn option_name_to_env(name: &str) -> String {
     let sanitized: String = name
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let trimmed = sanitized.trim_start_matches(|c: char| c.is_ascii_digit() || c == '_');
-    let result = if trimmed.is_empty() { &sanitized } else { trimmed };
+    let result = if trimmed.is_empty() {
+        &sanitized
+    } else {
+        trimmed
+    };
     result.to_uppercase()
 }
 
@@ -756,7 +766,9 @@ pub fn generate_feature_dockerfile_with_opts(
                     .replace('\r', "\\r")
                     .replace('\t', "\\t")
                     .replace('\'', "'\\''");
-                option_exports.push(format!("export {env_name}=\"$(printf '%b' '{escaped_val}')\""));
+                option_exports.push(format!(
+                    "export {env_name}=\"$(printf '%b' '{escaped_val}')\""
+                ));
             }
         }
 
@@ -769,7 +781,8 @@ pub fn generate_feature_dockerfile_with_opts(
         // Wrapper script with env sourcing, scoped options, and error context.
         lines.push(format!(
             "RUN {wrapper}",
-            wrapper = feature_wrapper_script(&feature.id, &feature.version, &stage_dir, &option_exports),
+            wrapper =
+                feature_wrapper_script(&feature.id, &feature.version, &stage_dir, &option_exports),
         ));
     }
 
@@ -796,7 +809,12 @@ pub fn generate_feature_dockerfile_with_opts(
 /// 3. Sets error context variables (_DEV_FEATURE_ID, _DEV_FEATURE_VERSION)
 /// 4. Runs install.sh with `set -e` for proper error propagation
 /// 5. Reports clear error messages on failure
-fn feature_wrapper_script(feature_id: &str, feature_version: &str, stage_dir: &str, option_exports: &[String]) -> String {
+fn feature_wrapper_script(
+    feature_id: &str,
+    feature_version: &str,
+    stage_dir: &str,
+    option_exports: &[String],
+) -> String {
     // Shell-escape the feature ID for safe embedding in the script.
     let escaped_id = feature_id.replace('\'', "'\\''");
     let escaped_version = feature_version.replace('\'', "'\\''");
@@ -879,10 +897,26 @@ fn build_metadata_label(
         }
 
         // Include lifecycle hooks in metadata so they survive the build.
-        insert_lifecycle_hook(&mut entry, "onCreateCommand", &feature.lifecycle_hooks.on_create_command);
-        insert_lifecycle_hook(&mut entry, "postCreateCommand", &feature.lifecycle_hooks.post_create_command);
-        insert_lifecycle_hook(&mut entry, "postStartCommand", &feature.lifecycle_hooks.post_start_command);
-        insert_lifecycle_hook(&mut entry, "postAttachCommand", &feature.lifecycle_hooks.post_attach_command);
+        insert_lifecycle_hook(
+            &mut entry,
+            "onCreateCommand",
+            &feature.lifecycle_hooks.on_create_command,
+        );
+        insert_lifecycle_hook(
+            &mut entry,
+            "postCreateCommand",
+            &feature.lifecycle_hooks.post_create_command,
+        );
+        insert_lifecycle_hook(
+            &mut entry,
+            "postStartCommand",
+            &feature.lifecycle_hooks.post_start_command,
+        );
+        insert_lifecycle_hook(
+            &mut entry,
+            "postAttachCommand",
+            &feature.lifecycle_hooks.post_attach_command,
+        );
 
         metadata.push(serde_json::Value::Object(entry));
     }
@@ -890,7 +924,10 @@ fn build_metadata_label(
     // Base config entry.
     let mut base_entry = serde_json::Map::new();
     if let Some(user) = remote_user {
-        base_entry.insert("remoteUser".into(), serde_json::Value::String(user.to_string()));
+        base_entry.insert(
+            "remoteUser".into(),
+            serde_json::Value::String(user.to_string()),
+        );
     }
     if let Some(ref env) = config.container_env {
         base_entry.insert(
@@ -918,12 +955,12 @@ fn insert_lifecycle_hook(
     if let Some(cmd) = hook {
         let val = match cmd {
             LifecycleCommand::Single(s) => serde_json::Value::String(s.clone()),
-            LifecycleCommand::Multiple(arr) => {
-                serde_json::Value::Array(arr.iter().map(|s| serde_json::Value::String(s.clone())).collect())
-            }
-            LifecycleCommand::Parallel(map) => {
-                serde_json::to_value(map).unwrap_or_default()
-            }
+            LifecycleCommand::Multiple(arr) => serde_json::Value::Array(
+                arr.iter()
+                    .map(|s| serde_json::Value::String(s.clone()))
+                    .collect(),
+            ),
+            LifecycleCommand::Parallel(map) => serde_json::to_value(map).unwrap_or_default(),
         };
         entry.insert(key.into(), val);
     }
@@ -1047,7 +1084,10 @@ mod tests {
         let label = build_metadata_label(&features, &empty_config(), None);
         let recovered = capabilities_from_metadata(&parse_label(&label));
 
-        assert!(recovered.privileged, "privileged must survive the roundtrip");
+        assert!(
+            recovered.privileged,
+            "privileged must survive the roundtrip"
+        );
         assert_eq!(recovered, merge_feature_capabilities(&features));
     }
 
@@ -1086,7 +1126,10 @@ mod tests {
     /// panicking or inventing them.
     #[test]
     fn capabilities_from_metadata_defaults_when_absent() {
-        assert_eq!(capabilities_from_metadata(&[]), MergedCapabilities::default());
+        assert_eq!(
+            capabilities_from_metadata(&[]),
+            MergedCapabilities::default()
+        );
 
         let no_caps = capabilities_from_metadata(&[serde_json::json!({"id": "a"})]);
         assert_eq!(no_caps, MergedCapabilities::default());
@@ -1105,7 +1148,10 @@ mod tests {
         let caps = capabilities_from_metadata(&entries);
 
         assert!(!caps.privileged, "a non-boolean must not enable privileged");
-        assert!(caps.cap_add.is_empty(), "a non-array capAdd must be ignored");
+        assert!(
+            caps.cap_add.is_empty(),
+            "a non-array capAdd must be ignored"
+        );
         assert_eq!(caps.security_opt, ["seccomp=unconfined"]);
     }
 
@@ -1127,12 +1173,8 @@ mod tests {
             make_feature("feature-b", serde_json::json!({})),
         ];
         let config = empty_config();
-        let dockerfile = generate_feature_dockerfile_with_opts(
-            "base:latest",
-            &features,
-            Some("root"),
-            &config,
-        );
+        let dockerfile =
+            generate_feature_dockerfile_with_opts("base:latest", &features, Some("root"), &config);
 
         // Feature options should be in RUN (scoped), not ENV (global).
         assert!(
@@ -1150,15 +1192,13 @@ mod tests {
     fn container_env_uses_env_directive() {
         // containerEnv intentionally persists in the image — should use ENV.
         let mut feature = make_feature("feature-a", serde_json::json!({}));
-        feature.container_env.insert("MY_VAR".to_string(), "hello".to_string());
+        feature
+            .container_env
+            .insert("MY_VAR".to_string(), "hello".to_string());
         let features = vec![feature];
         let config = empty_config();
-        let dockerfile = generate_feature_dockerfile_with_opts(
-            "base:latest",
-            &features,
-            Some("root"),
-            &config,
-        );
+        let dockerfile =
+            generate_feature_dockerfile_with_opts("base:latest", &features, Some("root"), &config);
         assert!(
             dockerfile.contains("ENV MY_VAR=\"hello\""),
             "containerEnv should use ENV directives.\nDockerfile:\n{dockerfile}"
@@ -1174,16 +1214,13 @@ mod tests {
 
     #[test]
     fn feature_options_escape_special_characters() {
-        let features = vec![
-            make_feature("feature-a", serde_json::json!({"desc": "line1\nline2"})),
-        ];
+        let features = vec![make_feature(
+            "feature-a",
+            serde_json::json!({"desc": "line1\nline2"}),
+        )];
         let config = empty_config();
-        let dockerfile = generate_feature_dockerfile_with_opts(
-            "base:latest",
-            &features,
-            Some("root"),
-            &config,
-        );
+        let dockerfile =
+            generate_feature_dockerfile_with_opts("base:latest", &features, Some("root"), &config);
         // Newlines should be escaped as \n inside printf, not literal newlines
         // that would break the Dockerfile RUN instruction.
         assert!(

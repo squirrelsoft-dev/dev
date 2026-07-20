@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::runtime::{ContainerState, detect_runtime};
-use crate::util::{find_config_source, workspace_folder_name, workspace_labels, ConfigSource};
 use crate::util::paths::devcontainers_dir;
+use crate::util::{ConfigSource, find_config_source, workspace_folder_name, workspace_labels};
 
 pub async fn run(
     workspace: &Path,
@@ -18,9 +18,7 @@ pub async fn run(
         .iter()
         .find(|c| c.state == ContainerState::Running)
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "No running container found for this workspace. Run `dev up` first."
-            )
+            anyhow::anyhow!("No running container found for this workspace. Run `dev up` first.")
         })?;
 
     let binary = if insiders { "code-insiders" } else { "code" };
@@ -49,9 +47,7 @@ pub async fn run(
         hex::encode(abs_path.to_string_lossy().as_bytes())
     };
 
-    let uri = format!(
-        "vscode-remote://dev-container+{hex}/workspaces/{folder_name}"
-    );
+    let uri = format!("vscode-remote://dev-container+{hex}/workspaces/{folder_name}");
 
     eprintln!("Opening VS Code attached to container...");
     let status = tokio::process::Command::new(binary)

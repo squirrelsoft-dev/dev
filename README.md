@@ -257,7 +257,13 @@ cargo build --release
 
 The binary will be at `target/release/dev`.
 
-**Note:** The `apple-container` crate (Apple Containers runtime) is only compiled on macOS.
+**Note:** The Apple Containers runtime is opt-in — it is only available on macOS and only when built with `--features apple`:
+
+```sh
+cargo build --release --features apple
+```
+
+That build needs `protoc` on `PATH`; see [CONTRIBUTING.md](CONTRIBUTING.md#development) for the prerequisites.
 
 ## License
 

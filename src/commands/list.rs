@@ -1,6 +1,4 @@
-use crate::collection::{
-    fetch_collection_index, fetch_features, fetch_templates,
-};
+use crate::collection::{fetch_collection_index, fetch_features, fetch_templates};
 
 pub async fn run(
     kind: &str,
@@ -30,7 +28,10 @@ pub async fn run(
                     Ok(_) => {}
                     Err(e) => {
                         if verbose > 0 {
-                            eprintln!("Warning: failed to fetch templates from '{}': {e}", collection.name);
+                            eprintln!(
+                                "Warning: failed to fetch templates from '{}': {e}",
+                                collection.name
+                            );
                         }
                     }
                 }
@@ -63,7 +64,7 @@ pub async fn run(
             } else if all.is_empty() {
                 println!("No templates found.");
             } else {
-                println!("{:<40} {:<20} {}", "ID", "NAME", "DESCRIPTION");
+                println!("{:<40} {:<20} DESCRIPTION", "ID", "NAME");
                 for (_, t) in &all {
                     println!("{:<40} {:<20} {}", t.id, t.name, t.description);
                 }
@@ -87,7 +88,10 @@ pub async fn run(
                     Ok(_) => {}
                     Err(e) => {
                         if verbose > 0 {
-                            eprintln!("Warning: failed to fetch features from '{}': {e}", collection.name);
+                            eprintln!(
+                                "Warning: failed to fetch features from '{}': {e}",
+                                collection.name
+                            );
                         }
                     }
                 }
@@ -119,7 +123,7 @@ pub async fn run(
             } else if all.is_empty() {
                 println!("No features found.");
             } else {
-                println!("{:<40} {:<20} {}", "ID", "NAME", "DESCRIPTION");
+                println!("{:<40} {:<20} DESCRIPTION", "ID", "NAME");
                 for (_, f) in &all {
                     println!("{:<40} {:<20} {}", f.id, f.name, f.description);
                 }

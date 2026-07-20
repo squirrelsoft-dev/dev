@@ -49,7 +49,9 @@ impl XpcMessage {
 
     pub fn set_data(&self, key: &str, val: &[u8]) {
         let c_key = CString::new(key).expect("key contains null byte");
-        unsafe { ffi::xpc_dictionary_set_data(self.inner, c_key.as_ptr(), val.as_ptr(), val.len()) };
+        unsafe {
+            ffi::xpc_dictionary_set_data(self.inner, c_key.as_ptr(), val.as_ptr(), val.len())
+        };
     }
 
     pub fn set_bool(&self, key: &str, val: bool) {

@@ -9,23 +9,52 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# One in-flight run per branch: pushing a fixup to a PR cancels the superseded
+# run instead of leaving both to finish. Matters most for the macos-latest job,
+# which bills at 10x the Linux rate and compiles the whole tonic/prost tree.
+# Pushes to main are exempt, so every commit on the default branch keeps its own
+# pass/fail status for bisecting and release gating.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# No step in either job writes to the repository, so drop the default
+# GITHUB_TOKEN grant to read-only. Least privilege is the other half of the
+# SHA-pinning below: it bounds what a compromised third-party action can do.
+permissions:
+  contents: read
+
+# Actions are pinned to full commit SHAs (with the human-readable version in a
+# trailing comment) so a retagged release cannot silently change what CI runs.
+# Dependabot's github-actions ecosystem keeps these pins current.
 jobs:
   ci:
     name: Build, test, and lint
     runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install Rust toolchain (stable, with clippy)
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Install Rust toolchain (stable, with clippy and rustfmt)
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           toolchain: stable
-          components: clippy
+          components: clippy, rustfmt
           rustflags: ""
+          # This action bundles Swatinem/rust-cache; disable it so the explicit
+          # cache step below is the single source of caching.
+          cache: false
 
-      - name: cargo check
-        run: cargo check
+      - name: Cache cargo registry and target dir
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: . -> target
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: cargo build
         run: cargo build
@@ -33,5 +62,49 @@ jobs:
       - name: cargo test
         run: cargo test
 
-      - name: cargo clippy
-        run: cargo clippy
+  macos:
+    name: Build, test, and lint (macOS, --features apple)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain (stable, with clippy)
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: stable
+          components: clippy
+          rustflags: ""
+          cache: false
+
+      - name: Cache cargo registry and target dir
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: . -> target
+          key: apple
+
+      # crates/apple-container's build script runs tonic-build, which shells
+      # out to `protoc`. macOS runners do not ship it, and the ubuntu job never
+      # compiles this crate, so this is the only job that needs it.
+      - name: Install protoc
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+          HOMEBREW_NO_INSTALL_CLEANUP: 1
+        run: brew install protobuf
+
+      # Covers the macOS-only Apple Containers path gated behind
+      # #[cfg(all(target_os = "macos", feature = "apple"))], which the
+      # ubuntu-latest job never compiles.
+      - name: cargo build --features apple
+        run: cargo build --features apple
+
+      - name: cargo test --features apple
+        run: cargo test --features apple
+
+      # `-p devcontainer --no-deps` scopes the gate to the root package, so
+      # src/runtime/apple.rs is linted while crates/apple-container is only
+      # built as a dependency. That crate has outstanding lints under
+      # -D warnings; cleaning it up is out of scope for this issue, so it stays
+      # excluded here rather than blocking this gate.
+      - name: cargo clippy --features apple
+        run: cargo clippy -p devcontainer --features apple --all-targets --no-deps -- -D warnings

@@ -204,25 +204,28 @@ pub async fn detect_runtime(
     let docker_running = {
         let mut found = None;
         // Try default socket (DOCKER_HOST or /var/run/docker.sock)
-        if let Ok(rt) = docker::DockerRuntime::connect() {
-            if rt.ping().await.is_ok() {
-                found = Some(rt);
-            }
+        if let Ok(rt) = docker::DockerRuntime::connect()
+            && rt.ping().await.is_ok()
+        {
+            found = Some(rt);
         }
         // Fallback: Docker Desktop on macOS uses ~/.docker/run/docker.sock
         // while /var/run/docker.sock may point to a different runtime.
-        if found.is_none() {
-            if let Some(rt) = docker::DockerRuntime::connect_fallback() {
-                if rt.ping().await.is_ok() {
-                    found = Some(rt);
-                }
-            }
+        if found.is_none()
+            && let Some(rt) = docker::DockerRuntime::connect_fallback()
+            && rt.ping().await.is_ok()
+        {
+            found = Some(rt);
         }
         found
     };
 
     let podman_running = if let Ok(rt) = podman::PodmanRuntime::connect() {
-        if rt.ping().await.is_ok() { Some(rt) } else { None }
+        if rt.ping().await.is_ok() {
+            Some(rt)
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -299,8 +302,8 @@ async fn diagnose_no_runtime() -> DevError {
         (None, Some(docker)) => DevError::NoRuntime(format!(
             "Docker is installed but the daemon is not running.\n\n{docker}, then try `dev <subcommand>` again."
         )),
-        (None, None) => DevError::NoRuntime(
-            "No container runtime found. Install Docker or Podman.".to_string(),
-        ),
+        (None, None) => {
+            DevError::NoRuntime("No container runtime found. Install Docker or Podman.".to_string())
+        }
     }
 }

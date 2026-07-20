@@ -21,8 +21,7 @@ impl XpcConnection {
             AppleContainerError::ConnectionFailed(format!("Invalid queue label: {e}"))
         })?;
 
-        let queue =
-            unsafe { ffi::dispatch_queue_create(label.as_ptr(), std::ptr::null()) };
+        let queue = unsafe { ffi::dispatch_queue_create(label.as_ptr(), std::ptr::null()) };
         if queue.is_null() {
             return Err(AppleContainerError::ConnectionFailed(
                 "Failed to create dispatch queue".to_string(),
@@ -30,9 +29,7 @@ impl XpcConnection {
         }
 
         // Use flags=0 (non-privileged) — the Apple Container daemon is a user-level service.
-        let conn = unsafe {
-            ffi::xpc_connection_create_mach_service(c_service.as_ptr(), queue, 0)
-        };
+        let conn = unsafe { ffi::xpc_connection_create_mach_service(c_service.as_ptr(), queue, 0) };
         if conn.is_null() {
             unsafe { ffi::dispatch_release(queue) };
             return Err(AppleContainerError::ConnectionFailed(
@@ -63,9 +60,8 @@ impl XpcConnection {
 
     /// Send a message synchronously and return the reply.
     pub fn send(&self, msg: &XpcMessage) -> Result<XpcMessage, AppleContainerError> {
-        let reply = unsafe {
-            ffi::xpc_connection_send_message_with_reply_sync(self.conn, msg.as_ptr())
-        };
+        let reply =
+            unsafe { ffi::xpc_connection_send_message_with_reply_sync(self.conn, msg.as_ptr()) };
         if reply.is_null() {
             return Err(AppleContainerError::SendFailed(
                 "XPC send returned null".to_string(),
@@ -89,9 +85,8 @@ impl XpcConnection {
             let conn_ptr = conn_addr as *mut std::ffi::c_void;
             let msg_ptr = msg_addr as *mut std::ffi::c_void;
 
-            let reply = unsafe {
-                ffi::xpc_connection_send_message_with_reply_sync(conn_ptr, msg_ptr)
-            };
+            let reply =
+                unsafe { ffi::xpc_connection_send_message_with_reply_sync(conn_ptr, msg_ptr) };
             // Release our retained copy of the message.
             unsafe { ffi::xpc_release(msg_ptr) };
 

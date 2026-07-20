@@ -1,10 +1,10 @@
+use bollard::Docker;
 use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecResults};
 use bollard::models::ContainerCreateBody;
 use bollard::query_parameters::{
     BuildImageOptions, BuilderVersion, CreateContainerOptions, CreateImageOptions,
     ListContainersOptions, RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
 };
-use bollard::Docker;
 use std::collections::HashMap;
 use std::path::Path;
 use tokio::io::AsyncWriteExt;
@@ -27,7 +27,9 @@ impl RawModeGuard {
         let fd = std::io::stdin().as_raw_fd();
         let mut original: libc::termios = unsafe { std::mem::zeroed() };
         if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
-            return Err(DevError::Runtime("Failed to get terminal attributes".into()));
+            return Err(DevError::Runtime(
+                "Failed to get terminal attributes".into(),
+            ));
         }
         let mut raw = original;
         unsafe { libc::cfmakeraw(&mut raw) };
@@ -93,7 +95,11 @@ fn translate_shift_enter(input: &[u8]) -> Vec<u8> {
 /// Adapts bollard's `LogOutput` stream into an `AsyncRead` byte stream.
 struct LogOutputStream {
     inner: std::pin::Pin<
-        Box<dyn futures_util::Stream<Item = Result<bollard::container::LogOutput, bollard::errors::Error>> + Send>,
+        Box<
+            dyn futures_util::Stream<
+                    Item = Result<bollard::container::LogOutput, bollard::errors::Error>,
+                > + Send,
+        >,
     >,
     buffer: bytes::BytesMut,
 }
@@ -171,7 +177,11 @@ impl BollardRuntime {
         // Pass a default (empty) DockerCredentials instead of None. When None
         // is passed, bollard sends an empty X-Registry-Auth header value which
         // Podman rejects as invalid JSON.
-        let mut stream = self.client.create_image(Some(opts), None, Some(bollard::auth::DockerCredentials::default()));
+        let mut stream = self.client.create_image(
+            Some(opts),
+            None,
+            Some(bollard::auth::DockerCredentials::default()),
+        );
         while let Some(result) = stream.next().await {
             result?;
         }
@@ -187,8 +197,8 @@ impl BollardRuntime {
         no_cache: bool,
         verbose: bool,
     ) -> Result<(), DevError> {
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
         use futures_util::StreamExt;
 
         // Create a tar.gz archive of the build context with the Dockerfile injected.
@@ -207,7 +217,9 @@ impl BollardRuntime {
         header.set_cksum();
         archive
             .append_data(&mut header, "Dockerfile", dockerfile_bytes)
-            .map_err(|e| DevError::BuildFailed(format!("Failed to add Dockerfile to archive: {e}")))?;
+            .map_err(|e| {
+                DevError::BuildFailed(format!("Failed to add Dockerfile to archive: {e}"))
+            })?;
 
         let encoder = archive
             .into_inner()
@@ -222,8 +234,7 @@ impl BollardRuntime {
         // to BuilderV1 which explicitly forces the legacy builder—even on
         // Docker 23+ where BuildKit is otherwise the default—and the
         // legacy builder cannot handle RUN --mount.
-        let needs_buildkit = dockerfile.starts_with("# syntax=")
-            || dockerfile.contains("--mount=");
+        let needs_buildkit = dockerfile.starts_with("# syntax=") || dockerfile.contains("--mount=");
         let version = if needs_buildkit {
             BuilderVersion::BuilderBuildKit
         } else {
@@ -251,7 +262,9 @@ impl BollardRuntime {
         // bollard sends an empty X-Registry-Config header value which Podman
         // rejects as invalid JSON.
         let body = bollard::body_full(compressed.into());
-        let mut stream = self.client.build_image(opts, Some(HashMap::new()), Some(body));
+        let mut stream = self
+            .client
+            .build_image(opts, Some(HashMap::new()), Some(body));
         while let Some(result) = stream.next().await {
             let info = match result {
                 Ok(info) => info,
@@ -259,24 +272,22 @@ impl BollardRuntime {
                     return Err(DevError::BuildFailed(format!("Docker stream error: {e}")));
                 }
             };
-            if verbose {
-                if let Some(ref stream_text) = info.stream {
-                    eprint!("{stream_text}");
-                }
+            if verbose && let Some(ref stream_text) = info.stream {
+                eprint!("{stream_text}");
             }
             // Check for BuildKit trace messages with vertex errors or log output.
-            if is_buildkit {
-                if let Some(bollard::models::BuildInfoAux::BuildKit(ref status)) = info.aux {
-                    for vertex in &status.vertexes {
-                        if !vertex.error.is_empty() {
-                            return Err(DevError::BuildFailed(vertex.error.clone()));
-                        }
+            if is_buildkit
+                && let Some(bollard::models::BuildInfoAux::BuildKit(ref status)) = info.aux
+            {
+                for vertex in &status.vertexes {
+                    if !vertex.error.is_empty() {
+                        return Err(DevError::BuildFailed(vertex.error.clone()));
                     }
-                    if verbose {
-                        for log in &status.logs {
-                            let text = String::from_utf8_lossy(&log.msg);
-                            eprint!("{text}");
-                        }
+                }
+                if verbose {
+                    for log in &status.logs {
+                        let text = String::from_utf8_lossy(&log.msg);
+                        eprint!("{text}");
                     }
                 }
             }
@@ -290,7 +301,10 @@ impl BollardRuntime {
         Ok(())
     }
 
-    pub(crate) async fn create_container_impl(&self, config: &ContainerConfig) -> Result<String, DevError> {
+    pub(crate) async fn create_container_impl(
+        &self,
+        config: &ContainerConfig,
+    ) -> Result<String, DevError> {
         let mut binds = Vec::new();
         for m in &config.mounts {
             let ro = if m.readonly { ":ro" } else { "" };
@@ -304,11 +318,7 @@ impl BollardRuntime {
             binds.push(format!("{}:{}", ws.source.display(), ws.target));
         }
 
-        let env: Vec<String> = config
-            .env
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect();
+        let env: Vec<String> = config.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
 
         let exposed_ports: Vec<String> = config
             .ports
@@ -356,7 +366,12 @@ impl BollardRuntime {
 
         let container_config = ContainerCreateBody {
             image: Some(config.image.clone()),
-            labels: Some(labels.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()),
+            labels: Some(
+                labels
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            ),
             env: Some(env),
             exposed_ports: Some(exposed_ports),
             host_config: Some(host_config),
@@ -392,7 +407,13 @@ impl BollardRuntime {
 
     async fn stop_container_impl(&self, id: &str) -> Result<(), DevError> {
         self.client
-            .stop_container(id, Some(StopContainerOptions { t: Some(10), ..Default::default() }))
+            .stop_container(
+                id,
+                Some(StopContainerOptions {
+                    t: Some(10),
+                    ..Default::default()
+                }),
+            )
             .await?;
         Ok(())
     }
@@ -513,12 +534,12 @@ impl BollardRuntime {
             let resize_client = self.client.clone();
             let resize_exec_id = exec.id.clone();
             let sigwinch_handle = tokio::spawn(async move {
-                let mut sig =
-                    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
-                    {
-                        Ok(s) => s,
-                        Err(_) => return,
-                    };
+                let mut sig = match tokio::signal::unix::signal(
+                    tokio::signal::unix::SignalKind::window_change(),
+                ) {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
                 while sig.recv().await.is_some() {
                     if let Some((cols, rows)) = terminal_size() {
                         let _ = resize_client
@@ -538,8 +559,8 @@ impl BollardRuntime {
             // Writing to cancel_writer causes the poll() in the reader to
             // wake up and exit cleanly, avoiding a stuck blocking thread that
             // would prevent the tokio runtime from shutting down.
-            let (cancel_reader, cancel_writer) = os_pipe::pipe()
-                .map_err(|e| DevError::Runtime(format!("pipe: {e}")))?;
+            let (cancel_reader, cancel_writer) =
+                os_pipe::pipe().map_err(|e| DevError::Runtime(format!("pipe: {e}")))?;
 
             // Channel to bridge blocking stdin reads → async container writes.
             let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
@@ -552,19 +573,35 @@ impl BollardRuntime {
                 let mut buf = [0u8; 1024];
                 loop {
                     let mut pfds = [
-                        libc::pollfd { fd: stdin_fd, events: libc::POLLIN, revents: 0 },
-                        libc::pollfd { fd: cancel_fd, events: libc::POLLIN, revents: 0 },
+                        libc::pollfd {
+                            fd: stdin_fd,
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                        libc::pollfd {
+                            fd: cancel_fd,
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
                     ];
                     let ready = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
-                    if ready < 0 { break; }
-                    if pfds[1].revents & libc::POLLIN != 0 { break; }
+                    if ready < 0 {
+                        break;
+                    }
+                    if pfds[1].revents & libc::POLLIN != 0 {
+                        break;
+                    }
                     if pfds[0].revents & libc::POLLIN != 0 {
                         let n = unsafe {
                             libc::read(stdin_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
                         };
-                        if n <= 0 { break; }
+                        if n <= 0 {
+                            break;
+                        }
                         let data = translate_shift_enter(&buf[..n as usize]);
-                        if stdin_tx.blocking_send(data).is_err() { break; }
+                        if stdin_tx.blocking_send(data).is_err() {
+                            break;
+                        }
                     }
                 }
             });
@@ -607,10 +644,10 @@ impl BollardRuntime {
             let monitor_handle = tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    if let Ok(info) = monitor_client.inspect_exec(&monitor_exec_id).await {
-                        if info.running == Some(false) {
-                            break;
-                        }
+                    if let Ok(info) = monitor_client.inspect_exec(&monitor_exec_id).await
+                        && info.running == Some(false)
+                    {
+                        break;
                     }
                 }
             });
@@ -673,9 +710,9 @@ impl BollardRuntime {
                     buffer: bytes::BytesMut::new(),
                 }),
             }),
-            StartExecResults::Detached => {
-                Err(DevError::Runtime("exec session detached unexpectedly".into()))
-            }
+            StartExecResults::Detached => Err(DevError::Runtime(
+                "exec session detached unexpectedly".into(),
+            )),
         }
     }
 
@@ -732,7 +769,9 @@ impl BollardRuntime {
 
         for c in containers {
             let state = match c.state {
-                Some(bollard::models::ContainerSummaryStateEnum::RUNNING) => ContainerState::Running,
+                Some(bollard::models::ContainerSummaryStateEnum::RUNNING) => {
+                    ContainerState::Running
+                }
                 _ => ContainerState::Stopped,
             };
 
@@ -771,33 +810,33 @@ impl BollardRuntime {
         let mut metadata_entries: Vec<serde_json::Value> = Vec::new();
 
         // Parse the devcontainer.metadata label (JSON array or single object).
-        if let Some(ref labels) = config.labels {
-            if let Some(raw) = labels.get("devcontainer.metadata") {
-                if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(raw) {
-                    metadata_entries = arr;
-                } else if let Ok(obj) = serde_json::from_str::<serde_json::Value>(raw) {
-                    metadata_entries = vec![obj];
-                }
+        if let Some(ref labels) = config.labels
+            && let Some(raw) = labels.get("devcontainer.metadata")
+        {
+            if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(raw) {
+                metadata_entries = arr;
+            } else if let Ok(obj) = serde_json::from_str::<serde_json::Value>(raw) {
+                metadata_entries = vec![obj];
+            }
 
-                // Later entries win.
-                for entry in &metadata_entries {
-                    if let Some(u) = entry.get("remoteUser").and_then(|v| v.as_str()) {
-                        remote_user = Some(u.to_string());
-                    }
-                    if let Some(u) = entry.get("containerUser").and_then(|v| v.as_str()) {
-                        container_user = Some(u.to_string());
-                    }
+            // Later entries win.
+            for entry in &metadata_entries {
+                if let Some(u) = entry.get("remoteUser").and_then(|v| v.as_str()) {
+                    remote_user = Some(u.to_string());
+                }
+                if let Some(u) = entry.get("containerUser").and_then(|v| v.as_str()) {
+                    container_user = Some(u.to_string());
                 }
             }
         }
 
         // Fall back to the Dockerfile USER instruction for container_user.
-        if container_user.is_none() {
-            if let Some(ref user) = config.user {
-                let user = user.trim();
-                if !user.is_empty() {
-                    container_user = Some(user.to_string());
-                }
+        if container_user.is_none()
+            && let Some(ref user) = config.user
+        {
+            let user = user.trim();
+            if !user.is_empty() {
+                container_user = Some(user.to_string());
             }
         }
 
@@ -833,7 +872,10 @@ impl ContainerRuntime for BollardRuntime {
         let context = context.to_path_buf();
         let tag = tag.to_string();
         let build_args = build_args.clone();
-        Box::pin(async move { self.build_image_impl(&dockerfile, &context, &tag, &build_args, no_cache, verbose).await })
+        Box::pin(async move {
+            self.build_image_impl(&dockerfile, &context, &tag, &build_args, no_cache, verbose)
+                .await
+        })
     }
 
     fn create_container(&self, config: &ContainerConfig) -> BoxFut<'_, String> {
@@ -882,9 +924,7 @@ impl ContainerRuntime for BollardRuntime {
 
     fn image_exists(&self, image: &str) -> BoxFut<'_, bool> {
         let image = image.to_string();
-        Box::pin(async move {
-            Ok(self.client.inspect_image(&image).await.is_ok())
-        })
+        Box::pin(async move { Ok(self.client.inspect_image(&image).await.is_ok()) })
     }
 
     fn inspect_image_metadata(&self, image: &str) -> BoxFut<'_, ImageMetadata> {
@@ -917,12 +957,12 @@ impl DockerRuntime {
     /// at ~/.docker/run/docker.sock while /var/run/docker.sock may be a
     /// symlink to a different runtime).
     pub fn connect_fallback() -> Option<Self> {
-        if cfg!(target_os = "macos") {
-            if let Ok(home) = std::env::var("HOME") {
-                let path = format!("{home}/.docker/run/docker.sock");
-                if std::path::Path::new(&path).exists() {
-                    return BollardRuntime::connect_to_socket(&path).ok().map(Self);
-                }
+        if cfg!(target_os = "macos")
+            && let Ok(home) = std::env::var("HOME")
+        {
+            let path = format!("{home}/.docker/run/docker.sock");
+            if std::path::Path::new(&path).exists() {
+                return BollardRuntime::connect_to_socket(&path).ok().map(Self);
             }
         }
         None
@@ -951,7 +991,8 @@ impl ContainerRuntime for DockerRuntime {
         no_cache: bool,
         verbose: bool,
     ) -> BoxFut<'_, ()> {
-        self.0.build_image(dockerfile, context, tag, build_args, no_cache, verbose)
+        self.0
+            .build_image(dockerfile, context, tag, build_args, no_cache, verbose)
     }
 
     fn create_container(&self, config: &ContainerConfig) -> BoxFut<'_, String> {

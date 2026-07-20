@@ -5,8 +5,8 @@ use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
 use tar::Archive;
 
-use crate::error::DevError;
 use super::registry::pull_first_layer;
+use crate::error::DevError;
 
 /// Return the blob cache directory, creating it if needed.
 fn blob_cache_dir() -> Result<PathBuf, DevError> {

@@ -60,9 +60,10 @@ pub async fn compose_build(
             .stderr(std::process::Stdio::inherit());
     }
 
-    let status = cmd.status().await.map_err(|e| {
-        DevError::Runtime(format!("Failed to run {bin} {sub} build: {e}"))
-    })?;
+    let status = cmd
+        .status()
+        .await
+        .map_err(|e| DevError::Runtime(format!("Failed to run {bin} {sub} build: {e}")))?;
     if !status.success() {
         return Err(DevError::BuildFailed(format!(
             "{bin} {sub} build failed (exit {})",
@@ -101,9 +102,10 @@ pub async fn compose_up(
             .stderr(std::process::Stdio::inherit());
     }
 
-    let status = cmd.status().await.map_err(|e| {
-        DevError::Runtime(format!("Failed to run {bin} {sub} up: {e}"))
-    })?;
+    let status = cmd
+        .status()
+        .await
+        .map_err(|e| DevError::Runtime(format!("Failed to run {bin} {sub} up: {e}")))?;
     if !status.success() {
         return Err(DevError::Runtime(format!(
             "{bin} {sub} up failed (exit {})",
@@ -234,7 +236,8 @@ pub async fn compose_service_image(
     for (k, v) in env {
         cmd.env(k, v);
     }
-    let output = cmd.output()
+    let output = cmd
+        .output()
         .await
         .map_err(|e| DevError::Runtime(format!("Failed to run {bin} {sub} config: {e}")))?;
 
@@ -336,18 +339,14 @@ pub fn generate_compose_override(
     }
 
     if !labels.is_empty() {
-        let labels_obj: serde_json::Map<_, _> = labels
-            .iter()
-            .map(|(k, v)| (k.clone(), json!(v)))
-            .collect();
+        let labels_obj: serde_json::Map<_, _> =
+            labels.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
         service_obj.insert("labels".into(), serde_json::Value::Object(labels_obj));
     }
 
     if !env.is_empty() {
-        let env_obj: serde_json::Map<_, _> = env
-            .iter()
-            .map(|(k, v)| (k.clone(), json!(v)))
-            .collect();
+        let env_obj: serde_json::Map<_, _> =
+            env.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
         service_obj.insert("environment".into(), serde_json::Value::Object(env_obj));
     }
 
@@ -397,17 +396,13 @@ pub fn generate_compose_override(
     if !caps.cap_add.is_empty() {
         service_obj.insert(
             "cap_add".into(),
-            serde_json::Value::Array(
-                caps.cap_add.iter().map(|c| json!(c)).collect(),
-            ),
+            serde_json::Value::Array(caps.cap_add.iter().map(|c| json!(c)).collect()),
         );
     }
     if !caps.security_opt.is_empty() {
         service_obj.insert(
             "security_opt".into(),
-            serde_json::Value::Array(
-                caps.security_opt.iter().map(|c| json!(c)).collect(),
-            ),
+            serde_json::Value::Array(caps.security_opt.iter().map(|c| json!(c)).collect()),
         );
     }
 
@@ -418,7 +413,10 @@ pub fn generate_compose_override(
     root.insert("services".into(), serde_json::Value::Object(services));
 
     if !top_level_volumes.is_empty() {
-        root.insert("volumes".into(), serde_json::Value::Object(top_level_volumes));
+        root.insert(
+            "volumes".into(),
+            serde_json::Value::Object(top_level_volumes),
+        );
     }
 
     serde_yaml::to_string(&serde_json::Value::Object(root)).unwrap_or_default()
@@ -433,22 +431,20 @@ pub fn generate_compose_override(
 /// as if it lived in `<workspace>/.devcontainer/`.
 ///
 /// Returns the path to a temporary rewritten compose file.
-pub fn rewrite_compose_volumes(
-    compose_path: &Path,
-    workspace: &Path,
-) -> Result<PathBuf, DevError> {
-    let content = std::fs::read_to_string(compose_path)
-        .map_err(|e| DevError::Runtime(format!("Failed to read {}: {e}", compose_path.display())))?;
+pub fn rewrite_compose_volumes(compose_path: &Path, workspace: &Path) -> Result<PathBuf, DevError> {
+    let content = std::fs::read_to_string(compose_path).map_err(|e| {
+        DevError::Runtime(format!("Failed to read {}: {e}", compose_path.display()))
+    })?;
 
-    let mut doc: serde_yaml::Value = serde_yaml::from_str(&content)
-        .map_err(|e| DevError::Runtime(format!("Failed to parse {}: {e}", compose_path.display())))?;
+    let mut doc: serde_yaml::Value = serde_yaml::from_str(&content).map_err(|e| {
+        DevError::Runtime(format!("Failed to parse {}: {e}", compose_path.display()))
+    })?;
 
-    let workspace_abs = workspace.canonicalize()
+    let workspace_abs = workspace
+        .canonicalize()
         .unwrap_or_else(|_| workspace.to_path_buf());
 
-    if let Some(services) =
-        doc.get_mut("services").and_then(|s| s.as_mapping_mut())
-    {
+    if let Some(services) = doc.get_mut("services").and_then(|s| s.as_mapping_mut()) {
         for (_name, service) in services.iter_mut() {
             rewrite_service_volumes(service, &workspace_abs);
         }
@@ -474,10 +470,7 @@ pub fn rewrite_compose_volumes(
 
 /// Rewrite volume source paths that start with `..` in a single service.
 fn rewrite_service_volumes(service: &mut serde_yaml::Value, workspace: &Path) {
-    let volumes = match service
-        .get_mut("volumes")
-        .and_then(|v| v.as_sequence_mut())
-    {
+    let volumes = match service.get_mut("volumes").and_then(|v| v.as_sequence_mut()) {
         Some(seq) => seq,
         None => return,
     };
@@ -486,27 +479,24 @@ fn rewrite_service_volumes(service: &mut serde_yaml::Value, workspace: &Path) {
         match vol {
             // Short syntax: "source:target[:mode]"
             serde_yaml::Value::String(s) => {
-                if s.starts_with("..") {
-                    if let Some(colon_pos) = s.find(':') {
-                        let source = &s[..colon_pos];
-                        let rest = &s[colon_pos..];
-                        let resolved = resolve_parent_ref(source, workspace);
-                        *s = format!("{}{rest}", resolved.display());
-                    }
+                if s.starts_with("..")
+                    && let Some(colon_pos) = s.find(':')
+                {
+                    let source = &s[..colon_pos];
+                    let rest = &s[colon_pos..];
+                    let resolved = resolve_parent_ref(source, workspace);
+                    *s = format!("{}{rest}", resolved.display());
                 }
             }
             // Long syntax: mapping with source/target/type keys
             serde_yaml::Value::Mapping(map) => {
                 let source_key = serde_yaml::Value::String("source".to_string());
-                if let Some(source_val) = map.get_mut(&source_key) {
-                    if let Some(s) = source_val.as_str() {
-                        if s.starts_with("..") {
-                            let resolved = resolve_parent_ref(s, workspace);
-                            *source_val = serde_yaml::Value::String(
-                                resolved.to_string_lossy().to_string(),
-                            );
-                        }
-                    }
+                if let Some(source_val) = map.get_mut(&source_key)
+                    && let Some(s) = source_val.as_str()
+                    && s.starts_with("..")
+                {
+                    let resolved = resolve_parent_ref(s, workspace);
+                    *source_val = serde_yaml::Value::String(resolved.to_string_lossy().to_string());
                 }
             }
             _ => {}
@@ -537,7 +527,9 @@ fn normalize_path(path: &Path) -> PathBuf {
     let mut parts = Vec::new();
     for c in path.components() {
         match c {
-            Component::ParentDir => { parts.pop(); }
+            Component::ParentDir => {
+                parts.pop();
+            }
             Component::CurDir => {}
             other => parts.push(other),
         }
@@ -547,13 +539,10 @@ fn normalize_path(path: &Path) -> PathBuf {
 
 /// Write a compose override to a temporary file and return its path.
 pub fn write_override_file(content: &str) -> Result<PathBuf, DevError> {
-    let path = std::env::temp_dir().join(format!(
-        "dev-compose-override-{}.yml",
-        std::process::id()
-    ));
-    std::fs::write(&path, content).map_err(|e| {
-        DevError::Runtime(format!("Failed to write compose override file: {e}"))
-    })?;
+    let path =
+        std::env::temp_dir().join(format!("dev-compose-override-{}.yml", std::process::id()));
+    std::fs::write(&path, content)
+        .map_err(|e| DevError::Runtime(format!("Failed to write compose override file: {e}")))?;
     Ok(path)
 }
 
@@ -565,7 +554,10 @@ mod tests {
     #[test]
     fn test_compose_file_args_relative() {
         let args = compose_file_args(&["docker-compose.yml"], Path::new("/project/.devcontainer"));
-        assert_eq!(args, vec!["-f", "/project/.devcontainer/docker-compose.yml"]);
+        assert_eq!(
+            args,
+            vec!["-f", "/project/.devcontainer/docker-compose.yml"]
+        );
     }
 
     #[test]
@@ -574,10 +566,15 @@ mod tests {
             &["docker-compose.yml", "/tmp/override.yml"],
             Path::new("/project/.devcontainer"),
         );
-        assert_eq!(args, vec![
-            "-f", "/project/.devcontainer/docker-compose.yml",
-            "-f", "/tmp/override.yml",
-        ]);
+        assert_eq!(
+            args,
+            vec![
+                "-f",
+                "/project/.devcontainer/docker-compose.yml",
+                "-f",
+                "/tmp/override.yml",
+            ]
+        );
     }
 
     #[test]
@@ -598,9 +595,9 @@ mod tests {
 
     #[test]
     fn test_mount_to_compose_volume_long_form() {
-        let result = mount_to_compose_volume(
-            "source=/host/path,target=/container/path,type=bind,readonly"
-        ).unwrap();
+        let result =
+            mount_to_compose_volume("source=/host/path,target=/container/path,type=bind,readonly")
+                .unwrap();
         assert_eq!(result["type"], "bind");
         assert_eq!(result["source"], "/host/path");
         assert_eq!(result["target"], "/container/path");
@@ -609,9 +606,7 @@ mod tests {
 
     #[test]
     fn test_mount_to_compose_volume_volume_type() {
-        let result = mount_to_compose_volume(
-            "source=my-vol,target=/data,type=volume"
-        ).unwrap();
+        let result = mount_to_compose_volume("source=my-vol,target=/data,type=volume").unwrap();
         assert_eq!(result["type"], "volume");
         assert_eq!(result["source"], "my-vol");
         assert_eq!(result["target"], "/data");
@@ -619,16 +614,15 @@ mod tests {
 
     #[test]
     fn test_generate_compose_override_basic() {
-        let labels = vec![
-            ("devcontainer.local_folder".to_string(), "/workspace".to_string()),
-        ];
+        let labels = vec![(
+            "devcontainer.local_folder".to_string(),
+            "/workspace".to_string(),
+        )];
         let mut env = HashMap::new();
         env.insert("SHELL".to_string(), "/bin/bash".to_string());
         let caps = MergedCapabilities::default();
 
-        let yaml = generate_compose_override(
-            "app", &labels, &env, &[], &[], &[], None, &caps,
-        );
+        let yaml = generate_compose_override("app", &labels, &env, &[], &[], &[], None, &caps);
         assert!(yaml.contains("app:"));
         assert!(yaml.contains("devcontainer.local_folder"));
         assert!(yaml.contains("SHELL"));
@@ -644,9 +638,17 @@ mod tests {
         };
 
         let yaml = generate_compose_override(
-            "web", &[], &HashMap::new(), &[], &[],
-            &[crate::runtime::PortMapping { host: 3000, container: 3000 }],
-            Some("myimage:featured"), &caps,
+            "web",
+            &[],
+            &HashMap::new(),
+            &[],
+            &[],
+            &[crate::runtime::PortMapping {
+                host: 3000,
+                container: 3000,
+            }],
+            Some("myimage:featured"),
+            &caps,
         );
         assert!(yaml.contains("myimage:featured"));
         assert!(yaml.contains("init: true"));
@@ -657,20 +659,27 @@ mod tests {
 
     #[test]
     fn test_generate_compose_override_with_volumes() {
-        let mounts = vec![
-            "source=/home/user/.ssh,target=/home/vscode/.ssh,type=bind".to_string(),
-        ];
+        let mounts = vec!["source=/home/user/.ssh,target=/home/vscode/.ssh,type=bind".to_string()];
         let volumes = vec!["extensions:/home/vscode/.vscode-server/extensions".to_string()];
         let caps = MergedCapabilities::default();
 
         let yaml = generate_compose_override(
-            "dev", &[], &HashMap::new(), &mounts, &volumes, &[], None, &caps,
+            "dev",
+            &[],
+            &HashMap::new(),
+            &mounts,
+            &volumes,
+            &[],
+            None,
+            &caps,
         );
         assert!(yaml.contains("/home/user/.ssh"));
         assert!(yaml.contains("extensions"));
         // Top-level volumes section should be present for named volumes.
         let lines: Vec<&str> = yaml.lines().collect();
-        let top_level_volumes = lines.iter().any(|l| l == &"volumes:" || l.starts_with("volumes:"));
+        let top_level_volumes = lines
+            .iter()
+            .any(|l| l == &"volumes:" || l.starts_with("volumes:"));
         assert!(top_level_volumes);
     }
 
@@ -687,29 +696,42 @@ mod tests {
     #[test]
     fn test_resolve_parent_ref() {
         let ws = Path::new("/home/user/projects/myapp");
-        assert_eq!(resolve_parent_ref("..", ws), PathBuf::from("/home/user/projects/myapp"));
-        assert_eq!(resolve_parent_ref("../src", ws), PathBuf::from("/home/user/projects/myapp/src"));
+        assert_eq!(
+            resolve_parent_ref("..", ws),
+            PathBuf::from("/home/user/projects/myapp")
+        );
+        assert_eq!(
+            resolve_parent_ref("../src", ws),
+            PathBuf::from("/home/user/projects/myapp/src")
+        );
     }
 
     #[test]
     fn test_rewrite_compose_volumes_short_syntax() {
         let dir = tempfile::TempDir::new().unwrap();
         let compose = dir.path().join("short-compose.yml");
-        std::fs::write(&compose, r#"
+        std::fs::write(
+            &compose,
+            r#"
 services:
   app:
     image: node:20
     volumes:
       - ..:/workspaces/myapp:cached
       - ./scripts:/scripts
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         let workspace = Path::new("/home/user/projects/myapp");
         let rewritten_path = rewrite_compose_volumes(&compose, workspace).unwrap();
         let content = std::fs::read_to_string(&rewritten_path).unwrap();
 
         // `..` should be rewritten to the workspace path
-        assert!(content.contains("/home/user/projects/myapp:/workspaces/myapp:cached"), "Got: {content}");
+        assert!(
+            content.contains("/home/user/projects/myapp:/workspaces/myapp:cached"),
+            "Got: {content}"
+        );
         // `./scripts` should NOT be rewritten (not a parent ref)
         assert!(content.contains("./scripts:/scripts"), "Got: {content}");
 
@@ -720,7 +742,9 @@ services:
     fn test_rewrite_compose_volumes_long_syntax() {
         let dir = tempfile::TempDir::new().unwrap();
         let compose = dir.path().join("long-compose.yml");
-        std::fs::write(&compose, r#"
+        std::fs::write(
+            &compose,
+            r#"
 services:
   app:
     image: node:20
@@ -728,13 +752,18 @@ services:
       - type: bind
         source: ..
         target: /workspaces/myapp
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         let workspace = Path::new("/home/user/projects/myapp");
         let rewritten_path = rewrite_compose_volumes(&compose, workspace).unwrap();
         let content = std::fs::read_to_string(&rewritten_path).unwrap();
 
-        assert!(content.contains("/home/user/projects/myapp"), "Got: {content}");
+        assert!(
+            content.contains("/home/user/projects/myapp"),
+            "Got: {content}"
+        );
         assert!(!content.contains("source: .."), "Got: {content}");
 
         let _ = std::fs::remove_file(&rewritten_path);
