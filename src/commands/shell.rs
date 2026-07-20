@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::devcontainer::compose::load_workspace_config;
+use crate::devcontainer::compose::load_session_config;
 use crate::devcontainer::substitute_variables;
 use crate::runtime::{ContainerState, detect_runtime, resolve_remote_user};
 use crate::util::{workspace_folder_name, workspace_labels};
@@ -21,9 +21,7 @@ pub async fn run(
         .ok_or_else(|| anyhow::anyhow!("No running container found for this workspace. Run `dev up` first."))?;
 
     // Resolve remoteUser and workspaceFolder from config or image metadata
-    let config = load_workspace_config(workspace, runtime.runtime_name())
-        .ok()
-        .map(|(_, config)| config);
+    let config = load_session_config(workspace, runtime.runtime_name());
     let config_user = config.as_ref().and_then(|c| c.remote_user.clone());
     let user = resolve_remote_user(
         runtime.as_ref(),

@@ -50,6 +50,11 @@ impl DevHome {
         self.root.join("global")
     }
 
+    /// The user-scoped project devcontainers directory, `~/.dev/devcontainers/`.
+    pub fn devcontainers_dir(&self) -> PathBuf {
+        self.root.join("devcontainers")
+    }
+
     /// A global template's `.devcontainer/devcontainer.json`.
     pub fn global_template_config(&self, template: &str) -> PathBuf {
         self.root
@@ -75,14 +80,4 @@ impl DevHome {
     pub fn runtime_config(&self, runtime: &str) -> PathBuf {
         self.root.join(runtime).join("devcontainer.json")
     }
-}
-
-/// VS Code remote-containers configs directory.
-///
-/// - macOS: `~/Library/Application Support/Code/User/globalStorage/ms-vscode-remote.remote-containers/configs/`
-/// - Linux: `~/.config/Code/User/globalStorage/ms-vscode-remote.remote-containers/configs/`
-pub fn vscode_configs_dir() -> PathBuf {
-    dirs::config_dir()
-        .expect("could not determine config directory")
-        .join("Code/User/globalStorage/ms-vscode-remote.remote-containers/configs")
 }

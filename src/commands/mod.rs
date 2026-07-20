@@ -12,4 +12,3 @@ pub mod open;
 pub mod shell;
 pub mod status;
 pub mod up;
-pub mod vscode;

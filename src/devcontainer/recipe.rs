@@ -19,8 +19,6 @@ pub struct Recipe {
     /// Template option substitutions (`${templateOption:key}` → value)
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub options: HashMap<String, String>,
-    /// Absolute path to the workspace root
-    pub root_folder: String,
     /// User-applied configuration overrides (highest-priority layer during composition).
     /// Stores devcontainer.json property deltas set via `dev config set/add/remove`.
     #[serde(
@@ -71,7 +69,6 @@ mod tests {
             global_template: "rust".to_string(),
             features: vec!["ghcr.io/features/zsh:1".to_string()],
             options: HashMap::from([("imageVariant".to_string(), "bookworm".to_string())]),
-            root_folder: "/home/user/project".to_string(),
             customizations: default_empty_object(),
         };
 
@@ -81,7 +78,6 @@ mod tests {
         assert_eq!(loaded.global_template, "rust");
         assert_eq!(loaded.features.len(), 1);
         assert_eq!(loaded.options["imageVariant"], "bookworm");
-        assert_eq!(loaded.root_folder, "/home/user/project");
     }
 
     #[test]
@@ -93,7 +89,6 @@ mod tests {
             global_template: "python".to_string(),
             features: Vec::new(),
             options: HashMap::new(),
-            root_folder: "/tmp/proj".to_string(),
             customizations: default_empty_object(),
         };
 
@@ -103,6 +98,7 @@ mod tests {
         assert!(!raw.contains("features"));
         assert!(!raw.contains("options"));
         assert!(!raw.contains("customizations"));
+        assert!(!raw.contains("rootFolder"));
 
         let loaded = Recipe::from_path(&path).unwrap();
         assert_eq!(loaded.global_template, "python");
@@ -126,7 +122,6 @@ mod tests {
             global_template: "rust".to_string(),
             features: Vec::new(),
             options: HashMap::new(),
-            root_folder: "/home/user/project".to_string(),
             customizations,
         };
 
@@ -154,5 +149,26 @@ mod tests {
         let loaded = Recipe::from_path(&path).unwrap();
         assert_eq!(loaded.global_template, "rust");
         assert!(is_empty_object(&loaded.customizations));
+    }
+
+    #[test]
+    fn a_legacy_root_folder_is_read_without_being_written_back() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("recipe.json");
+        fs::write(
+            &path,
+            r#"{"globalTemplate": "rust", "rootFolder": "/home/someone-else/project"}"#,
+        )
+        .unwrap();
+
+        let loaded = Recipe::from_path(&path).unwrap();
+        loaded.write_to(&path).unwrap();
+
+        let raw = fs::read_to_string(&path).unwrap();
+        assert_eq!(loaded.global_template, "rust");
+        assert!(
+            !raw.contains("rootFolder"),
+            "rewriting a legacy recipe should drop the unused field: {raw}"
+        );
     }
 }

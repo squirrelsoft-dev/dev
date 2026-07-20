@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use super::paths::devcontainers_dir;
+use super::paths::DevHome;
 use crate::error::DevError;
 
 /// Where a devcontainer config was found.
@@ -21,6 +21,15 @@ pub enum ConfigSource {
 /// 4. `~/.dev/devcontainers/<folder>/.devcontainer/recipe.json` → Recipe
 /// 5. `~/.dev/devcontainers/<folder>/.devcontainer/devcontainer.json` → Direct (legacy)
 pub fn find_config_source(workspace: &Path) -> Result<ConfigSource, DevError> {
+    find_config_source_in(&DevHome::current(), workspace)
+}
+
+/// [`find_config_source`] against an explicit `~/.dev/` layout, so the user-scope
+/// fallback in steps 4 and 5 stays inside an injected home rather than the real one.
+pub fn find_config_source_in(
+    dev_home: &DevHome,
+    workspace: &Path,
+) -> Result<ConfigSource, DevError> {
     let workspace_recipe = workspace.join(".devcontainer/recipe.json");
     let nested = workspace.join(".devcontainer/devcontainer.json");
     let root_level = workspace.join(".devcontainer.json");
@@ -44,7 +53,10 @@ pub fn find_config_source(workspace: &Path) -> Result<ConfigSource, DevError> {
     }
 
     let folder_name = workspace_folder_name(workspace);
-    let user_dir = devcontainers_dir().join(&folder_name).join(".devcontainer");
+    let user_dir = dev_home
+        .devcontainers_dir()
+        .join(&folder_name)
+        .join(".devcontainer");
 
     // Check for recipe first (new flow)
     let recipe_path = user_dir.join("recipe.json");

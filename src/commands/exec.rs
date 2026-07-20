@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::devcontainer::compose::load_workspace_config;
+use crate::devcontainer::compose::load_session_config;
 use crate::runtime::{ContainerState, detect_runtime, resolve_remote_user};
 use crate::util::workspace_labels;
 
@@ -24,9 +24,8 @@ pub async fn run(
     let resolved_user = if user.is_some() {
         user.map(|u| u.to_string())
     } else {
-        let config_user = load_workspace_config(workspace, runtime.runtime_name())
-            .ok()
-            .and_then(|(_, config)| config.remote_user);
+        let config_user = load_session_config(workspace, runtime.runtime_name())
+            .and_then(|config| config.remote_user);
         resolve_remote_user(
             runtime.as_ref(),
             &container.image,

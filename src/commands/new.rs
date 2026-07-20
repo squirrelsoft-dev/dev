@@ -171,12 +171,6 @@ async fn apply_global_template(
     Ok(())
 }
 
-/// A recipe describes the workspace it belongs to relatively, so the same
-/// `recipe.json` works for every clone of a repository. Baking the creating
-/// machine's absolute path in here would make a committed recipe unusable to
-/// anyone else.
-const WORKSPACE_ROOT: &str = "${localWorkspaceFolder}";
-
 /// Refuse to create a recipe next to a `devcontainer.json`.
 ///
 /// `find_config_source` rejects a directory holding both, so writing one anyway
@@ -227,7 +221,6 @@ fn write_recipe_in(
         global_template: global_template.to_string(),
         features,
         options,
-        root_folder: WORKSPACE_ROOT.to_string(),
         customizations: serde_json::Value::Object(serde_json::Map::new()),
     };
     // Auxiliary files are planned (and rejected if locally edited) before the
@@ -466,8 +459,10 @@ mod tests {
             !raw.contains(workspace.path().to_str().unwrap()),
             "a committed recipe must not pin the creating machine's path: {raw}"
         );
-        let recipe = Recipe::from_path(&devcontainer_dir.join("recipe.json")).unwrap();
-        assert_eq!(recipe.root_folder, WORKSPACE_ROOT);
+        assert!(
+            !raw.contains("rootFolder"),
+            "the unused rootFolder field must not be serialized: {raw}"
+        );
     }
 
     #[test]

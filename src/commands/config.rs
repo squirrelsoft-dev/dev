@@ -1268,7 +1268,6 @@ mod tests {
             global_template: "test".to_string(),
             features: Vec::new(),
             options: HashMap::new(),
-            root_folder: "/tmp/proj".to_string(),
             customizations: Value::Object(serde_json::Map::new()),
         };
         recipe.write_to(&recipe_path).unwrap();
