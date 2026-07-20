@@ -337,7 +337,7 @@ pub async fn run(
         ports,
         workspace_mount: Some(WorkspaceMount {
             source: workspace.to_path_buf(),
-            target: config.workspace_mount_target(workspace)?,
+            target: config.workspace_mount_target(workspace, remote_user)?,
         }),
         extra_args,
         entrypoint: None,
