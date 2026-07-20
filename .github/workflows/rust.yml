@@ -9,6 +9,13 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# One in-flight run per branch: pushing a fixup to a PR cancels the superseded
+# run instead of leaving both to finish. Matters most for the macos-latest job,
+# which bills at 10x the Linux rate and compiles the whole tonic/prost tree.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 # No step in either job writes to the repository, so drop the default
 # GITHUB_TOKEN grant to read-only. Least privilege is the other half of the
 # SHA-pinning below: it bounds what a compromised third-party action can do.
@@ -44,17 +51,14 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all --check
 
-      - name: cargo check
-        run: cargo check
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: cargo build
         run: cargo build
 
       - name: cargo test
         run: cargo test
-
-      - name: cargo clippy
-        run: cargo clippy --all-targets -- -D warnings
 
   macos:
     name: Build, test, and lint (macOS, --features apple)
