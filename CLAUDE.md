@@ -2,7 +2,8 @@
 - Install: `cargo build`
 - Build: `cargo build --release`
 - Test: `cargo test`
-- Lint: `cargo clippy`
+- Lint: `cargo clippy --all-targets -- -D warnings`
+- Format check: `cargo fmt --all --check`
 - Typecheck: `cargo check`
 
 # Non-Negotiables
