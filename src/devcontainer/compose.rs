@@ -7,7 +7,8 @@ use sha2::{Digest, Sha256};
 
 use crate::devcontainer::config::DevcontainerConfig;
 use crate::devcontainer::effective::{
-    absolutize_config_paths, config_definition, prune_lower_priority_definitions,
+    absolutize_config_paths, config_definition, load_effective_config_value,
+    prune_lower_priority_definitions,
 };
 use crate::devcontainer::jsonc::parse_jsonc;
 use crate::devcontainer::merge::{merge_layer, merge_layers};
@@ -130,7 +131,14 @@ pub(crate) fn load_workspace_config_in(
 ) -> anyhow::Result<(PathBuf, DevcontainerConfig)> {
     match find_config_source_in(dev_home, workspace)? {
         ConfigSource::Direct(path) => {
-            let config = DevcontainerConfig::from_path(&path)?;
+            // `dev up` builds a direct-config project through load_effective_config,
+            // so the base layer is already in the container. Reading the project file
+            // alone here would drop it and hand the session the image's defaults
+            // instead of the user the container actually runs as.
+            let (value, _) = load_effective_config_value(&path, true, &dev_home.base_config())?;
+            let config = serde_json::from_value(value).map_err(|e| {
+                DevError::InvalidConfig(format!("Failed to parse merged config: {e}"))
+            })?;
             Ok((path, config))
         }
         ConfigSource::Recipe(recipe_path) => {
@@ -1561,6 +1569,64 @@ mod tests {
 
         assert_eq!(config.remote_user.as_deref(), Some("dev"));
         assert_eq!(config_path, devcontainer_dir.join("devcontainer.json"));
+    }
+
+    /// `dev up` merges the base layer under a direct project's config, so the
+    /// container really does run as the base's `remoteUser`. If this path stopped
+    /// merging, `dev shell` and `dev exec` would report the image's default user
+    /// instead and open the session as the wrong one.
+    #[test]
+    fn a_direct_project_picks_up_the_base_layer_the_container_was_built_with() {
+        let env = TestDevHome::new(
+            r#"{"image": "unused"}"#,
+            Some(r#"{"remoteUser": "daemon", "containerEnv": {"FROM_BASE": "yes"}}"#),
+            None,
+            "docker",
+        );
+        let devcontainer_dir = env.workspace.join(".devcontainer");
+        fs::create_dir_all(&devcontainer_dir).unwrap();
+        fs::write(
+            devcontainer_dir.join("devcontainer.json"),
+            r#"{"image": "ubuntu:24.04"}"#,
+        )
+        .unwrap();
+
+        let (_, config) =
+            load_workspace_config_in(&env.dev_home, &env.workspace, "docker").unwrap();
+
+        assert_eq!(config.remote_user.as_deref(), Some("daemon"));
+        assert_eq!(
+            config
+                .container_env
+                .as_ref()
+                .and_then(|env| env.get("FROM_BASE"))
+                .map(String::as_str),
+            Some("yes")
+        );
+    }
+
+    /// The base layer fills gaps; it must never outrank what the project declares.
+    #[test]
+    fn a_direct_project_outranks_the_base_layer() {
+        let env = TestDevHome::new(
+            r#"{"image": "unused"}"#,
+            Some(r#"{"remoteUser": "daemon"}"#),
+            None,
+            "docker",
+        );
+        let devcontainer_dir = env.workspace.join(".devcontainer");
+        fs::create_dir_all(&devcontainer_dir).unwrap();
+        fs::write(
+            devcontainer_dir.join("devcontainer.json"),
+            r#"{"image": "ubuntu:24.04", "remoteUser": "root"}"#,
+        )
+        .unwrap();
+
+        let (_, config) =
+            load_workspace_config_in(&env.dev_home, &env.workspace, "docker").unwrap();
+
+        assert_eq!(config.remote_user.as_deref(), Some("root"));
+        assert_eq!(config.image.as_deref(), Some("ubuntu:24.04"));
     }
 
     #[test]
