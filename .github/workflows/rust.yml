@@ -9,6 +9,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# No step in either job writes to the repository, so drop the default
+# GITHUB_TOKEN grant to read-only. Least privilege is the other half of the
+# SHA-pinning below: it bounds what a compromised third-party action can do.
+permissions:
+  contents: read
+
 # Actions are pinned to full commit SHAs (with the human-readable version in a
 # trailing comment) so a retagged release cannot silently change what CI runs.
 # Dependabot's github-actions ecosystem keeps these pins current.
@@ -57,10 +63,11 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install Rust toolchain (stable)
+      - name: Install Rust toolchain (stable, with clippy)
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           toolchain: stable
+          components: clippy
           rustflags: ""
           cache: false
 
@@ -72,13 +79,17 @@ jobs:
 
       # Covers the macOS-only Apple Containers path gated behind
       # #[cfg(all(target_os = "macos", feature = "apple"))], which the
-      # ubuntu-latest job never compiles. Clippy is intentionally not enforced
-      # here yet: crates/apple-container is not clippy-clean under -D warnings.
-      - name: cargo check --features apple
-        run: cargo check --features apple
-
+      # ubuntu-latest job never compiles.
       - name: cargo build --features apple
         run: cargo build --features apple
 
       - name: cargo test --features apple
         run: cargo test --features apple
+
+      # `-p devcontainer --no-deps` scopes the gate to the root package, so
+      # src/runtime/apple.rs is linted while crates/apple-container is only
+      # built as a dependency. That crate has outstanding lints under
+      # -D warnings; cleaning it up is tracked separately, and until then it
+      # stays out of scope here rather than blocking this gate.
+      - name: cargo clippy --features apple
+        run: cargo clippy -p devcontainer --features apple --all-targets --no-deps -- -D warnings
