@@ -505,11 +505,10 @@ async fn resolve_depends_on(
         // Add the dependency as an install_after for feature(s) that depend on it,
         // using the cached metadata instead of re-reading files.
         for f in features.iter_mut() {
-            if let Some(deps) = deps_cache.get(&f.id) {
-                if deps.contains_key(&dep_id) {
+            if let Some(deps) = deps_cache.get(&f.id)
+                && deps.contains_key(&dep_id) {
                     f.install_after.push(dep_id.clone());
                 }
-            }
         }
 
         features.push(dep_feature);

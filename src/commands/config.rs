@@ -330,12 +330,11 @@ fn apply_remove(
         PropertyType::Lifecycle => {
             if let Some(map) = obj.get_mut(property).and_then(|v| v.as_object_mut()) {
                 if map.remove(value).is_some() {
-                    if map.len() == 1 {
-                        if let Some((_, single_val)) = map.iter().next() {
+                    if map.len() == 1
+                        && let Some((_, single_val)) = map.iter().next() {
                             let simplified = single_val.clone();
                             obj.insert(property.to_string(), simplified);
                         }
-                    }
                     Ok(format!("Removed {value} from {property}"))
                 } else {
                     Ok(format!("Label '{value}' not found in {property}"))
@@ -458,44 +457,40 @@ fn config_list(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
     }
 
     // Features
-    if let Some(features) = obj.get("features").and_then(|v| v.as_object()) {
-        if !features.is_empty() {
+    if let Some(features) = obj.get("features").and_then(|v| v.as_object())
+        && !features.is_empty() {
             println!("features:");
             for key in features.keys() {
                 println!("  - {key}");
             }
         }
-    }
 
     // Forward ports
-    if let Some(ports) = obj.get("forwardPorts").and_then(|v| v.as_array()) {
-        if !ports.is_empty() {
-            let ports_str: Vec<String> = ports.iter().map(|v| format_value(v)).collect();
+    if let Some(ports) = obj.get("forwardPorts").and_then(|v| v.as_array())
+        && !ports.is_empty() {
+            let ports_str: Vec<String> = ports.iter().map(format_value).collect();
             println!("forwardPorts: {}", ports_str.join(", "));
         }
-    }
 
     // Env maps
     for key in ["remoteEnv", "containerEnv"] {
-        if let Some(env) = obj.get(key).and_then(|v| v.as_object()) {
-            if !env.is_empty() {
+        if let Some(env) = obj.get(key).and_then(|v| v.as_object())
+            && !env.is_empty() {
                 println!("{key}:");
                 for (k, v) in env {
                     println!("  {k}={}", format_value(v));
                 }
             }
-        }
     }
 
     // Mounts
-    if let Some(mounts) = obj.get("mounts").and_then(|v| v.as_array()) {
-        if !mounts.is_empty() {
+    if let Some(mounts) = obj.get("mounts").and_then(|v| v.as_array())
+        && !mounts.is_empty() {
             println!("mounts:");
             for m in mounts {
                 println!("  - {}", format_value(m));
             }
         }
-    }
 
     // Lifecycle commands
     for key in LIFECYCLE_COMMANDS {
@@ -503,7 +498,7 @@ fn config_list(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
             match val {
                 Value::String(s) => println!("{key}: {s}"),
                 Value::Array(arr) => {
-                    let cmds: Vec<String> = arr.iter().map(|v| format_value(v)).collect();
+                    let cmds: Vec<String> = arr.iter().map(format_value).collect();
                     println!("{key}: [{}]", cmds.join(", "));
                 }
                 Value::Object(map) => {
@@ -513,7 +508,7 @@ fn config_list(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
                             Value::String(s) => println!("  {label}: {s}"),
                             Value::Array(arr) => {
                                 let cmds: Vec<String> =
-                                    arr.iter().map(|v| format_value(v)).collect();
+                                    arr.iter().map(format_value).collect();
                                 println!("  {label}: [{}]", cmds.join(", "));
                             }
                             other => println!("  {label}: {other}"),
@@ -691,7 +686,7 @@ fn interactive_ports(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
             let ports: Vec<String> = json
                 .get("forwardPorts")
                 .and_then(|v| v.as_array())
-                .map(|a| a.iter().map(|v| format_value(v)).collect())
+                .map(|a| a.iter().map(format_value).collect())
                 .unwrap_or_default();
 
             if ports.is_empty() {
@@ -783,7 +778,7 @@ fn interactive_mounts(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
             let mounts: Vec<String> = json
                 .get("mounts")
                 .and_then(|v| v.as_array())
-                .map(|a| a.iter().map(|v| format_value(v)).collect())
+                .map(|a| a.iter().map(format_value).collect())
                 .unwrap_or_default();
 
             if mounts.is_empty() {
@@ -821,7 +816,7 @@ fn interactive_lifecycle(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
     let current_desc = match current {
         Some(Value::String(s)) => format!("string: {s}"),
         Some(Value::Array(a)) => {
-            let cmds: Vec<String> = a.iter().map(|v| format_value(v)).collect();
+            let cmds: Vec<String> = a.iter().map(format_value).collect();
             format!("array: [{}]", cmds.join(", "))
         }
         Some(Value::Object(map)) => {
