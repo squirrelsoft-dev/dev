@@ -200,6 +200,11 @@ pub struct DotfilesConfig {
 
 impl DevcontainerConfig {
     /// Read and parse a devcontainer.json file (supports JSONC with comments).
+    ///
+    /// Exported from `lib.rs` but no longer called by the `dev` binary, which
+    /// reads configs through `load_effective_config_value` so the base and
+    /// runtime layers are applied.
+    #[allow(dead_code)]
     pub fn from_path(path: &Path) -> Result<Self, DevError> {
         let raw = std::fs::read_to_string(path).map_err(|e| {
             DevError::InvalidConfig(format!("Failed to read {}: {e}", path.display()))
