@@ -155,6 +155,11 @@ pub struct DevcontainerConfig {
     pub docker_compose_file: Option<DockerComposeFile>,
     pub service: Option<String>,
     pub workspace_folder: Option<String>,
+    /// Full `--mount` string for `docker run`, per the devcontainer spec.
+    /// Example: `"source=${localWorkspaceFolder},target=/workspace,type=bind"`.
+    /// When set, the `target=` segment takes precedence over `workspace_folder`
+    /// for the effective bind mount destination.
+    pub workspace_mount: Option<String>,
     pub features: Option<HashMap<String, serde_json::Value>>,
     #[serde(default, deserialize_with = "deserialize_forward_ports")]
     pub forward_ports: Option<Vec<PortMapping>>,
@@ -208,6 +213,260 @@ impl DevcontainerConfig {
     /// Returns true if this config uses Docker Compose rather than image/Dockerfile.
     pub fn is_compose(&self) -> bool {
         self.docker_compose_file.is_some()
+    }
+
+    /// Returns the effective workspace bind-mount target inside the container,
+    /// per the devcontainer spec precedence:
+    ///   1. `workspaceMount.target` (after variable substitution), if set
+    ///   2. `workspaceFolder`, if set
+    ///   3. `/workspaces/{folder_name}` as a last-resort default
+    ///
+    /// `remote_user` is used to resolve user-dependent variables like
+    /// `${containerEnv:HOME}` when a non-root `remoteUser` is configured.
+    ///
+    /// Only the `target=` segment of `workspaceMount` is consulted; `source=`,
+    /// `type=`, and `readonly=` are ignored here because the source is the host
+    /// workspace directory and the bind is always writable at this layer.
+    pub fn workspace_mount_target(
+        &self,
+        host: &Path,
+        remote_user: Option<&str>,
+    ) -> Result<String, DevError> {
+        let folder_name = host
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let default = format!("/workspaces/{folder_name}");
+
+        // Spec precedence: workspaceMount.target wins, then workspaceFolder, then default.
+        if let Some(mount) = &self.workspace_mount {
+            // Substitute variables first so e.g. ${localWorkspaceFolder} expands
+            // before we look for `target=`. Use the with_user variant so
+            // ${containerEnv:HOME} etc. reflect the effective remote user.
+            let expanded = substitute_variables_with_user(mount, host, remote_user);
+            if let Some(target) = parse_mount_target(&expanded) {
+                return Ok(target);
+            }
+            // Mount string was set but had no recognizable target= segment.
+            // Fall back to workspaceFolder, then to the default.
+        }
+
+        if let Some(folder) = &self.workspace_folder {
+            return Ok(substitute_variables_with_user(folder, host, remote_user));
+        }
+
+        Ok(default)
+    }
+}
+
+/// Extracts the destination value from a Docker `--mount` string.
+/// Accepts Docker's three accepted key names: `target`, `dst`, `destination`.
+/// Returns `None` if no destination segment is found.
+///
+/// Handles comma-separated key=value pairs. Trims whitespace on both sides of
+/// the `=` separator, so `"key = value"`, `"key =value"`, and `"key= value"`
+/// all parse. Values containing `=` are preserved (only the first `=` is the
+/// split). Segments without an `=` (bare flags like `readonly`) are skipped
+/// rather than treated as parse failures. Does not attempt to handle quoted
+/// values containing commas — Docker's own parser has the same limitation,
+/// and devcontainer configs don't use it.
+fn parse_mount_target(mount: &str) -> Option<String> {
+    for segment in mount.split(',') {
+        // Skip bare-flag segments (e.g. "readonly") — they have no `=` to split on.
+        // Using `?` here would abort the whole function on the first flag,
+        // missing any target that appears after it in the string.
+        let Some((raw_key, raw_value)) = segment.split_once('=') else { continue };
+        let key = raw_key.trim();
+        if matches!(key, "target" | "dst" | "destination") {
+            return Some(raw_value.trim().to_string());
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod workspace_mount_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn cfg(workspace_folder: Option<&str>, workspace_mount: Option<&str>) -> DevcontainerConfig {
+        DevcontainerConfig {
+            workspace_folder: workspace_folder.map(String::from),
+            workspace_mount: workspace_mount.map(String::from),
+            ..make_minimal_config()
+        }
+    }
+
+    fn make_minimal_config() -> DevcontainerConfig {
+        DevcontainerConfig {
+            name: None,
+            image: Some("ubuntu:24.04".to_string()),
+            build: None,
+            docker_compose_file: None,
+            service: None,
+            workspace_folder: None,
+            workspace_mount: None,
+            features: None,
+            forward_ports: None,
+            remote_user: None,
+            remote_env: None,
+            container_env: None,
+            mounts: None,
+            volumes: None,
+            run_args: None,
+            on_create_command: None,
+            update_content_command: None,
+            post_create_command: None,
+            post_start_command: None,
+            post_attach_command: None,
+            initialize_command: None,
+            customize: None,
+            update_remote_user_uid: None,
+            dotfiles: None,
+        }
+    }
+
+    #[test]
+    fn no_config_falls_back_to_workspaces_folder() {
+        let host = PathBuf::from("/home/user/my-project");
+        let resolved = cfg(None, None).workspace_mount_target(&host, None).unwrap();
+        assert_eq!(resolved, "/workspaces/my-project");
+    }
+
+    #[test]
+    fn workspace_folder_used_when_no_mount() {
+        let host = PathBuf::from("/home/user/my-project");
+        let resolved = cfg(Some("/workspace"), None).workspace_mount_target(&host, None).unwrap();
+        assert_eq!(resolved, "/workspace");
+    }
+
+    #[test]
+    fn workspace_mount_target_wins() {
+        let host = PathBuf::from("/home/user/my-project");
+        let mount = "source=/host,target=/container/work,type=bind";
+        let resolved = cfg(Some("/workspace"), Some(mount))
+            .workspace_mount_target(&host, None)
+            .unwrap();
+        assert_eq!(resolved, "/container/work");
+    }
+
+    #[test]
+    fn workspace_mount_alone() {
+        let host = PathBuf::from("/home/user/my-project");
+        let mount = "source=/host,target=/srv/app,type=bind";
+        let resolved = cfg(None, Some(mount)).workspace_mount_target(&host, None).unwrap();
+        assert_eq!(resolved, "/srv/app");
+    }
+
+    #[test]
+    fn workspace_mount_with_local_workspace_folder_var() {
+        let host = PathBuf::from("/home/user/my-project");
+        let mount = "source=${localWorkspaceFolder},target=/workspace,type=bind";
+        let resolved = cfg(None, Some(mount)).workspace_mount_target(&host, None).unwrap();
+        // We don't assert the substituted source (the host canonicalize happens
+        // in the caller), only that the target was extracted and the source
+        // var was substituted without erroring. The target here is /workspace.
+        assert_eq!(resolved, "/workspace");
+    }
+
+    #[test]
+    fn workspace_mount_without_target_falls_through_to_folder() {
+        // A mount string with no target= segment should not crash; we fall
+        // back to workspaceFolder, then to the default.
+        let host = PathBuf::from("/home/user/my-project");
+        let mount = "type=bind,readonly";
+        let resolved = cfg(Some("/workspace"), Some(mount))
+            .workspace_mount_target(&host, None)
+            .unwrap();
+        assert_eq!(resolved, "/workspace");
+    }
+
+    #[test]
+    fn workspace_mount_without_target_and_no_folder_falls_back_to_default() {
+        let host = PathBuf::from("/home/user/my-project");
+        let mount = "type=bind,readonly";
+        let resolved = cfg(None, Some(mount)).workspace_mount_target(&host, None).unwrap();
+        assert_eq!(resolved, "/workspaces/my-project");
+    }
+
+    #[test]
+    fn workspace_mount_accepts_dst_alias() {
+        // Docker's --mount flag also accepts dst= as a synonym for target=.
+        let host = PathBuf::from("/home/user/my-project");
+        let mount = "source=/host,dst=/srv/dst,type=bind";
+        let resolved = cfg(None, Some(mount)).workspace_mount_target(&host, None).unwrap();
+        assert_eq!(resolved, "/srv/dst");
+    }
+
+    #[test]
+    fn workspace_mount_accepts_destination_alias() {
+        // Docker's --mount flag also accepts destination= as a synonym for target=.
+        let host = PathBuf::from("/home/user/my-project");
+        let mount = "source=/host,destination=/srv/dest,type=bind";
+        let resolved = cfg(None, Some(mount)).workspace_mount_target(&host, None).unwrap();
+        assert_eq!(resolved, "/srv/dest");
+    }
+
+    #[test]
+    fn parse_mount_target_handles_spaces_around_equals() {
+        // The parser trims whitespace on both sides of the `=` separator, so
+        // all of these forms are accepted.
+        assert_eq!(
+            parse_mount_target("source=/host, target=/x,type=bind"),
+            Some("/x".to_string()),
+        );
+        assert_eq!(
+            parse_mount_target("source=/host, target = /y,type=bind"),
+            Some("/y".to_string()),
+        );
+        assert_eq!(
+            parse_mount_target("source=/host, target =/z,type=bind"),
+            Some("/z".to_string()),
+        );
+        assert_eq!(
+            parse_mount_target("source=/host, target =/w ,type=bind"),
+            Some("/w".to_string()),
+        );
+        assert_eq!(parse_mount_target("type=bind,readonly"), None);
+        // Keys other than target/dst/destination are not destinations.
+        assert_eq!(parse_mount_target("source=/host,readonly"), None);
+    }
+
+    #[test]
+    fn parse_mount_target_skips_bare_flag_segments() {
+        // Bare-flag segments (no `=`, e.g. `readonly`) must not abort the loop.
+        // They are skipped so any target after them is still found.
+        assert_eq!(
+            parse_mount_target("readonly,target=/work,type=bind"),
+            Some("/work".to_string()),
+        );
+        assert_eq!(
+            parse_mount_target("type=bind,readonly,target=/srv"),
+            Some("/srv".to_string()),
+        );
+        assert_eq!(
+            parse_mount_target("readonly"),
+            None,
+        );
+    }
+
+    #[test]
+    fn workspace_mount_substitutes_user_dependent_vars() {
+        // ${containerEnv:HOME} must resolve against the effective remote
+        // user's container env, not the host. This is the case the
+        // _with_user variant of substitute_variables was added to handle.
+        let host = PathBuf::from("/home/user/my-project");
+        let mut config = cfg(
+            None,
+            Some("source=/host,target=${containerEnv:HOME}/work,type=bind"),
+        );
+        config.remote_user = Some("dev".to_string());
+        config.container_env = Some(std::collections::HashMap::from([(
+            "HOME".to_string(),
+            "/home/dev".to_string(),
+        )]));
+        let resolved = config.workspace_mount_target(&host, Some("dev")).unwrap();
+        assert_eq!(resolved, "/home/dev/work");
     }
 }
 
