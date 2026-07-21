@@ -576,13 +576,18 @@ async fn verify_container_execs(
 ) -> anyhow::Result<()> {
     let probe = vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()];
     let mut polls = ReadinessPolls::new();
+    // A runtime that answered — even to refuse — said something more specific
+    // than a deadline can, so its last word outlives a later attempt that only
+    // ran out of window.
+    let mut refusal: Option<String> = None;
+    let mut timeout: Option<String> = None;
 
     loop {
         let window = polls.remaining();
         let attempt =
             tokio::time::timeout(window, runtime.exec(container_id, &probe, remote_user)).await;
 
-        let failure = match attempt {
+        match attempt {
             // A process that ran to completion proves the create → start → wait
             // sequence works, whatever status it reported — and that sequence
             // is the whole of what this gate certifies. The status belongs to
@@ -597,14 +602,19 @@ async fn verify_container_execs(
                 warn_probe_command_missing(container_id, &e.to_string());
                 return Ok(());
             }
-            Ok(Err(e)) => e.to_string(),
-            Err(_) => format!(
-                "it did not report an exit within {:.1}s",
-                window.as_secs_f64()
-            ),
-        };
+            Ok(Err(e)) => refusal = Some(e.to_string()),
+            Err(_) => {
+                timeout = Some(format!(
+                    "it did not report an exit within {:.1}s",
+                    window.as_secs_f64()
+                ));
+            }
+        }
 
         if !polls.wait().await {
+            let failure = refusal
+                .or(timeout)
+                .unwrap_or_else(|| "the runtime gave no reason".to_string());
             anyhow::bail!(
                 "Container '{container_id}' was started and is running, but no command can be \
                  run in it: {failure}. `dev exec`, `dev shell` and lifecycle hooks would all \
@@ -1695,6 +1705,10 @@ mod tests {
         /// `exec` never returns, standing in for the dropped `containerWait`
         /// behind issue #4: the process runs but its exit is never reported.
         exec_never_returns: bool,
+        /// Refuse this many attempts, then stop answering at all — a runtime
+        /// that said something specific before a later attempt merely ran out
+        /// of window.
+        exec_refusals_before_silence: Option<Arc<AtomicUsize>>,
         /// `exec` answers, but with a non-zero status for a command that
         /// cannot fail on its own.
         exec_exit_code: i32,
@@ -1722,6 +1736,7 @@ mod tests {
                 exec_errors_before_success: Arc::new(AtomicUsize::new(0)),
                 exec_command_missing: false,
                 exec_never_returns: false,
+                exec_refusals_before_silence: None,
                 exec_exit_code: 0,
                 execs: Arc::new(Mutex::new(Vec::new())),
                 created_id: "fake-id".to_string(),
@@ -1773,6 +1788,15 @@ mod tests {
         fn execs_never_return() -> Self {
             Self {
                 exec_never_returns: true,
+                ..Self::ok()
+            }
+        }
+
+        /// Refuses `refusals` attempts, then stops answering, so a later
+        /// attempt can only end on its own deadline.
+        fn refuses_then_stops_answering(refusals: usize) -> Self {
+            Self {
+                exec_refusals_before_silence: Some(Arc::new(AtomicUsize::new(refusals))),
                 ..Self::ok()
             }
         }
@@ -1936,6 +1960,7 @@ mod tests {
             let exit_code = self.exec_exit_code;
             let settling = self.exec_errors_before_success.clone();
             let never_returns = self.exec_never_returns;
+            let refusals_left = self.exec_refusals_before_silence.clone();
             let execs = self.execs.clone();
             Box::pin(async move {
                 execs.lock().unwrap().push((cmd, user));
@@ -1945,6 +1970,18 @@ mod tests {
                 // meet, hiding a gate that grants an attempt no budget.
                 tokio::task::yield_now().await;
                 if never_returns {
+                    std::future::pending::<()>().await;
+                }
+                if let Some(refusals_left) = refusals_left {
+                    let refusing = refusals_left
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                        .is_ok();
+                    if refusing {
+                        return Err(DevError::Runtime("exec failed (test-injected)".to_string()));
+                    }
+                    // The refusals are spent; from here it simply stops
+                    // answering, so a later attempt can only end on its
+                    // own deadline.
                     std::future::pending::<()>().await;
                 }
                 let still_settling = settling
@@ -2411,6 +2448,30 @@ mod tests {
         assert!(
             !msg.contains("did not report an exit"),
             "a refusal must not be reported as a hang, got: {msg}"
+        );
+    }
+
+    /// A runtime that refuses and then, on a later attempt, simply runs out of
+    /// window must still be reported as refusing: the runtime said something
+    /// specific, and a deadline expiring says nothing the user can act on.
+    #[tokio::test(start_paused = true)]
+    async fn up_keeps_the_runtimes_refusal_over_a_later_timeout() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let rt = UpFakeRuntime::refuses_then_stops_answering(1);
+
+        let err = run_up_with_fake(&rt, &workspace)
+            .await
+            .expect_err("readiness must not be reported for a container that cannot exec");
+
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("exec failed (test-injected)"),
+            "the refusal must outlive the timeout that followed it, got: {msg}"
+        );
+        assert!(
+            !msg.contains("did not report an exit"),
+            "a deadline says less than the refusal it replaced, got: {msg}"
         );
     }
 

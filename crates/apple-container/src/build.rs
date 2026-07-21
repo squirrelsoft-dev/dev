@@ -30,7 +30,7 @@ const BUILDER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// How many replies may be queued for the gRPC writer at once.
 ///
 /// This bounds the memory the outbound half can hold, and the bound is set by
-/// the largest payload class on it: a content-store chunk is up to
+/// the largest payload class on it: a content-store reply may reach
 /// [`MAX_REPLY_PAYLOAD`], so the worst case when the writer falls behind is
 /// this many of those — roughly 63 MiB at 16, against the ~8 MiB the 512 KiB
 /// walk chunks would reach. Deep enough that the writer is never the thing
@@ -675,15 +675,15 @@ fn metadata_field<'a>(metadata: &'a HashMap<String, String>, key: &str) -> &'a s
 /// echoes, so a packet naming neither can be routed nowhere and is left alone.
 ///
 /// Naming both is the whole test, and deliberately so. Neither of the other
-/// fields separates a request from an echo of one of our own replies. What
-/// `complete` means on a packet the shim *sends* is not established anywhere —
-/// a one-shot request carrying all its parameters at once is a natural
-/// `complete: true`, and nothing here shows otherwise. (That it terminates a
-/// transfer on the packets this client *sends* is a different claim, and one
-/// the working fssync walk does establish; see [`send_blob_range`].)
-/// `direction` describes which way the data flows, so a request for us to send
-/// data carries the same `OUTOF` our replies do. Between answering a packet
-/// that did not need it and staying silent on one that did, silence is the
+/// fields separates a request from an echo of one of our own replies. The shim
+/// builds its requests without setting `complete` at all — `packetReaderAt`
+/// (`pkg/content/readerat.go`) and `packetReadAt` (`pkg/fssync/file.go`) fill
+/// in id, direction, metadata and descriptor and leave it to default — so it is
+/// false on every request and cannot distinguish one from a reply of ours that
+/// is still mid-transfer. `direction` describes which way the data flows, so a
+/// request for us to send data carries the same `OUTOF` our replies do.
+/// Between answering a packet that did not need it and staying silent on one
+/// that did, silence is the
 /// worse failure: the shim's receivers have no deadline, so it costs the whole
 /// 600s idle budget and the build dies with the wrong reason.
 fn is_request(stage: &str, method: &str) -> bool {
@@ -1143,25 +1143,24 @@ const MAX_REPLY_PAYLOAD: u64 = 4 * 1024 * 1024 - 64 * 1024;
 
 /// How many bytes an fssync `Read` asked for.
 ///
-/// The shim reads an empty reply as EOF, so an absent `length` has to mean
-/// "some of the file" rather than "none of it" — defaulting to zero would
+/// `File.ReadAt` (`pkg/fssync/file.go`) sends its caller's buffer size as
+/// `length` and reads an empty payload as EOF, so an absent `length` has to
+/// mean "some of the file" rather than "none of it" — defaulting to zero would
 /// report every context file as empty instead of failing. One reply's worth is
-/// the right guess here precisely because `Read` loops: the shim comes back for
-/// the rest at the next offset. The content store cannot guess that way, since
-/// nothing continues an unasked-for length there, so it reads to the end of the
-/// blob instead; see [`BlobRange::requested`].
+/// the guess, since that is the most a reply can carry either way.
+///
+/// Only [`handle_read`] reaches this. The content store names its own length
+/// and is answered by [`send_blob_range`].
 fn requested_read_length(metadata: &HashMap<String, String>) -> u64 {
     numeric_metadata(metadata, "length").unwrap_or(MAX_REPLY_PAYLOAD)
 }
 
 /// How much of a requested range one fssync `Read` reply carries.
 ///
-/// `Read` is an offset protocol that loops: the reply states the offset and the
-/// length it carries and the shim reads on from there, so as much as fits is a
-/// complete answer to this request and a shorter one costs a second round trip
-/// at most. The content store's `ReaderAt` is not that shape — it asks for a
-/// whole layer at once — so that side spreads one answer over several packets
-/// instead of clamping; see [`send_blob_range`].
+/// Bounded by what one gRPC message holds. `File.ReadAt` treats a reply shorter
+/// than the length it asked for as EOF (`n < length` sets `io.EOF`), so this
+/// only reads as the end of the file when the caller's buffer is larger than a
+/// reply — and its caller's buffers are far below that.
 fn readable_span(requested: u64, available: u64) -> usize {
     requested.min(available).min(MAX_REPLY_PAYLOAD) as usize
 }
@@ -1370,13 +1369,21 @@ async fn handle_content_store(
             let message = format!("content store: malformed digest {digest:?}");
             return send_content_error(builder, build_id, transfer, method, &message).await;
         };
+        let requested = match content_read_length(&transfer.metadata) {
+            RequestedLength::Named(length) => Some(length),
+            RequestedLength::Absent => None,
+            RequestedLength::Unreadable(raw) => {
+                let message = format!("content-store read named an unreadable length {raw:?}");
+                return send_content_error(builder, build_id, transfer, method, &message).await;
+            }
+        };
         let range = BlobRange {
             digest: &digest,
             path: &path,
             method,
             size,
             offset,
-            requested: numeric_metadata(&transfer.metadata, "length"),
+            requested,
         };
         return send_blob_range(builder, build_id, transfer, &range).await;
     }
@@ -1395,6 +1402,28 @@ async fn handle_content_store(
     .await
 }
 
+/// What a content-store read said about how much it wanted.
+///
+/// A length this client cannot read is deliberately not folded into "named
+/// none": the two call for opposite answers, and guessing on the caller's
+/// behalf would serve a windowed read something it never asked for.
+#[derive(Debug, PartialEq, Eq)]
+enum RequestedLength<'a> {
+    Named(u64),
+    Absent,
+    Unreadable(&'a str),
+}
+
+fn content_read_length(metadata: &HashMap<String, String>) -> RequestedLength<'_> {
+    match metadata.get("length") {
+        None => RequestedLength::Absent,
+        Some(raw) => match raw.trim().parse::<u64>() {
+            Ok(length) => RequestedLength::Named(length),
+            Err(_) => RequestedLength::Unreadable(raw),
+        },
+    }
+}
+
 /// The slice of a stored blob one `ReaderAt` asked for.
 struct BlobRange<'a> {
     digest: &'a str,
@@ -1403,38 +1432,33 @@ struct BlobRange<'a> {
     /// The blob's whole size, which every reply reports.
     size: u64,
     offset: u64,
-    /// The length the request named, or `None` when it named none.
-    ///
-    /// Absent means the rest of the blob, not one packet's worth: this reply
-    /// can be continued across packets, so there is no length it cannot serve,
-    /// and capping it would answer a 50 MiB layer with 3.94 MiB marked
-    /// `complete` — the silent truncation the chunking exists to prevent.
+    /// The caller's buffer size, or `None` when the request named no length.
     requested: Option<u64>,
 }
 
-/// Answer a `ReaderAt` with the range it asked for, across as many packets as
-/// that takes.
+/// Answer a `ReaderAt` with one packet carrying as much of the range as it can.
 ///
-/// A reply is one gRPC message and the shim asks for a whole layer in one call,
-/// so a 50 MiB layer cannot be a single packet. Truncating the answer would
-/// leave the tail of the layer zero-filled for a caller that does not loop, and
-/// refusing it would fail every build with a real base image, so the answer is
-/// spread over packets with `complete` only on the last.
+/// One request, one reply — established from the shim's own source rather than
+/// inferred. `readerAt.ReadAt` (`pkg/content/readerat.go`) issues one
+/// `proxy.request` and uses the single `ImageTransfer` it returns:
+/// `ContentStoreProxy.request` (`pkg/content/content.go`) forwards to
+/// `Request` (`pkg/stream/stage.go`), which does exactly one `demux.Recv()`.
+/// Nothing on this path reassembles packets, and nothing reads `complete`. A
+/// second packet would not extend the answer — it would sit in the demux queue
+/// for the *next* `ReadAt` on the same id and be returned as that read's data,
+/// at the wrong offset, silently corrupting the layer.
 ///
-/// What that rests on, stated plainly because it decides whether this is
-/// correct. Observed: the fssync `Walk` hands its archive over in exactly this
-/// form — many packets, `complete` on the last — and that path demonstrably
-/// works against shim 0.8.0, so an outbound `complete` is what ends a transfer
-/// on `BuildTransfer`. Inferred: that the content-store receiver reassembles
-/// `ImageTransfer` the same way. `proto/builder.proto` documents neither, and
-/// this crate has no shim source to check against. The inference is worth
-/// making because a request for more than one message can hold is itself the
-/// caller saying it wants the whole range — a shim that looped on offset would
-/// ask in its own buffer's units — but if it is ever proved wrong, this is the
-/// decision to revisit first.
+/// So the answer is bounded, not continued, and a short answer is what the
+/// protocol expects: `ReadAt` returns `(n, nil)` for `n < len(p)` and its caller
+/// reads on from the new offset. `readerAt` is wrapped in a prefetcher
+/// configured with `ChunkSize: 1 << 20`, so a request never asks for more than
+/// 1 MiB in practice and [`MAX_REPLY_PAYLOAD`] is headroom rather than a limit
+/// that bites.
 ///
-/// Memory: the producer holds one packet at a time rather than the whole blob.
-/// The pipe is what bounds the rest — see [`OUTBOUND_PACKETS`].
+/// The contrast is the fssync `Walk`, which *is* multi-packet:
+/// `pkg/fileutils/tarxfer.go` accumulates `bt.Data` in a loop and stops on
+/// `bt.Complete`. Two receivers, two shapes — which is why this one cannot be
+/// written by analogy to that one.
 async fn send_blob_range(
     builder: &BuilderSink,
     build_id: &str,
@@ -1442,74 +1466,50 @@ async fn send_blob_range(
     range: &BlobRange<'_>,
 ) -> Result<(), AppleContainerError> {
     let available = range.size.saturating_sub(range.offset);
-    let total = range.requested.unwrap_or(available).min(available);
-
     // `ReaderAt::init` probes with length 0 purely to learn the size, and a
-    // read that starts past the end is EOF; both are one empty completed reply.
-    if total == 0 {
-        let metadata = blob_reply_metadata(range.method, range.digest, range.size, range.offset, 0);
-        return send_image_transfer(
-            builder,
-            build_id,
-            transfer,
-            range.digest,
-            metadata,
-            Vec::new(),
-            true,
-        )
-        .await;
-    }
+    // read that starts past the end is EOF; both are one empty reply.
+    let wanted = range
+        .requested
+        .unwrap_or(MAX_REPLY_PAYLOAD)
+        .min(available)
+        .min(MAX_REPLY_PAYLOAD) as usize;
 
-    let mut sent = 0u64;
-    while sent < total {
-        let at = range.offset + sent;
-        let wanted = (total - sent).min(MAX_REPLY_PAYLOAD) as usize;
-        let data = match content::read_range(range.path, at, wanted) {
-            Ok(data) => data,
-            Err(e) => {
-                let message = format!("cannot read blob {}: {e}", range.digest);
-                return send_content_error(builder, build_id, transfer, range.method, &message)
-                    .await;
-            }
-        };
-
-        // `read_range` clamps to the end of the file, so a short read means the
-        // blob is no longer the size the store reported — it was replaced or
-        // collected mid-transfer. Completing the transfer here would hand the
-        // shim a layer with a zero-filled tail and a digest that will not
-        // match, so it is reported instead.
-        if data.len() < wanted {
-            let message = format!(
-                "blob {} is {} bytes shorter than the {} the content store reported; \
-                 it changed while it was being read",
-                range.digest,
-                wanted - data.len(),
-                range.size
-            );
+    let data = match content::read_range(range.path, range.offset, wanted) {
+        Ok(data) => data,
+        Err(e) => {
+            let message = format!("cannot read blob {}: {e}", range.digest);
             return send_content_error(builder, build_id, transfer, range.method, &message).await;
         }
+    };
 
-        sent += data.len() as u64;
-        let metadata = blob_reply_metadata(
-            range.method,
-            range.digest,
-            range.size,
-            at,
-            data.len() as u64,
+    // `read_range` clamps to the end of the file, so a read that came back
+    // short of what the store's own size says is there means the blob was
+    // replaced or collected under us. Answering with it would hand the shim a
+    // layer whose digest cannot match, and `ReadAt` checks `metadata["error"]`
+    // before it looks at the payload, so the disagreement is reported instead.
+    if data.len() < wanted {
+        let short_by = available - data.len() as u64;
+        let message = format!(
+            "blob {} has {short_by} fewer bytes from offset {} than the {} the content \
+             store reported; it changed while it was being read",
+            range.digest, range.offset, range.size
         );
-        send_image_transfer(
-            builder,
-            build_id,
-            transfer,
-            range.digest,
-            metadata,
-            data,
-            sent >= total,
-        )
-        .await?;
+        return send_content_error(builder, build_id, transfer, range.method, &message).await;
     }
 
-    Ok(())
+    let length = data.len() as u64;
+    let metadata =
+        blob_reply_metadata(range.method, range.digest, range.size, range.offset, length);
+    send_image_transfer(
+        builder,
+        build_id,
+        transfer,
+        range.digest,
+        metadata,
+        data,
+        true,
+    )
+    .await
 }
 
 /// Metadata one content-store reply carries.
@@ -3098,8 +3098,9 @@ mod tests {
         assert!(header_value("tag", "tag\0nul").is_err());
     }
 
-    /// Both protocols read an empty reply as EOF, so an absent length must
-    /// mean "some of the file" rather than none of it.
+    /// `File.ReadAt` reads an empty reply as EOF, so an absent length must mean
+    /// "some of the file" rather than none of it. Only the fssync `Read` path
+    /// reaches this; the content store names its own length.
     #[test]
     fn a_read_length_never_defaults_to_nothing() {
         assert_eq!(requested_read_length(&metadata(&[])), MAX_REPLY_PAYLOAD);
@@ -3110,7 +3111,6 @@ mod tests {
             requested_read_length(&metadata(&[("length", "5000000000")])),
             5_000_000_000
         );
-        // `ReaderAt::init` probes with length 0 purely to learn a blob's size.
         assert_eq!(requested_read_length(&metadata(&[("length", "0")])), 0);
     }
 
@@ -3136,13 +3136,14 @@ mod tests {
         assert_eq!(readable_span(asset, asset), MAX_REPLY_PAYLOAD as usize);
     }
 
-    /// A blob larger than one gRPC message is the ordinary case — the shim asks
-    /// for a whole base-image layer in one `ReaderAt` — so it has to be served
-    /// across packets, with `complete` only on the last. Truncating would leave
-    /// the layer's tail zero-filled for a caller that does not loop; refusing
-    /// would fail every build with a real base image.
+    /// One request, one reply. `readerAt.ReadAt` takes the single
+    /// `ImageTransfer` that `proxy.request` returns — `Request`
+    /// (`pkg/stream/stage.go`) does one `demux.Recv()` and never looks at
+    /// `complete` — so a second packet would not extend this answer. It would
+    /// wait in the demux for the *next* `ReadAt` on the same id and be handed
+    /// back as that read's data, at an offset it does not belong to.
     #[test]
-    fn an_oversized_blob_read_is_served_across_packets() {
+    fn an_oversized_blob_read_is_answered_with_exactly_one_packet() {
         let layer = (MAX_REPLY_PAYLOAD as usize) * 2 + 1024;
         let content: Vec<u8> = (0..layer).map(|i| (i % 251) as u8).collect();
         let store = tempfile::tempdir().expect("temp store");
@@ -3163,41 +3164,62 @@ mod tests {
             drain_image(&mut rx)
         });
 
-        assert!(
-            replies.len() > 1,
-            "a layer larger than one message must span packets, got {}",
-            replies.len()
-        );
-        assert!(
-            replies
-                .iter()
-                .all(|p| p.data.len() <= MAX_REPLY_PAYLOAD as usize),
-            "no packet may exceed what one gRPC message can carry"
-        );
         assert_eq!(
-            replies.iter().filter(|p| p.complete).count(),
+            replies.len(),
             1,
-            "`complete` ends the transfer, so exactly one packet may set it"
+            "the receiver consumes one packet per request, so only one may be sent"
         );
-        assert!(replies.last().expect("last").complete);
+        let reply = &replies[0];
+        assert!(reply.complete);
+        assert_eq!(
+            reply.data.len(),
+            MAX_REPLY_PAYLOAD as usize,
+            "the reply carries as much as one gRPC message holds"
+        );
+        assert_eq!(reply.data, content[..reply.data.len()]);
+        assert_eq!(reply.metadata.get("offset").map(String::as_str), Some("0"));
+        assert_eq!(
+            reply.metadata.get("length").map(String::as_str),
+            Some(reply.data.len().to_string().as_str())
+        );
+        // The whole size is still reported, so the caller knows to read on.
+        assert_eq!(
+            reply.metadata.get("size").map(String::as_str),
+            Some(layer.to_string().as_str())
+        );
+    }
 
-        let served: Vec<u8> = replies.iter().flat_map(|p| p.data.clone()).collect();
-        assert_eq!(served, content, "the packets must reassemble the layer");
+    /// A read that begins part-way through is answered from that offset, which
+    /// is how the prefetcher walks a layer it asked for a chunk at a time.
+    #[test]
+    fn a_blob_read_at_an_offset_answers_from_there() {
+        let layer = (MAX_REPLY_PAYLOAD as usize) + 4096;
+        let content: Vec<u8> = (0..layer).map(|i| (i % 251) as u8).collect();
+        let store = tempfile::tempdir().expect("temp store");
+        let blob = store.path().join("layer");
+        std::fs::write(&blob, &content).expect("blob");
 
-        // Each packet states where its own slice began, so a caller that does
-        // not concatenate blindly can still place them.
-        let mut expected_offset = 0usize;
-        for packet in &replies {
-            assert_eq!(
-                packet.metadata.get("offset").map(String::as_str),
-                Some(expected_offset.to_string().as_str())
-            );
-            assert_eq!(
-                packet.metadata.get("length").map(String::as_str),
-                Some(packet.data.len().to_string().as_str())
-            );
-            expected_offset += packet.data.len();
-        }
+        let at = MAX_REPLY_PAYLOAD;
+        let request = image_transfer();
+        let replies = run(async {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<ClientStream>(8);
+            send_blob_range(
+                &sink(&tx),
+                REPLY_ID,
+                &request,
+                &blob_range(&blob, layer as u64, at, Some(1 << 20)),
+            )
+            .await
+            .expect("a windowed read must be servable");
+            drain_image(&mut rx)
+        });
+
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].data, content[at as usize..]);
+        assert_eq!(
+            replies[0].metadata.get("offset").map(String::as_str),
+            Some(at.to_string().as_str())
+        );
     }
 
     /// `ReaderAt::init` probes with length 0 purely to learn the size, and
@@ -3232,12 +3254,10 @@ mod tests {
         );
     }
 
-    /// A `ReaderAt` that names no length wants the blob, not one packet of it.
-    /// Capping it at a packet would mark a 46 MiB-short answer `complete` and
-    /// the shim would zero-fill the rest — the truncation chunking exists to
-    /// prevent, reached through the one metadata key this client may not read.
+    /// A `ReaderAt` that names no length still gets a bounded reply rather than
+    /// nothing, and reports the whole size so the caller can read on.
     #[test]
-    fn a_blob_read_without_a_length_serves_the_whole_blob() {
+    fn a_blob_read_without_a_length_is_answered_bounded() {
         let layer = (MAX_REPLY_PAYLOAD as usize) + 4096;
         let content: Vec<u8> = (0..layer).map(|i| (i % 251) as u8).collect();
         let store = tempfile::tempdir().expect("temp store");
@@ -3254,22 +3274,25 @@ mod tests {
                 &blob_range(&blob, layer as u64, 0, None),
             )
             .await
-            .expect("a lengthless read must still serve the blob");
+            .expect("a lengthless read must still be answered");
             drain_image(&mut rx)
         });
 
-        let served: Vec<u8> = replies.iter().flat_map(|p| p.data.clone()).collect();
-        assert_eq!(served, content, "an absent length must mean the whole blob");
-        assert_eq!(replies.iter().filter(|p| p.complete).count(), 1);
-        assert!(replies.last().expect("last").complete);
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].data.len(), MAX_REPLY_PAYLOAD as usize);
+        assert_eq!(replies[0].data, content[..replies[0].data.len()]);
+        assert_eq!(
+            replies[0].metadata.get("size").map(String::as_str),
+            Some(layer.to_string().as_str())
+        );
     }
 
     /// The content store said one size and the file is another: the blob was
-    /// replaced or collected mid-transfer. Completing there would hand the shim
-    /// a layer with a zero-filled tail and a digest that cannot match, so it is
-    /// reported instead.
+    /// replaced or collected under us. `ReadAt` checks `metadata["error"]`
+    /// before it looks at the payload, so the disagreement is reported rather
+    /// than answered with bytes whose digest cannot match.
     #[test]
-    fn a_blob_that_shrinks_mid_transfer_is_reported_not_completed() {
+    fn a_blob_shorter_than_the_store_says_is_reported_not_answered() {
         let store = tempfile::tempdir().expect("temp store");
         let blob = store.path().join("layer");
         std::fs::write(&blob, b"0123456789").expect("blob");
@@ -3293,17 +3316,43 @@ mod tests {
             .iter()
             .find(|p| p.metadata.contains_key("error"))
             .expect("a blob shorter than the store said must be reported");
+        // The figure names the blob's shortfall, not the current chunk's.
         assert!(
-            reported.metadata["error"].contains("shorter"),
+            reported.metadata["error"].contains("4086 fewer bytes"),
             "{}",
             reported.metadata["error"]
         );
         assert!(
             !replies
                 .iter()
-                .any(|p| p.complete && !p.metadata.contains_key("error")),
-            "a short layer must never be completed cleanly"
+                .any(|p| !p.data.is_empty() && !p.metadata.contains_key("error")),
+            "no payload may be handed over once the blob is known to be short"
         );
+    }
+
+    /// A `length` this client cannot read is not the same as one that named
+    /// none. Folding the two together would answer a windowed read with a
+    /// whole-blob default it never asked for, silently.
+    #[test]
+    fn an_unreadable_content_read_length_is_kept_apart_from_an_absent_one() {
+        assert_eq!(
+            content_read_length(&metadata(&[("length", "4096")])),
+            RequestedLength::Named(4096)
+        );
+        assert_eq!(
+            content_read_length(&metadata(&[("length", "0")])),
+            RequestedLength::Named(0),
+            "the size probe names zero and must stay named"
+        );
+        assert_eq!(content_read_length(&metadata(&[])), RequestedLength::Absent);
+
+        for unreadable in ["0x1000", "4096b", "", "18446744073709551616"] {
+            assert_eq!(
+                content_read_length(&metadata(&[("length", unreadable)])),
+                RequestedLength::Unreadable(unreadable),
+                "{unreadable:?} is present but unreadable, not absent"
+            );
+        }
     }
 
     /// A read that starts past the end of the blob is EOF, not an error.
