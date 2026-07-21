@@ -52,12 +52,14 @@ If you have no `.devcontainer/` yet, scaffold one:
 
 ```sh
 dev init                                  # minimal .devcontainer/ with a Dockerfile
-dev new                                   # interactive: pick a template from the registry
+dev new                                   # interactive: pick a template, writes a recipe
 dev new --template rust                   # by template id
 ```
 
-`--template` takes the short id from the `ID` column of `dev list templates`, not a fully
-qualified OCI reference.
+`dev init` writes a real `devcontainer.json` plus a Dockerfile. `dev new` instead writes a
+`recipe.json` that references a global template by name (see [Recipes](#recipes-workspace-vs-user-scope));
+the full config is composed at build/run time. `--template` takes the short id from the `ID`
+column of `dev list templates`, not a fully qualified OCI reference.
 
 ## Bringing a container up with `dev up`
 
@@ -207,16 +209,17 @@ Docker Compose (`dockerComposeFile`) is supported for the full lifecycle — bui
 
 ```sh
 brew install dnsmasq
+# Apple Silicon uses /opt/homebrew/etc; Intel Macs use /usr/local/etc
 echo 'address=/.test/127.0.0.1' >> /opt/homebrew/etc/dnsmasq.conf
 sudo brew services start dnsmasq
 sudo mkdir -p /etc/resolver
 echo 'nameserver 127.0.0.1' | sudo tee /etc/resolver/test
 
 brew install caddy
-sudo caddy start --config ~/.dev/caddy/Caddyfile
+brew services start caddy
 ```
 
-Caddy only needs to be started once — it persists across reboots and `dev` handles reloads. After first-time DNS setup, flush your browser/system DNS cache or `.test` may not resolve immediately:
+Caddy runs as a Homebrew service and persists across reboots; `dev` handles reloads. `dev` creates `~/.dev/caddy/Caddyfile` on the first `dev up` (with `forwardPorts`) or `dev forward` — you don't need to create it yourself, and `dev` auto-starts Caddy if it isn't already running when it reloads. After first-time DNS setup, flush your browser/system DNS cache or `.test` may not resolve immediately:
 
 ```sh
 sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder
@@ -254,6 +257,13 @@ dev forward 3000 --list                     # list this workspace's forwarders
 without it won't resolve through the dnsmasq `.test` resolver. `--list` reports every forwarder
 for the workspace, but the port argument is still required by the CLI (it is ignored).
 
+Without `-d`, `dev forward <port>` runs in the foreground and blocks until you Ctrl-C, which
+stops the forwarder and removes its `.test` site; pass `-d` (or `--daemon`) to run it in the
+background. The forwarder pipes traffic through `nc`/`netcat` inside the container, so the
+image needs `nc`, `ncat`, or `netcat` installed.
+
+### Caddy config files
+
 | Path                              | Purpose                                 |
 | --------------------------------- | --------------------------------------- |
 | `~/.dev/caddy/Caddyfile`          | Root config, imports all site fragments |
@@ -263,7 +273,7 @@ for the workspace, but the port argument is still required by the CLI (it is ign
 
 ```sh
 dev init                                     # minimal .devcontainer/ with a Dockerfile
-dev new [--template <id>] [--options <k=v>…] # .devcontainer/ from a registry template
+dev new [--template <id>] [--options <k=v>…] # writes .devcontainer/recipe.json from a template
 
 dev build [--tag <t>] [--no-cache] [--buildkit] [--no-base] [--frozen-lockfile]
           [--update-remote-user-uid-default never|on|off]
