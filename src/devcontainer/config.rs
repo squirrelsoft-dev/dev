@@ -629,6 +629,16 @@ mod tests {
         );
         let mounts = config.mounts.expect("mounts field is present");
         assert_eq!(mounts.len(), 1);
-        assert!(matches!(&mounts[0], MountSpec::Object(o) if o.source.as_deref() == Some("./")))
+        assert!(matches!(&mounts[0], MountSpec::Object(o) if o.source.as_deref() == Some("./")));
+
+        // Prove the mount actually emits the expected long-form string.
+        let ws = PathBuf::from("/home/user/project");
+        let emitted = mounts[0]
+            .substitute_and_emit(&ws, None)
+            .expect("should emit a long-form string");
+        assert_eq!(
+            emitted,
+            "source=./,target=/workspace,type=bind,readonly=false"
+        );
     }
 }
