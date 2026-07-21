@@ -16,13 +16,26 @@ use crate::runtime::{
     ExecResult, ImageMetadata, WorkspaceMount, terminal_size,
 };
 
+/// What a container's own processes run with.
+///
+/// Docker and Podman let an exec inherit both of these from the container.
+/// Apple's daemon has no such inheritance — it runs an exec with exactly the
+/// process configuration it is handed — so an exec that omits them runs with no
+/// `PATH` and from `/`, and `postCreateCommand: "npm install"` fails with
+/// command-not-found where docker succeeds.
+#[derive(Debug, Clone, Default)]
+struct ProcessDefaults {
+    working_directory: String,
+    environment: Vec<String>,
+}
+
 /// Apple Containers runtime using native XPC.
 pub struct AppleRuntime {
     client: AppleContainerClient,
-    /// Working directory per container id, so repeated execs do not each pay
-    /// for a daemon round trip. Populated directly when this process creates
-    /// the container, and by one lookup otherwise.
-    working_directories: std::sync::Mutex<HashMap<String, String>>,
+    /// What each container's processes run with, so repeated execs do not each
+    /// pay for a daemon round trip. Populated directly when this process
+    /// creates the container, and by one lookup otherwise.
+    process_defaults: std::sync::Mutex<HashMap<String, ProcessDefaults>>,
 }
 
 impl AppleRuntime {
@@ -31,24 +44,24 @@ impl AppleRuntime {
             .map_err(|e| DevError::Runtime(format!("Apple Containers: {e}")))?;
         Ok(Self {
             client,
-            working_directories: std::sync::Mutex::new(HashMap::new()),
+            process_defaults: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
-    fn remembered_working_directory(&self, id: &str) -> Option<String> {
+    fn remembered_defaults(&self, id: &str) -> Option<ProcessDefaults> {
         let cache = self
-            .working_directories
+            .process_defaults
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         cache.get(id).cloned()
     }
 
-    fn remember_working_directory(&self, id: &str, working_directory: &str) {
+    fn remember_defaults(&self, id: &str, defaults: ProcessDefaults) {
         let mut cache = self
-            .working_directories
+            .process_defaults
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        cache.insert(id.to_string(), working_directory.to_string());
+        cache.insert(id.to_string(), defaults);
     }
 
     pub async fn ping(&self) -> Result<(), DevError> {
@@ -66,41 +79,43 @@ impl AppleRuntime {
         cmd: &[String],
         user: Option<&str>,
     ) -> Result<ExecResult, DevError> {
-        let working_directory = self.container_working_directory(id).await;
-        let proc_config = exec_process_config(cmd, user, false, &working_directory);
+        let defaults = self.container_process_defaults(id).await;
+        let proc_config = exec_process_config(cmd, user, false, &defaults);
         run_captured_process(&self.client, id, &proc_config).await
     }
 
-    /// The working directory the container's own processes use.
+    /// The environment and working directory the container's own processes use.
     ///
     /// Resolved at most once per container: `create_container` records what it
     /// configured, and any other invocation (`dev exec`, `dev shell`) reads it
     /// back from the daemon once. A lookup failure is reported and degrades to
-    /// `/` for that command only — it is never cached, so a transient daemon
-    /// error cannot pin the rest of the invocation to the wrong directory.
-    async fn container_working_directory(&self, id: &str) -> String {
-        if let Some(known) = self.remembered_working_directory(id) {
+    /// an empty environment in `/` for that command only — it is never cached,
+    /// so a transient daemon error cannot pin the rest of the invocation to the
+    /// wrong directory or strip `PATH` from every later command.
+    async fn container_process_defaults(&self, id: &str) -> ProcessDefaults {
+        if let Some(known) = self.remembered_defaults(id) {
             return known;
         }
 
         match self.client.get(id).await {
             Ok(snapshot) => {
-                let working_directory = absolute_or_root([Some(
-                    snapshot
-                        .configuration
-                        .init_process
-                        .working_directory
-                        .as_str(),
-                )]);
-                self.remember_working_directory(id, &working_directory);
-                working_directory
+                let init = snapshot.configuration.init_process;
+                let defaults = ProcessDefaults {
+                    working_directory: absolute_or_root([Some(init.working_directory.as_str())]),
+                    environment: init.environment,
+                };
+                self.remember_defaults(id, defaults.clone());
+                defaults
             }
             Err(e) => {
                 eprintln!(
-                    "Warning: could not read the working directory of container '{id}' \
-                     ({e}); running this command from /"
+                    "Warning: could not read the process configuration of container '{id}' \
+                     ({e}); running this command from / with no environment"
                 );
-                "/".to_string()
+                ProcessDefaults {
+                    working_directory: "/".to_string(),
+                    environment: Vec::new(),
+                }
             }
         }
     }
@@ -114,8 +129,8 @@ impl AppleRuntime {
     ) -> Result<i32, DevError> {
         // Resolved before raw mode: this can warn, and a raw terminal needs
         // CRLF to keep such output from staircasing.
-        let working_directory = self.container_working_directory(id).await;
-        let proc_config = exec_process_config(cmd, user, true, &working_directory);
+        let defaults = self.container_process_defaults(id).await;
+        let proc_config = exec_process_config(cmd, user, true, &defaults);
 
         let _raw_guard = RawModeGuard::enter()?;
         let process_id = next_process_id("exec-interactive");
@@ -135,11 +150,13 @@ impl AppleRuntime {
 
         // Registered before the start for the same reason a captured exec does
         // it: see `start_with_registered_exit_wait`.
-        let exit_wait = self.client.wait_process(id, &process_id);
+        let (issued, on_the_wire) = tokio::sync::oneshot::channel();
+        let exit_wait = self.client.wait_process_issuing(id, &process_id, issued);
         tokio::pin!(exit_wait);
         if let Err(e) = start_with_registered_exit_wait(
             "exec_interactive",
             &mut exit_wait,
+            on_the_wire,
             self.client.start_process(id, &process_id),
         )
         .await
@@ -193,7 +210,42 @@ impl AppleRuntime {
                 }
                 _ = window_change.recv() => self.resize_to_terminal(id, process_id).await,
                 _ = interrupt.recv() => self.forward_signal(id, process_id, libc::SIGINT).await,
-                _ = terminate.recv() => self.forward_signal(id, process_id, libc::SIGTERM).await,
+                // A SIGTERM aimed at `dev` must also end `dev`.
+                _ = terminate.recv() => {
+                    self.forward_signal(id, process_id, libc::SIGTERM).await;
+                    return self.stop_attending(id, process_id, wait).await;
+                }
+            }
+        }
+    }
+
+    /// How long a signalled process has to exit before this stops waiting.
+    const TERMINATION_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Wait out a terminated process, then give up on it and return.
+    ///
+    /// `dev shell` must not outlive a SIGTERM sent to it: an interactive shell
+    /// that ignores the signal (bash does) would otherwise leave the CLI
+    /// killable only with SIGKILL, which skips `RawModeGuard`'s restore and
+    /// leaves the user's terminal in raw mode. A supervisor or script stopping
+    /// `dev shell` would simply hang.
+    async fn stop_attending<W>(
+        &self,
+        id: &str,
+        process_id: &str,
+        wait: std::pin::Pin<&mut W>,
+    ) -> Result<i32, DevError>
+    where
+        W: std::future::Future<Output = Result<i32, AppleContainerError>>,
+    {
+        match tokio::time::timeout(Self::TERMINATION_GRACE, wait).await {
+            Ok(exited) => {
+                exited.map_err(|e| DevError::Runtime(format!("exec_interactive wait failed: {e}")))
+            }
+            Err(_) => {
+                self.forward_signal(id, process_id, libc::SIGKILL).await;
+                // The shell conventionally reports a signalled child this way.
+                Ok(128 + libc::SIGTERM)
             }
         }
     }
@@ -463,17 +515,20 @@ fn parse_numeric_user(spec: &str) -> Option<UserId> {
 }
 
 /// Build the process configuration for an exec'd command.
+///
+/// The container's own environment and working directory are applied here
+/// because Apple's daemon gives an exec neither: see [`ProcessDefaults`].
 fn exec_process_config(
     cmd: &[String],
     user: Option<&str>,
     terminal: bool,
-    working_directory: &str,
+    defaults: &ProcessDefaults,
 ) -> ProcessConfiguration {
     ProcessConfiguration {
         executable: cmd.first().cloned().unwrap_or_default(),
         arguments: cmd.get(1..).map(<[String]>::to_vec).unwrap_or_default(),
-        environment: Vec::new(),
-        working_directory: absolute_or_root([Some(working_directory)]),
+        environment: defaults.environment.clone(),
+        working_directory: absolute_or_root([Some(defaults.working_directory.as_str())]),
         terminal,
         user: to_apple_user(user),
         supplemental_groups: vec![],
@@ -544,8 +599,16 @@ trait ExecDaemon: Send + Sync {
     fn start_process<'a>(&'a self, container_id: &'a str, process_id: &'a str)
     -> DaemonFut<'a, ()>;
 
-    fn wait_process<'a>(&'a self, container_id: &'a str, process_id: &'a str)
-    -> DaemonFut<'a, i32>;
+    /// Wait for a process's exit, signalling `issued` as the request goes out.
+    ///
+    /// The signal is what orders the wait ahead of the start; see
+    /// [`start_with_registered_exit_wait`].
+    fn wait_process<'a>(
+        &'a self,
+        container_id: &'a str,
+        process_id: &'a str,
+        issued: tokio::sync::oneshot::Sender<()>,
+    ) -> DaemonFut<'a, i32>;
 
     fn kill_process<'a>(
         &'a self,
@@ -592,11 +655,13 @@ impl ExecDaemon for AppleContainerClient {
         &'a self,
         container_id: &'a str,
         process_id: &'a str,
+        issued: tokio::sync::oneshot::Sender<()>,
     ) -> DaemonFut<'a, i32> {
-        Box::pin(AppleContainerClient::wait_process(
+        Box::pin(AppleContainerClient::wait_process_issuing(
             self,
             container_id,
             process_id,
+            issued,
         ))
     }
 
@@ -621,12 +686,19 @@ impl ExecDaemon for AppleContainerClient {
 /// The daemon, though, never answers a `containerWait` that reaches it while
 /// it is recording that process's exit, so a wait sent after the start is lost
 /// whenever the command finishes first — a short command like `echo` usually
-/// does, which is the `dev exec` and lifecycle-hook hang in issue #4. A wait
-/// registered while the process still cannot exit is always answered, so this
-/// polls the wait (which sends its request) before sending the start.
+/// does, which is the `dev exec` and lifecycle-hook hang in issue #4.
+///
+/// Polling the wait once is not enough to order the two. Every request is a
+/// synchronous XPC send queued onto the blocking pool, so polling only queues
+/// it: which thread runs first, and therefore which request the daemon sees
+/// first, is the pool's business. `on_the_wire` is signalled from inside that
+/// blocking closure immediately before the send, so the start goes out only
+/// once the wait genuinely has. A wait registered while the process still
+/// cannot exit is always answered.
 async fn start_with_registered_exit_wait<W>(
     what: &str,
     exit_wait: &mut std::pin::Pin<&mut W>,
+    on_the_wire: tokio::sync::oneshot::Receiver<()>,
     start: impl std::future::Future<Output = Result<(), AppleContainerError>>,
 ) -> Result<(), DevError>
 where
@@ -643,8 +715,11 @@ where
                 "{what} wait reported exit {code} for a process that was never started"
             )),
         }),
-        // The wait's request is on its way; start the process behind it.
-        _ = tokio::task::yield_now() => start
+        // The wait's request has reached the daemon; start the process behind
+        // it. A dropped signal means the wait will never report anything, and
+        // starting anyway is what surfaces that as a failure rather than as a
+        // process nothing is watching.
+        _ = on_the_wire => start
             .await
             .map_err(|e| DevError::Runtime(format!("{what} start failed: {e}"))),
     }
@@ -688,10 +763,13 @@ async fn run_captured_process(
     let stdout_task = read_pipe(stdout_read);
     let stderr_task = read_pipe(stderr_read);
 
-    let exit_wait = daemon.wait_process(id, &process_id);
+    let (issued, on_the_wire) = tokio::sync::oneshot::channel();
+    let exit_wait = daemon.wait_process(id, &process_id, issued);
     tokio::pin!(exit_wait);
     let start = daemon.start_process(id, &process_id);
-    if let Err(e) = start_with_registered_exit_wait("exec", &mut exit_wait, start).await {
+    if let Err(e) =
+        start_with_registered_exit_wait("exec", &mut exit_wait, on_the_wire, start).await
+    {
         // The wait is already registered with the daemon and the readers only
         // finish at EOF. Tear the process down so both are released, then
         // report the failure instead of blocking on them.
@@ -1014,14 +1092,17 @@ impl ContainerRuntime for AppleRuntime {
             let image: ImageDescription = serde_json::from_slice(&image_desc_bytes)
                 .map_err(|e| DevError::Runtime(format!("parse image descriptor: {e}")))?;
 
-            // Fetch the OCI image config (cached or from registry) so the init
-            // process inherits the image's expected environment and working
-            // directory.
-            let image_config = if let Some(c) = read_cached_config(&config.image) {
+            // Fetch the OCI image config so the init process inherits the
+            // image's expected environment and working directory.
+            //
+            // The blob the daemon just unpacked comes first: it is the exact
+            // config this container will run with. The reference-keyed cache
+            // carries no digest and never expires, so for a moving tag
+            // (`node:22`) it can be months out of date — preferring it would
+            // hand a freshly pulled image the previous one's PATH.
+            let image_config = if let Some(c) = read_local_image_config(&image) {
                 c
-            } else if let Some(c) = read_local_image_config(&image) {
-                // The image is already unpacked here, so its config is on disk.
-                // An image `dev` built has no registry to fall back to.
+            } else if let Some(c) = read_cached_config(&config.image) {
                 c
             } else if config.image.starts_with("localhost/") {
                 // Local images have no registry to query; daemon handles env vars.
@@ -1063,7 +1144,13 @@ impl ContainerRuntime for AppleRuntime {
                 .await
                 .map_err(|e| DevError::Runtime(format!("Failed to create container: {e}")))?;
 
-            self.remember_working_directory(&id, &apple_config.init_process.working_directory);
+            self.remember_defaults(
+                &id,
+                ProcessDefaults {
+                    working_directory: apple_config.init_process.working_directory.clone(),
+                    environment: apple_config.init_process.environment.clone(),
+                },
+            );
 
             Ok(id)
         })
@@ -1277,6 +1364,9 @@ mod tests {
         exit_code: i32,
         start_fails: bool,
         wait_fails: bool,
+        /// Hold the wait's request back before it reaches the daemon, the way
+        /// a contended blocking pool delays the thread carrying it.
+        delay_wait_request: bool,
         stdin_reached_eof: AtomicBool,
         /// Set once `start_process` has run the process to completion.
         exited: AtomicBool,
@@ -1334,6 +1424,15 @@ mod tests {
             Self {
                 wait_fails: true,
                 ..Self::default()
+            }
+        }
+
+        /// Produces output and exits, but its wait request is slow to reach
+        /// the daemon.
+        fn with_a_slow_wait_request(stdout: &str, exit_code: i32) -> Self {
+            Self {
+                delay_wait_request: true,
+                ..Self::producing(stdout, "", exit_code)
             }
         }
 
@@ -1400,13 +1499,28 @@ mod tests {
             })
         }
 
+        /// The signal fires where the real client's does: from inside the
+        /// request, before it could be answered. A start that goes out ahead of
+        /// it is a start the daemon can record an exit for before the wait
+        /// lands — the ordering the real daemon drops on the floor.
         fn wait_process<'a>(
             &'a self,
             _container_id: &'a str,
             _process_id: &'a str,
+            issued: tokio::sync::oneshot::Sender<()>,
         ) -> DaemonFut<'a, i32> {
             Box::pin(async move {
+                if self.delay_wait_request {
+                    // Whatever else is runnable gets to go first, exactly as a
+                    // contended blocking pool would let it.
+                    for _ in 0..64 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                // Recorded where the daemon would see it, which is also where
+                // the caller is told the request is on its way.
                 self.record("wait");
+                let _ = issued.send(());
                 let at_eof = {
                     let held = self.held.lock().unwrap();
                     let held = held.as_ref().expect("wait without create");
@@ -1453,7 +1567,10 @@ mod tests {
             &["echo".to_string(), "hello".to_string()],
             None,
             false,
-            "/tmp",
+            &ProcessDefaults {
+                working_directory: "/tmp".to_string(),
+                environment: Vec::new(),
+            },
         )
     }
 
@@ -1505,6 +1622,29 @@ mod tests {
             daemon.calls().iter().position(|c| *c == "wait"),
             Some(1),
             "the exit wait must be sent between the create and the start, got: {:?}",
+            daemon.calls()
+        );
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "hello\n");
+    }
+
+    /// Registering the wait means getting its *request* to the daemon first,
+    /// not merely polling its future. Every request is a synchronous XPC send
+    /// queued onto the blocking pool, so polling only queues it — under pool
+    /// contention the start's thread can still issue first, the daemon records
+    /// the exit before the wait lands, and the wait is dropped: the issue #4
+    /// hang, back again. The start must wait for the wait to actually go out.
+    #[tokio::test]
+    async fn exec_holds_the_start_until_the_wait_request_has_gone_out() {
+        let daemon = FakeExecDaemon::with_a_slow_wait_request("hello\n", 0);
+        let result = bounded_exec(&daemon)
+            .await
+            .expect("a start must not overtake the wait it is registered behind");
+
+        assert_eq!(
+            daemon.calls(),
+            vec!["create", "wait", "start"],
+            "the daemon must see the wait before the start, got: {:?}",
             daemon.calls()
         );
         assert_eq!(result.exit_code, 0);
@@ -1715,17 +1855,80 @@ mod tests {
             &["sh".to_string(), "-c".to_string(), "echo hi".to_string()],
             None,
             false,
-            "/workspaces/demo",
+            &defaults_in("/workspaces/demo"),
         );
         assert_eq!(config.executable, "sh");
         assert_eq!(config.arguments, vec!["-c", "echo hi"]);
         assert!(!config.terminal);
         assert_eq!(config.working_directory, "/workspaces/demo");
 
-        let empty = exec_process_config(&[], None, true, "/");
+        let empty = exec_process_config(&[], None, true, &defaults_in("/"));
         assert_eq!(empty.executable, "");
         assert!(empty.arguments.is_empty());
         assert!(empty.terminal);
+    }
+
+    fn defaults_in(working_directory: &str) -> ProcessDefaults {
+        ProcessDefaults {
+            working_directory: working_directory.to_string(),
+            environment: Vec::new(),
+        }
+    }
+
+    /// Apple's daemon gives an exec nothing the container has: with an empty
+    /// environ there is no `PATH`, so `postCreateCommand: "npm install"` fails
+    /// with command-not-found where docker — which inherits the container's
+    /// environment — succeeds. Whatever the image and the devcontainer features
+    /// put on `PATH` has to reach every exec.
+    #[test]
+    fn an_exec_inherits_the_containers_environment() {
+        let defaults = ProcessDefaults {
+            working_directory: "/workspaces/demo".to_string(),
+            environment: vec![
+                "PATH=/usr/local/share/nvm/versions/node/v22/bin:/usr/bin".to_string(),
+                "NODE_VERSION=22".to_string(),
+            ],
+        };
+
+        let config = exec_process_config(&["npm".to_string()], None, false, &defaults);
+
+        assert_eq!(
+            config.environment, defaults.environment,
+            "an exec must run with the container's own environment"
+        );
+    }
+
+    /// The environment a container is created with is what its execs inherit,
+    /// so the image's env and the config's env must both survive into it.
+    #[test]
+    fn the_created_containers_environment_is_what_execs_inherit() {
+        let mut container_config = minimal_container_config();
+        container_config
+            .env
+            .insert("DEV_MODE".to_string(), "1".to_string());
+
+        let apple_config = to_apple_config(
+            &container_config,
+            ImageDescription::default(),
+            &CachedImageConfig {
+                env: vec!["PATH=/usr/local/bin:/usr/bin".to_string()],
+                ..CachedImageConfig::default()
+            },
+        );
+
+        let defaults = ProcessDefaults {
+            working_directory: apple_config.init_process.working_directory.clone(),
+            environment: apple_config.init_process.environment.clone(),
+        };
+        let exec = exec_process_config(&["sh".to_string()], None, false, &defaults);
+
+        assert!(
+            exec.environment
+                .contains(&"PATH=/usr/local/bin:/usr/bin".to_string()),
+            "the image's PATH must reach an exec, got: {:?}",
+            exec.environment
+        );
+        assert!(exec.environment.contains(&"DEV_MODE=1".to_string()));
     }
 
     /// An exec must start in the container's own working directory, the way
@@ -1738,7 +1941,7 @@ mod tests {
             &["npm".to_string(), "install".to_string()],
             None,
             false,
-            "/workspaces/project",
+            &defaults_in("/workspaces/project"),
         );
         assert_eq!(
             config.working_directory, "/workspaces/project",
@@ -1751,7 +1954,7 @@ mod tests {
     #[test]
     fn unusable_working_directories_fall_back_to_root() {
         for spec in ["", "relative/path"] {
-            let config = exec_process_config(&["sh".to_string()], None, false, spec);
+            let config = exec_process_config(&["sh".to_string()], None, false, &defaults_in(spec));
             assert_eq!(
                 config.working_directory, "/",
                 "{spec:?} must fall back to /"

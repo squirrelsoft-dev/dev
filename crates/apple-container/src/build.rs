@@ -151,12 +151,15 @@ pub async fn build_image(
 
     let mut request = tonic::Request::new(client_stream);
     let md = request.metadata_mut();
-    md.insert("build-id", build_id.parse().unwrap());
-    md.insert("tag", tag.parse().unwrap());
-    md.insert("progress", "plain".parse().unwrap());
-    md.insert("target", "".parse().unwrap());
-    md.insert("context", context_str.parse().unwrap());
-    md.insert("dockerfile", dockerfile_b64.parse().unwrap());
+    md.insert("build-id", header_value("build-id", &build_id)?);
+    md.insert("tag", header_value("tag", tag)?);
+    md.insert(
+        "progress",
+        tonic::metadata::MetadataValue::from_static("plain"),
+    );
+    md.insert("target", tonic::metadata::MetadataValue::from_static(""));
+    md.insert("context", header_value("context", &context_str)?);
+    md.insert("dockerfile", header_value("dockerfile", &dockerfile_b64)?);
     // The Go server panics with "assignment to entry in nil map" if no outputs
     // header is sent — the default ExportEntry has a nil Attrs map. Sending
     // this forces the parseOutputCSV path which initialises the map properly.
@@ -164,12 +167,10 @@ pub async fn build_image(
     // is what `imageLoad` registers the image under.
     md.insert(
         "outputs",
-        format!("type=oci,name={tag}").parse().map_err(|_| {
-            AppleContainerError::XpcError(format!("tag {tag:?} is not a valid header value"))
-        })?,
+        header_value("outputs", &format!("type=oci,name={tag}"))?,
     );
     if no_cache {
-        md.insert("no-cache", "".parse().unwrap());
+        md.insert("no-cache", tonic::metadata::MetadataValue::from_static(""));
     }
 
     let response = match tokio::time::timeout(
@@ -208,6 +209,24 @@ pub async fn build_image(
     register_built_image(&export.archive(), tag).await
 }
 
+/// Turn a value the environment supplied into a gRPC header value.
+///
+/// The build's context path and tag both become headers, and a header may not
+/// carry a line break or a NUL. A directory name may — a newline in a folder
+/// name is unusual but perfectly legal — so a workspace under such a path has
+/// to be reported rather than panicked on.
+fn header_value(
+    name: &str,
+    value: &str,
+) -> Result<tonic::metadata::MetadataValue<tonic::metadata::Ascii>, AppleContainerError> {
+    value.parse().map_err(|_| {
+        AppleContainerError::XpcError(format!(
+            "the build's {name} ({value:?}) cannot be sent to the builder: \
+             a gRPC header may not carry a line break or a NUL"
+        ))
+    })
+}
+
 /// The per-build directory the builder writes its export into.
 ///
 /// Removed when the build ends so a failed or abandoned build cannot leave a
@@ -218,7 +237,7 @@ struct ExportDir {
 
 impl ExportDir {
     fn create(build_id: &str) -> Result<Self, AppleContainerError> {
-        let path = builder_exports_root().join(build_id);
+        let path = builder_exports_root()?.join(build_id);
         std::fs::create_dir_all(&path).map_err(AppleContainerError::Io)?;
         Ok(Self { path })
     }
@@ -235,8 +254,20 @@ impl Drop for ExportDir {
 }
 
 /// Host directory mapped into the builder VM as its export target.
-fn builder_exports_root() -> std::path::PathBuf {
-    content::application_support_root().join("builder")
+///
+/// The builder writes the image it just produced here and the daemon loads it
+/// back, so it must be a directory only this user can write to — see
+/// [`content::application_support_root`].
+fn builder_exports_root() -> Result<std::path::PathBuf, AppleContainerError> {
+    content::application_support_root()
+        .map(|root| root.join("builder"))
+        .ok_or_else(|| {
+            AppleContainerError::XpcError(
+                "HOME does not name an absolute directory, so the Apple Containers data \
+                 directory cannot be located"
+                    .to_string(),
+            )
+        })
 }
 
 /// Import a finished build into the daemon's image store under `tag`.
@@ -258,13 +289,26 @@ async fn register_built_image(archive: &Path, tag: &str) -> Result<(), AppleCont
 
     // The daemon names an image from its layout annotations and falls back to
     // `untagged@<digest>`, so an archive BuildKit did not annotate still needs
-    // the tag applied.
-    let source = loaded.first().ok_or_else(|| {
-        AppleContainerError::XpcError(format!(
-            "{} contained no image to register",
-            archive.display()
-        ))
-    })?;
+    // the tag applied. Which one to tag is only unambiguous when the archive
+    // held exactly one image: picking arbitrarily out of several would hand
+    // `dev up` a container built from an image the build never asked for.
+    let source = match loaded.as_slice() {
+        [only] => only,
+        [] => {
+            return Err(AppleContainerError::XpcError(format!(
+                "{} contained no image to register",
+                archive.display()
+            )));
+        }
+        many => {
+            let references: Vec<&str> = many.iter().map(|i| i.reference.as_str()).collect();
+            return Err(AppleContainerError::XpcError(format!(
+                "{} contained several images and none is tagged {tag}: {}",
+                archive.display(),
+                references.join(", ")
+            )));
+        }
+    };
     tag_image(&source.reference, tag).await
 }
 
@@ -282,7 +326,13 @@ pub async fn load_image_archive(
     reply.check_error()?;
 
     if let Some(raw) = reply.get_data(XpcKey::REJECTED_MEMBERS) {
-        let rejected: Vec<String> = serde_json::from_slice(&raw).unwrap_or_default();
+        // Reading an unparseable reply as "nothing was rejected" would report a
+        // partially refused archive as a successful load.
+        let rejected: Vec<String> = serde_json::from_slice(&raw).map_err(|e| {
+            AppleContainerError::XpcError(format!(
+                "imageLoad reported rejected members this version cannot read: {e}"
+            ))
+        })?;
         if !rejected.is_empty() {
             return Err(AppleContainerError::XpcError(format!(
                 "image archive contained files the daemon refused: {}",
@@ -367,21 +417,26 @@ async fn process_build_stream(
                 handle_build_transfer(&transfer, &builder, reply_id, session.context).await?;
             }
             Some(server_stream::PacketType::ImageTransfer(ref transfer)) => {
-                let stage = transfer
-                    .metadata
-                    .get("stage")
-                    .map(|s| s.as_str())
-                    .unwrap_or("");
-                let method = transfer
-                    .metadata
-                    .get("method")
-                    .map(|s| s.as_str())
-                    .unwrap_or("");
-                if stage == "resolver" && method == "/resolve" {
-                    handle_image_resolve(transfer, &builder, reply_id, &mut session).await?;
-                } else if stage == "content-store" {
-                    handle_content_store(transfer, method, &builder, reply_id, &mut session)
-                        .await?;
+                let stage = metadata_field(&transfer.metadata, "stage");
+                let method = metadata_field(&transfer.metadata, "method");
+                match (stage, method) {
+                    ("resolver", "/resolve") => {
+                        handle_image_resolve(transfer, &builder, reply_id, &mut session).await?;
+                    }
+                    ("content-store", _) => {
+                        handle_content_store(transfer, method, &builder, reply_id, &mut session)
+                            .await?;
+                    }
+                    // The shim's receivers have no deadline, so answering
+                    // nothing leaves it waiting out the whole idle budget for
+                    // a request we simply do not implement.
+                    _ => {
+                        let message = format!(
+                            "this client does not implement the {stage:?} stage's {method:?} method"
+                        );
+                        send_image_error(&builder, reply_id, transfer, stage, method, &message)
+                            .await?;
+                    }
                 }
             }
             None => {}
@@ -500,35 +555,40 @@ async fn handle_build_transfer(
     build_id: &str,
     context: &Path,
 ) -> Result<(), AppleContainerError> {
-    let stage = transfer
-        .metadata
-        .get("stage")
-        .map(|s| s.as_str())
-        .unwrap_or("");
-    let method = transfer
-        .metadata
-        .get("method")
-        .map(|s| s.as_str())
-        .unwrap_or("");
-
-    if stage != "fssync" {
-        return Ok(());
-    }
+    let stage = metadata_field(&transfer.metadata, "stage");
+    let method = metadata_field(&transfer.metadata, "method");
 
     // The builder shim sends capitalized method names (Walk, Read, Info).
-    match method {
-        "walk" | "Walk" => handle_walk(transfer, builder, build_id, context).await,
-        "read" | "Read" => handle_read(transfer, builder, build_id, context).await,
-        "info" | "Info" => handle_info(transfer, builder, build_id, context).await,
-        _ => Ok(()),
+    match (stage, method) {
+        ("fssync", "walk" | "Walk") => handle_walk(transfer, builder, build_id, context).await,
+        ("fssync", "read" | "Read") => handle_read(transfer, builder, build_id, context).await,
+        ("fssync", "info" | "Info") => handle_info(transfer, builder, build_id, context).await,
+        // The shim's receivers have no deadline, so a request answered with
+        // silence leaves it blocked until the whole idle budget expires and the
+        // user is told the builder went quiet, not that we ignored it.
+        _ => {
+            let message =
+                format!("this client does not implement the {stage:?} stage's {method:?} method");
+            send_transfer_error(builder, build_id, transfer, stage, method, &message).await
+        }
     }
+}
+
+/// Read one metadata field the builder sent, or the empty string.
+fn metadata_field<'a>(metadata: &'a HashMap<String, String>, key: &str) -> &'a str {
+    metadata.get(key).map(String::as_str).unwrap_or("")
 }
 
 /// Metadata every fssync reply carries.
 fn fssync_metadata(method: &str) -> HashMap<String, String> {
+    transfer_metadata("fssync", method)
+}
+
+/// Metadata a reply on any stage carries.
+fn transfer_metadata(stage: &str, method: &str) -> HashMap<String, String> {
     HashMap::from([
         ("os".to_string(), "linux".to_string()),
-        ("stage".to_string(), "fssync".to_string()),
+        ("stage".to_string(), stage.to_string()),
         ("method".to_string(), method.to_string()),
     ])
 }
@@ -571,7 +631,19 @@ async fn send_fssync_error(
     method: &str,
     message: &str,
 ) -> Result<(), AppleContainerError> {
-    let mut metadata = fssync_metadata(method);
+    send_transfer_error(builder, build_id, transfer, "fssync", method, message).await
+}
+
+/// Report a failure on whichever stage the request named.
+async fn send_transfer_error(
+    builder: &BuilderSink,
+    build_id: &str,
+    transfer: &BuildTransfer,
+    stage: &str,
+    method: &str,
+    message: &str,
+) -> Result<(), AppleContainerError> {
+    let mut metadata = transfer_metadata(stage, method);
     metadata.insert("error".to_string(), message.to_string());
     send_build_transfer(
         builder,
@@ -658,11 +730,13 @@ async fn prepare_walk(
 /// shim caches its unpacked context by that hash, so a later stable build would
 /// silently reuse the wrong tree.
 ///
-/// The writer's `blocking_send` has no deadline of its own and needs none: it
-/// can only block while this loop is draining, this loop is bounded by
-/// [`BUILDER_IDLE_TIMEOUT`] on every send, and every exit from it drops the
-/// receiver — which fails the pending `blocking_send` rather than parking a
-/// pool thread for the rest of the process.
+/// The producing direction is bounded too. The writer's `blocking_send` needs
+/// no deadline of its own — it can only block while this loop is draining, and
+/// every exit from the loop drops the receiver, which fails the pending send
+/// rather than parking a pool thread for the rest of the process. But the
+/// filesystem underneath it can stall (a hung NFS or virtiofs mount, a device
+/// that never answers), and nothing else in this protocol would ever notice, so
+/// each wait for the next chunk carries the same idle budget every send does.
 async fn stream_walk_archive(
     entries: Vec<fssync::ContextEntry>,
     announced: &str,
@@ -687,8 +761,62 @@ async fn stream_walk_archive(
         Ok(digest.finish())
     });
 
+    match send_archive_chunks(
+        &mut chunk_rx,
+        writer,
+        announced,
+        builder,
+        build_id,
+        transfer,
+    )
+    .await
+    {
+        Ok(pending) => {
+            // `readTarHeader` blocks until at least one data packet arrives, so
+            // an empty context still has to send its end-of-archive marker.
+            send_build_transfer(
+                builder,
+                build_id,
+                transfer,
+                fssync_metadata("Walk"),
+                pending.unwrap_or_default(),
+                true,
+                false,
+            )
+            .await
+        }
+        Err(e) => {
+            send_fssync_error(builder, build_id, transfer, "Walk", &e.to_string()).await?;
+            Err(e)
+        }
+    }
+}
+
+/// Drain the archive into `BuildTransfer` packets, returning the last chunk.
+///
+/// The final packet is the one carrying `complete`, so the last chunk is held
+/// back for the caller to send once the archive has been checked against the
+/// checksum the shim was promised.
+async fn send_archive_chunks(
+    chunks: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    writer: tokio::task::JoinHandle<Result<String, AppleContainerError>>,
+    announced: &str,
+    builder: &BuilderSink,
+    build_id: &str,
+    transfer: &BuildTransfer,
+) -> Result<Option<Vec<u8>>, AppleContainerError> {
+    let stalled = || {
+        AppleContainerError::XpcError(format!(
+            "the build context produced nothing for {}s; giving up on the build",
+            builder.idle.as_secs()
+        ))
+    };
+
     let mut pending: Option<Vec<u8>> = None;
-    while let Some(chunk) = chunk_rx.recv().await {
+    while let Some(chunk) = tokio::time::timeout(builder.idle, chunks.recv())
+        .await
+        .map_err(|_| stalled())?
+    {
         if let Some(previous) = pending.replace(chunk) {
             send_build_transfer(
                 builder,
@@ -705,33 +833,15 @@ async fn stream_walk_archive(
 
     // The sender is dropped when the writer finishes, so the loop above has
     // already ended by the time this resolves.
-    let streamed = match join_blocking(writer).await {
-        Ok(streamed) => streamed,
-        Err(e) => {
-            send_fssync_error(builder, build_id, transfer, "Walk", &e.to_string()).await?;
-            return Err(e);
-        }
-    };
+    let streamed = tokio::time::timeout(builder.idle, join_blocking(writer))
+        .await
+        .map_err(|_| stalled())??;
     if streamed != announced {
-        let e = AppleContainerError::XpcError(format!(
+        return Err(AppleContainerError::XpcError(format!(
             "build context changed while it was being sent: announced {announced}, sent {streamed}"
-        ));
-        send_fssync_error(builder, build_id, transfer, "Walk", &e.to_string()).await?;
-        return Err(e);
+        )));
     }
-
-    // `readTarHeader` blocks until at least one data packet arrives, so an
-    // empty context still has to send its end-of-archive marker.
-    send_build_transfer(
-        builder,
-        build_id,
-        transfer,
-        fssync_metadata("Walk"),
-        pending.unwrap_or_default(),
-        true,
-        false,
-    )
-    .await
+    Ok(pending)
 }
 
 /// Run blocking filesystem work off the runtime's worker threads.
@@ -756,8 +866,8 @@ async fn join_blocking<T>(
 ///
 /// The shim sends the caller's buffer size as `length` (`pkg/fssync/file.go`)
 /// and reads an empty reply as EOF. An absent `length` therefore falls back to
-/// the rest of the file, not to zero: a shim that renames or drops the key
-/// would otherwise silently build an image whose files are all empty.
+/// a packet's worth of the file, not to zero: a shim that renames or drops the
+/// key would otherwise silently build an image whose files are all empty.
 async fn handle_read(
     transfer: &BuildTransfer,
     builder: &BuilderSink,
@@ -765,10 +875,12 @@ async fn handle_read(
     context: &Path,
 ) -> Result<(), AppleContainerError> {
     let source = transfer.source.as_deref().unwrap_or("");
-    let path = resolve_path(context, source);
+    let Some(path) = resolve_path(context, source) else {
+        let message = unconfined_message(source);
+        return send_fssync_error(builder, build_id, transfer, "Read", &message).await;
+    };
     let offset = numeric_metadata(&transfer.metadata, "offset").unwrap_or(0);
-    let length = numeric_metadata(&transfer.metadata, "length")
-        .map_or(usize::MAX, |requested| requested as usize);
+    let length = requested_read_length(&transfer.metadata);
 
     let data = match content::read_range(&path, offset, length) {
         Ok(data) => data,
@@ -798,7 +910,10 @@ async fn handle_info(
     use std::os::unix::fs::MetadataExt;
 
     let source = transfer.source.as_deref().unwrap_or("");
-    let path = resolve_path(context, source);
+    let Some(path) = resolve_path(context, source) else {
+        let message = unconfined_message(source);
+        return send_fssync_error(builder, build_id, transfer, "Info", &message).await;
+    };
 
     // `symlink_metadata` describes the link itself; BuildKit resolves links
     // on its own side and expects to be told the target.
@@ -842,6 +957,27 @@ async fn handle_info(
 /// Read a numeric metadata field the builder sent.
 fn numeric_metadata(metadata: &HashMap<String, String>, key: &str) -> Option<u64> {
     metadata.get(key)?.trim().parse().ok()
+}
+
+/// How many bytes a read request asked for, bounded to one packet.
+///
+/// Both read protocols treat an empty reply as EOF, so an absent `length` has
+/// to mean "some of the file" rather than "none of it" — defaulting to zero
+/// would report every blob and every context file as empty instead of failing.
+/// It cannot mean "all of it" either: a reply is one gRPC message, and a
+/// multi-gigabyte file would be read into a single buffer to build one that
+/// could never be sent. An explicit zero is left alone, because that is how
+/// `ReaderAt::init` probes for a blob's size.
+fn requested_read_length(metadata: &HashMap<String, String>) -> usize {
+    let packet = fssync::CONTEXT_CHUNK_SIZE as u64;
+    numeric_metadata(metadata, "length")
+        .unwrap_or(packet)
+        .min(packet) as usize
+}
+
+/// Why a builder-supplied path was refused.
+fn unconfined_message(source: &str) -> String {
+    format!("{source:?} is outside the build context and will not be read")
 }
 
 /// Map the host's Rust architecture name to its OCI/Go equivalent.
@@ -1013,7 +1149,10 @@ async fn handle_content_store(
     session: &mut BuildSession<'_>,
 ) -> Result<(), AppleContainerError> {
     if !matches!(method, CONTENT_INFO_METHOD | CONTENT_READER_AT_METHOD) {
-        return Ok(());
+        // Answering nothing would leave the shim's deadline-free receiver
+        // blocked until the whole idle budget expired.
+        let message = format!("this client does not implement the content-store method {method:?}");
+        return send_content_error(builder, build_id, transfer, method, &message).await;
     }
 
     let Some(digest) = content_digest(transfer) else {
@@ -1028,17 +1167,16 @@ async fn handle_content_store(
     };
 
     let size = match ensure_blob(&digest, session).await {
-        Some(size) => size,
-        None => {
-            let message = format!("blob {digest} is not in the local content store");
-            return send_content_error(builder, build_id, transfer, method, &message).await;
+        Ok(size) => size,
+        Err(e) => {
+            return send_content_error(builder, build_id, transfer, method, &e.to_string()).await;
         }
     };
 
     // `ReaderAt` probes with offset 0 and length 0 purely to learn the size,
     // and reads an empty payload as EOF thereafter.
     let offset = numeric_metadata(&transfer.metadata, "offset").unwrap_or(0);
-    let length = numeric_metadata(&transfer.metadata, "length").unwrap_or(0) as usize;
+    let length = requested_read_length(&transfer.metadata);
     let data = if method == CONTENT_READER_AT_METHOD && length > 0 {
         match content::read_blob_range(&digest, offset, length) {
             Ok(data) => data,
@@ -1066,11 +1204,7 @@ async fn handle_content_store(
 
 /// Metadata every content-store reply carries.
 fn content_store_metadata(method: &str) -> HashMap<String, String> {
-    HashMap::from([
-        ("os".to_string(), "linux".to_string()),
-        ("stage".to_string(), "content-store".to_string()),
-        ("method".to_string(), method.to_string()),
-    ])
+    transfer_metadata("content-store", method)
 }
 
 /// The digest a content-store request refers to.
@@ -1094,14 +1228,29 @@ fn content_digest(transfer: &ImageTransfer) -> Option<String> {
 /// resolved reference populates the daemon's content store, and the pull is
 /// attempted once per reference so a genuinely absent blob fails instead of
 /// looping.
-async fn ensure_blob(digest: &str, session: &mut BuildSession<'_>) -> Option<u64> {
+///
+/// Why the pull failed is what the user needs: a registry auth, network or
+/// rate-limit failure reported as "not in the local content store" points at
+/// the wrong subsystem entirely.
+async fn ensure_blob(
+    digest: &str,
+    session: &mut BuildSession<'_>,
+) -> Result<u64, AppleContainerError> {
     if let Some(size) = content::blob_size(digest) {
-        return Some(size);
+        return Ok(size);
     }
 
-    let resolved = session.resolved.as_ref()?;
+    let Some(resolved) = session.resolved.as_ref() else {
+        return Err(AppleContainerError::XpcError(format!(
+            "blob {digest} is not in the local content store and the build has resolved no \
+             base image to pull it from"
+        )));
+    };
     if session.pulled.iter().any(|r| r == &resolved.reference) {
-        return None;
+        return Err(AppleContainerError::XpcError(format!(
+            "blob {digest} is still not in the local content store after pulling {}",
+            resolved.reference
+        )));
     }
     let (reference, platform) = (resolved.reference.clone(), resolved.platform.clone());
     session.pulled.push(reference.clone());
@@ -1110,11 +1259,18 @@ async fn ensure_blob(digest: &str, session: &mut BuildSession<'_>) -> Option<u64
     let platform_json = serde_json::to_vec(&serde_json::json!({
         "os": os,
         "architecture": architecture,
-    }))
-    .ok()?;
-    pull_image(&reference, &platform_json).await.ok()?;
+    }))?;
+    pull_image(&reference, &platform_json).await.map_err(|e| {
+        AppleContainerError::XpcError(format!(
+            "could not pull {reference} to supply blob {digest}: {e}"
+        ))
+    })?;
 
-    content::blob_size(digest)
+    content::blob_size(digest).ok_or_else(|| {
+        AppleContainerError::XpcError(format!(
+            "{reference} was pulled but does not contain blob {digest}"
+        ))
+    })
 }
 
 /// When a blob was last written, formatted the way the shim parses it.
@@ -1159,7 +1315,27 @@ async fn send_content_error(
     method: &str,
     message: &str,
 ) -> Result<(), AppleContainerError> {
-    let mut metadata = content_store_metadata(method);
+    send_image_error(
+        builder,
+        build_id,
+        transfer,
+        "content-store",
+        method,
+        message,
+    )
+    .await
+}
+
+/// Report a failure on whichever image stage the request named.
+async fn send_image_error(
+    builder: &BuilderSink,
+    build_id: &str,
+    transfer: &ImageTransfer,
+    stage: &str,
+    method: &str,
+    message: &str,
+) -> Result<(), AppleContainerError> {
+    let mut metadata = transfer_metadata(stage, method);
     metadata.insert("error".to_string(), message.to_string());
     send_image_transfer(
         builder,
@@ -1172,13 +1348,33 @@ async fn send_content_error(
     .await
 }
 
-/// Resolve a source path relative to the context directory.
-fn resolve_path(context: &Path, source: &str) -> std::path::PathBuf {
-    if source.starts_with('/') {
-        std::path::PathBuf::from(source)
-    } else {
-        context.join(source)
+/// Resolve a builder-supplied source path inside the build context.
+///
+/// The builder names the paths it wants and we hand back their contents, so an
+/// unconfined `source` is a read of any file this user can reach: an fssync
+/// `Read` for `/Users/me/.ssh/id_rsa` or `../../../.ssh/id_rsa` would be
+/// streamed straight into the VM. `content::blob_path` defends the content
+/// store against exactly this, and the fssync side is confined the same way —
+/// an absolute path is only accepted when it names something inside the
+/// context, and `..` is refused outright rather than normalised.
+fn resolve_path(context: &Path, source: &str) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+
+    let source = Path::new(source);
+    let relative = match source.is_absolute() {
+        true => source.strip_prefix(context).ok()?,
+        false => source,
+    };
+
+    let mut resolved = context.to_path_buf();
+    for component in relative.components() {
+        match component {
+            Component::Normal(part) => resolved.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
     }
+    Some(resolved)
 }
 
 /// Simple base64 encoding (no padding).
@@ -1441,7 +1637,7 @@ pub async fn ensure_builder(conn: &XpcConnection) -> Result<(), AppleContainerEr
 
     // Ensure the exports directory exists (the builder shim writes build
     // outputs here via virtiofs).
-    let exports_dir = builder_exports_root();
+    let exports_dir = builder_exports_root()?;
     std::fs::create_dir_all(&exports_dir).map_err(AppleContainerError::Io)?;
 
     // Build the full config as raw JSON — the builder needs fields
@@ -2025,6 +2221,193 @@ mod tests {
             message.contains("stopped accepting packets"),
             "the error must name the stall, got: {message}"
         );
+    }
+
+    /// The producing half has to be bounded like the sending half: a context
+    /// file the filesystem never answers for (a named pipe, a hung virtiofs or
+    /// NFS mount) would otherwise park the walk forever with nothing reported.
+    #[test]
+    fn a_walk_whose_context_never_produces_a_chunk_fails_on_the_idle_budget() {
+        let dir = context_with(&[("app.txt", "payload")]);
+        let pipe = dir.path().join("stalled.fifo");
+        let c_path = std::ffi::CString::new(pipe.to_string_lossy().as_bytes()).expect("fifo path");
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0, "mkfifo");
+
+        // The walk skips non-regular files, so the stall is staged directly:
+        // an entry whose metadata says "regular file" but whose path only
+        // answers `open` once something else opens the other end.
+        let entries = vec![fssync::ContextEntry {
+            name: "stalled.fifo".to_string(),
+            path: pipe.clone(),
+            metadata: std::fs::symlink_metadata(dir.path().join("app.txt")).expect("metadata"),
+        }];
+        let request = build_transfer(&[("method", "Walk"), ("mode", "tar")], ".");
+
+        let outcome = run(async {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<ClientStream>(64);
+            let outcome = must_bound_itself(stream_walk_archive(
+                entries,
+                &"0".repeat(64),
+                &impatient_sink(&tx),
+                REPLY_ID,
+                &request,
+            ))
+            .await;
+            // Let the parked `open` complete so the runtime can shut down.
+            let _unblock = std::fs::OpenOptions::new().write(true).open(&pipe);
+            (outcome, drain(&mut rx))
+        });
+
+        let (outcome, replies) = outcome;
+        let message = outcome
+            .expect_err("a context that never produces must not hang the build")
+            .to_string();
+        assert!(
+            message.contains("produced nothing"),
+            "the error must name the stall, got: {message}"
+        );
+        assert!(
+            replies
+                .iter()
+                .any(|(_, p)| p.metadata.contains_key("error")),
+            "the shim only stops waiting when it sees an `error` key: {replies:?}"
+        );
+    }
+
+    // ---- a request we do not implement must be answered, not ignored: the
+    // shim's receivers have no deadline of their own ----
+
+    #[test]
+    fn an_unknown_fssync_method_is_answered_with_an_error() {
+        let dir = context_with(&[("app.txt", "payload")]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let request = build_transfer(&[("stage", "fssync"), ("method", "Truncate")], "app.txt");
+
+        run(handle_build_transfer(
+            &request,
+            &sink(&tx),
+            REPLY_ID,
+            dir.path(),
+        ))
+        .expect("an unimplemented method must still be answered");
+
+        let replies = drain(&mut rx);
+        assert_eq!(replies.len(), 1, "exactly one error packet");
+        let (_, reply) = &replies[0];
+        assert!(reply.metadata.contains_key("error"), "{:?}", reply.metadata);
+        assert!(reply.complete);
+    }
+
+    #[test]
+    fn an_unknown_build_transfer_stage_is_answered_with_an_error() {
+        let dir = context_with(&[("app.txt", "payload")]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let request = build_transfer(&[("stage", "diffcopy"), ("method", "Walk")], ".");
+
+        run(handle_build_transfer(
+            &request,
+            &sink(&tx),
+            REPLY_ID,
+            dir.path(),
+        ))
+        .expect("an unimplemented stage must still be answered");
+
+        let replies = drain(&mut rx);
+        assert_eq!(replies.len(), 1);
+        assert!(replies[0].1.metadata.contains_key("error"));
+    }
+
+    // ---- builder-supplied paths are confined to the build context ----
+
+    /// The builder names the paths it wants and we hand back their contents,
+    /// so an unconfined source is a read of any file this user can reach.
+    #[test]
+    fn a_source_outside_the_context_resolves_to_nothing() {
+        let context = Path::new("/workspace/project");
+
+        assert_eq!(
+            resolve_path(context, "src/main.rs"),
+            Some(context.join("src/main.rs"))
+        );
+        assert_eq!(
+            resolve_path(context, "./app.txt"),
+            Some(context.join("app.txt"))
+        );
+        assert_eq!(resolve_path(context, "."), Some(context.to_path_buf()));
+        assert_eq!(
+            resolve_path(context, "/workspace/project/src/main.rs"),
+            Some(context.join("src/main.rs"))
+        );
+
+        assert_eq!(resolve_path(context, "/etc/passwd"), None);
+        assert_eq!(resolve_path(context, "../../../.ssh/id_rsa"), None);
+        assert_eq!(resolve_path(context, "src/../../escape"), None);
+        assert_eq!(resolve_path(context, "/workspace/project/../secrets"), None);
+    }
+
+    #[test]
+    fn read_refuses_a_path_outside_the_context() {
+        let root = context_with(&[("context/app.txt", "payload"), ("secret.txt", "private")]);
+        let context = root.path().join("context");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let request = build_transfer(&[("method", "Read"), ("length", "64")], "../secret.txt");
+
+        run(handle_read(&request, &sink(&tx), REPLY_ID, &context)).expect("read");
+
+        let (_, reply) = &drain(&mut rx)[0];
+        assert!(
+            reply.data.is_empty() && reply.metadata.contains_key("error"),
+            "a path outside the context must be refused, got: {reply:?}"
+        );
+    }
+
+    #[test]
+    fn info_refuses_an_absolute_path_outside_the_context() {
+        let dir = context_with(&[("app.txt", "payload")]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let request = build_transfer(&[("method", "Info")], "/etc/passwd");
+
+        run(handle_info(&request, &sink(&tx), REPLY_ID, dir.path())).expect("info");
+
+        let (_, reply) = &drain(&mut rx)[0];
+        assert!(reply.metadata.contains_key("error"), "{:?}", reply.metadata);
+        assert!(
+            !reply.metadata.contains_key("size"),
+            "nothing outside the context may be described"
+        );
+    }
+
+    /// A directory name may hold a character a header may not. Building under
+    /// one has to fail with a message rather than panic part-way through
+    /// `dev up`.
+    #[test]
+    fn a_header_value_a_header_cannot_carry_is_reported_not_panicked_on() {
+        assert!(header_value("context", "/Users/dev/project").is_ok());
+        // Headers carry obs-text, so an accented path is not the problem.
+        assert!(header_value("context", "/Users/josé/proj").is_ok());
+
+        let error = header_value("context", "/Users/dev/two\nlines")
+            .expect_err("a control character must not be sent as a header");
+        assert!(error.to_string().contains("context"), "{error}");
+        assert!(header_value("tag", "tag\rwith-return").is_err());
+        assert!(header_value("tag", "tag\0nul").is_err());
+    }
+
+    /// Both protocols read an empty reply as EOF, so an absent length must
+    /// mean "some of the file"; it cannot mean all of a multi-gigabyte one
+    /// either, since a reply is a single gRPC message.
+    #[test]
+    fn a_read_length_is_bounded_and_never_defaults_to_nothing() {
+        let packet = fssync::CONTEXT_CHUNK_SIZE;
+        assert_eq!(requested_read_length(&metadata(&[])), packet);
+        assert_eq!(requested_read_length(&metadata(&[("length", "512")])), 512);
+        assert_eq!(
+            requested_read_length(&metadata(&[("length", "5000000000")])),
+            packet,
+            "one reply must stay inside one packet"
+        );
+        // `ReaderAt::init` probes with length 0 purely to learn a blob's size.
+        assert_eq!(requested_read_length(&metadata(&[("length", "0")])), 0);
     }
 
     /// `pkg/fileutils/file_info.go` reads these out of the metadata map and

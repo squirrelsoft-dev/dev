@@ -81,6 +81,10 @@ impl ContextFilter {
     }
 
     /// Whether the request asked for the entire context.
+    ///
+    /// Only the tests distinguish the two: the walk itself asks about one path
+    /// at a time, so nothing in the transfer path needs to know.
+    #[cfg(test)]
     pub fn is_unfiltered(&self) -> bool {
         self.patterns.is_empty() && self.excludes.is_empty()
     }
@@ -166,17 +170,43 @@ fn matches_path(pattern: &str, path: &str) -> bool {
     match_segments(&pattern, &path)
 }
 
+/// Match path segments against pattern segments, `**` matching any depth.
+///
+/// Walked with a single backtrack point rather than by recursing at every `**`:
+/// a rule such as `**/a/**/a/**/b` from a `.dockerignore` would otherwise cost
+/// exponential time against a deep path, and the walk runs on a blocking-pool
+/// thread with no deadline above it.
 fn match_segments(pattern: &[&str], path: &[&str]) -> bool {
-    let Some(head) = pattern.first() else {
+    let (mut p, mut s) = (0, 0);
+    // Where to resume from, and how much of the path the last `**` has eaten.
+    let mut wildcard: Option<usize> = None;
+    let mut consumed = 0;
+
+    loop {
         // The pattern named this path or one of its parents.
-        return true;
-    };
-    if *head == "**" {
-        return (0..=path.len()).any(|i| match_segments(&pattern[1..], &path[i..]));
-    }
-    match path.split_first() {
-        Some((segment, rest)) if glob_match(head, segment) => match_segments(&pattern[1..], rest),
-        _ => false,
+        if p == pattern.len() {
+            return true;
+        }
+        if pattern[p] == "**" {
+            wildcard = Some(p);
+            consumed = s;
+            p += 1;
+            continue;
+        }
+        if s < path.len() && glob_match(pattern[p], path[s]) {
+            p += 1;
+            s += 1;
+            continue;
+        }
+        match wildcard {
+            // Let the `**` swallow one more segment and try the rest again.
+            Some(star) if consumed < path.len() => {
+                p = star + 1;
+                consumed += 1;
+                s = consumed;
+            }
+            _ => return false,
+        }
     }
 }
 
@@ -197,18 +227,46 @@ fn could_match_within(pattern: &str, dir: &str) -> bool {
 }
 
 /// Match a single path segment against a glob supporting `*` and `?`.
+///
+/// Backtracks to the most recent `*` rather than branching at each one: a
+/// `.dockerignore` rule such as `*a*a*a*a*a*a*a*a*b` would otherwise take
+/// exponential time against a long filename and pin a blocking-pool thread for
+/// the rest of the build.
 fn glob_match(pattern: &str, segment: &str) -> bool {
-    fn walk(pattern: &[u8], segment: &[u8]) -> bool {
-        let Some((head, rest)) = pattern.split_first() else {
-            return segment.is_empty();
-        };
-        match head {
-            b'*' => (0..=segment.len()).any(|i| walk(rest, &segment[i..])),
-            b'?' => !segment.is_empty() && walk(rest, &segment[1..]),
-            literal => segment.first() == Some(literal) && walk(rest, &segment[1..]),
+    let pattern = pattern.as_bytes();
+    let segment = segment.as_bytes();
+    let (mut p, mut s) = (0, 0);
+    // Where to resume from, and how much of the segment the last `*` has eaten.
+    let mut wildcard: Option<usize> = None;
+    let mut consumed = 0;
+
+    while s < segment.len() {
+        match pattern.get(p) {
+            Some(b'*') => {
+                wildcard = Some(p);
+                consumed = s;
+                p += 1;
+            }
+            Some(b'?') => {
+                p += 1;
+                s += 1;
+            }
+            Some(literal) if *literal == segment[s] => {
+                p += 1;
+                s += 1;
+            }
+            // Let the `*` swallow one more byte and try the rest again.
+            _ => match wildcard {
+                Some(star) => {
+                    p = star + 1;
+                    consumed += 1;
+                    s = consumed;
+                }
+                None => return false,
+            },
         }
     }
-    walk(pattern.as_bytes(), segment.as_bytes())
+    pattern[p..].iter().all(|byte| *byte == b'*')
 }
 
 /// One context path selected for transfer.
@@ -222,6 +280,13 @@ pub struct ContextEntry {
     pub metadata: std::fs::Metadata,
 }
 
+/// How deep the walk will descend into a build context.
+///
+/// Far past any real project layout, and shallow enough that a pathological
+/// tree fails with a message instead of overflowing the stack and aborting the
+/// whole process.
+const MAX_CONTEXT_DEPTH: usize = 128;
+
 /// Collect every context path the request selected, in a stable order.
 ///
 /// Symlinks are recorded without being followed, so a link cycle inside the
@@ -231,7 +296,7 @@ pub fn collect_context(
     filter: &ContextFilter,
 ) -> Result<Vec<ContextEntry>, AppleContainerError> {
     let mut entries = Vec::new();
-    collect_dir(root, root, filter, &mut entries)?;
+    collect_dir(root, root, filter, 0, &mut entries)?;
     Ok(entries)
 }
 
@@ -239,12 +304,20 @@ fn collect_dir(
     root: &Path,
     dir: &Path,
     filter: &ContextFilter,
+    depth: usize,
     entries: &mut Vec<ContextEntry>,
 ) -> Result<(), AppleContainerError> {
-    let mut children: Vec<_> = std::fs::read_dir(dir)
-        .map_err(AppleContainerError::Io)?
-        .filter_map(Result::ok)
-        .collect();
+    if depth > MAX_CONTEXT_DEPTH {
+        return Err(AppleContainerError::XpcError(format!(
+            "build context is nested more than {MAX_CONTEXT_DEPTH} directories deep at {}",
+            dir.display()
+        )));
+    }
+
+    let mut children = Vec::new();
+    for child in std::fs::read_dir(dir).map_err(AppleContainerError::Io)? {
+        children.push(child.map_err(AppleContainerError::Io)?);
+    }
     children.sort_by_key(std::fs::DirEntry::file_name);
 
     for child in children {
@@ -255,8 +328,14 @@ fn collect_dir(
         let name = relative.to_string_lossy().replace('\\', "/");
         // `symlink_metadata` describes the link itself, so a symlink is sent
         // as a link rather than being followed out of the context.
-        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
-            continue;
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            // A path that vanished between the listing and the stat cannot be
+            // sent and is not a failure. Anything else — EACCES on an
+            // untraversable directory, EIO — would silently drop a file the
+            // image needs, so it stops the walk instead.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(AppleContainerError::Io(e)),
         };
 
         if metadata.is_dir() {
@@ -268,8 +347,16 @@ fn collect_dir(
                 path: path.clone(),
                 metadata,
             });
-            collect_dir(root, &path, filter, entries)?;
+            collect_dir(root, &path, filter, depth + 1, entries)?;
         } else {
+            // Only regular files and symlinks have contents a tar can carry.
+            // Opening a FIFO with no writer blocks forever and a socket fails
+            // outright, so a stray one in the context would hang or break the
+            // build rather than being skipped the way BuildKit's own fsutil
+            // skips it.
+            if !metadata.is_file() && !metadata.is_symlink() {
+                continue;
+            }
             if !filter.matches_file(&name) {
                 continue;
             }
@@ -286,8 +373,12 @@ fn collect_dir(
 
 /// Build the context tar and return it with the checksum that names it.
 ///
-/// Holds the whole archive in memory, so it is only for contexts already known
-/// to be small; [`stream_context_tar`] is what a real transfer uses.
+/// Holds the whole archive in memory, so a real transfer must never use it —
+/// a repository-sized context would cost a multi-gigabyte allocation. It exists
+/// so the tests can compare what [`stream_context_tar`] handed over against a
+/// single reference archive, and is confined to them so it cannot be picked up
+/// by the transfer path again.
+#[cfg(test)]
 pub fn build_context_tar(
     root: &Path,
     filter: &ContextFilter,
@@ -447,18 +538,67 @@ fn write_tar<W: std::io::Write>(
             builder
                 .append_data(&mut header, &entry.name, std::io::empty())
                 .map_err(AppleContainerError::Io)?;
-        } else {
+        } else if entry.metadata.is_file() {
+            // The size comes from the open file rather than from the metadata
+            // the walk captured: an editor or `cargo` rewriting a context file
+            // between the two would otherwise put a length in the header that
+            // does not describe what follows it.
             let file = std::fs::File::open(&entry.path).map_err(AppleContainerError::Io)?;
+            let size = file.metadata().map_err(AppleContainerError::Io)?.len();
             header.set_entry_type(tar::EntryType::Regular);
-            header.set_size(entry.metadata.len());
+            header.set_size(size);
             builder
-                .append_data(&mut header, &entry.name, file)
+                .append_data(&mut header, &entry.name, ExactLength::new(file, size))
                 .map_err(AppleContainerError::Io)?;
         }
     }
 
     builder.into_inner().map_err(AppleContainerError::Io)?;
     Ok(())
+}
+
+/// A reader that yields exactly the number of bytes its entry's header declares.
+///
+/// `tar::Builder` pads each entry from the bytes it actually copied rather than
+/// from the header it just wrote, so a file whose length changes between the
+/// two shifts every following entry: the shim's extractor then reads part of
+/// the file's contents as the next 512-byte header and fails with garbage
+/// entries or `invalid tar path`. Truncating a file that grew and zero-filling
+/// one that shrank keeps the header and the stream describing the same thing
+/// whatever the filesystem does underneath.
+struct ExactLength<R> {
+    inner: R,
+    remaining: u64,
+}
+
+impl<R> ExactLength<R> {
+    fn new(inner: R, length: u64) -> Self {
+        Self {
+            inner,
+            remaining: length,
+        }
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for ExactLength<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let wanted = buf
+            .len()
+            .min(self.remaining.min(usize::MAX as u64) as usize);
+        if wanted == 0 {
+            return Ok(0);
+        }
+        let buf = &mut buf[..wanted];
+        let read = self.inner.read(buf)?;
+        if read == 0 {
+            // The file ended early; the header already promised these bytes.
+            buf.fill(0);
+            self.remaining -= wanted as u64;
+            return Ok(wanted);
+        }
+        self.remaining -= read as u64;
+        Ok(read)
+    }
 }
 
 /// Seconds since the Unix epoch, or zero for timestamps we cannot read.
@@ -519,6 +659,7 @@ pub fn go_file_mode(metadata: &std::fs::Metadata) -> u32 {
     mode
 }
 
+#[cfg(test)]
 fn sha256_hex(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -791,6 +932,143 @@ mod tests {
         assert!(
             matches!(error, AppleContainerError::Io(_)),
             "a filesystem failure must stay an Io error, got {error:?}"
+        );
+    }
+
+    /// The header is written from the file's length and the entry's payload is
+    /// padded from the bytes actually copied, so the two must describe the same
+    /// file. A context file that grew between the walk and the transfer used to
+    /// overrun its own entry, leaving the shim's extractor parsing file
+    /// contents as the next tar header.
+    #[test]
+    fn a_file_that_changed_since_the_walk_still_produces_a_readable_archive() {
+        for (before, after) in [("small", "much longer than before"), ("longer start", "s")] {
+            let dir = tempfile::tempdir().expect("temp context");
+            write(dir.path(), "app.txt", before);
+            write(dir.path(), "zz-after.txt", "sentinel");
+            let entries = collect_context(dir.path(), &ContextFilter::default()).expect("walk");
+
+            // Rewritten after the walk captured its metadata, exactly as an
+            // editor or a build running in the workspace would.
+            write(dir.path(), "app.txt", after);
+
+            let mut archive = Vec::new();
+            stream_context_tar(&entries, &mut |chunk| {
+                archive.extend_from_slice(&chunk);
+                Ok(())
+            })
+            .expect("stream");
+
+            assert_eq!(
+                tar_names(&archive),
+                vec!["app.txt".to_string(), "zz-after.txt".to_string()],
+                "a resized file must not corrupt the entries after it"
+            );
+            let mut reader = tar::Archive::new(archive.as_slice());
+            let sizes: Vec<u64> = reader
+                .entries()
+                .expect("entries")
+                .map(|e| e.expect("entry").header().size().expect("size"))
+                .collect();
+            assert_eq!(
+                sizes[0],
+                after.len() as u64,
+                "the header must describe the bytes that were actually sent"
+            );
+        }
+    }
+
+    /// Opening a FIFO for reading blocks until something writes to it, and the
+    /// walk runs on a blocking-pool thread with no deadline above it — so a
+    /// stray pipe or socket in the context would hang `dev up` outright.
+    #[test]
+    fn non_regular_files_are_left_out_of_the_context() {
+        let dir = tempfile::tempdir().expect("temp context");
+        write(dir.path(), "app.txt", "payload");
+        let fifo = std::ffi::CString::new(
+            dir.path()
+                .join("dev-server.fifo")
+                .to_string_lossy()
+                .as_bytes(),
+        )
+        .expect("fifo path");
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0, "mkfifo");
+
+        let entries = collect_context(dir.path(), &ContextFilter::default()).expect("walk");
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["app.txt"],
+            "a named pipe must not be opened by the transfer"
+        );
+    }
+
+    /// A file that cannot be stat'ed is a file that would be missing from the
+    /// image with nothing said about it, so the walk has to fail instead.
+    /// A path that merely vanished is not that: it cannot be sent either way.
+    #[test]
+    fn an_unreadable_directory_fails_the_walk_rather_than_dropping_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Permissions do not apply to root, so there is nothing to observe.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("temp context");
+        write(dir.path(), "secret/app.txt", "payload");
+        let secret = dir.path().join("secret");
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        let outcome = collect_context(dir.path(), &ContextFilter::default());
+
+        // Restore before asserting so the temporary directory can be removed.
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert!(
+            outcome.is_err(),
+            "a context file that cannot be read must not be silently omitted"
+        );
+    }
+
+    /// A pathological tree must come back as an error rather than overflow the
+    /// stack, which would abort the process instead of failing the build.
+    #[test]
+    fn a_context_nested_past_the_depth_limit_is_reported() {
+        let dir = tempfile::tempdir().expect("temp context");
+        let mut deep = dir.path().to_path_buf();
+        for _ in 0..(MAX_CONTEXT_DEPTH + 2) {
+            deep = deep.join("d");
+        }
+        std::fs::create_dir_all(&deep).expect("deep tree");
+
+        let error = collect_context(dir.path(), &ContextFilter::default())
+            .expect_err("an unbounded tree must be refused");
+        assert!(error.to_string().contains("deep"), "{error}");
+    }
+
+    /// Backtracking one `*` at a time keeps a hostile `.dockerignore` rule from
+    /// pinning a blocking-pool thread; the recursive form took exponential time
+    /// on exactly this shape.
+    #[test]
+    fn a_pathological_glob_still_matches_promptly() {
+        let pattern = "*a*a*a*a*a*a*a*a*a*a*a*a*b";
+        let segment = "a".repeat(64);
+        let started = std::time::Instant::now();
+
+        assert!(!glob_match(pattern, &segment));
+        assert!(glob_match(pattern, &format!("{segment}b")));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "matching must not backtrack exponentially"
+        );
+
+        let nested = "**/a/**/a/**/a/**/a/**/b";
+        let path = "a/".repeat(24) + "c";
+        let started = std::time::Instant::now();
+        assert!(!matches_path(nested, &path));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "`**` must not backtrack exponentially either"
         );
     }
 

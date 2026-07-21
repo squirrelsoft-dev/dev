@@ -10,10 +10,26 @@ use std::path::PathBuf;
 
 use crate::error::AppleContainerError;
 
-/// Root of the daemon's application-support directory.
-pub fn application_support_root() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home).join("Library/Application Support/com.apple.container")
+/// Root of the daemon's application-support directory, or `None` when `HOME`
+/// does not locate one.
+///
+/// `HOME` is the only thing that names this directory, and everything under it
+/// is trusted: the blobs an image's environment and working directory are read
+/// out of, and the archives `imageLoad` registers images from. Guessing a
+/// world-writable fallback such as `/tmp` when `HOME` is unset or relative
+/// would let any other local user pre-populate both, so an unusable `HOME` is
+/// reported rather than substituted.
+pub fn application_support_root() -> Option<PathBuf> {
+    support_root_under(std::env::var_os("HOME").as_deref())
+}
+
+/// [`application_support_root`] against an explicit home directory.
+fn support_root_under(home: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let home = PathBuf::from(home?);
+    if !home.is_absolute() {
+        return None;
+    }
+    Some(home.join("Library/Application Support/com.apple.container"))
 }
 
 /// Locate a blob by its OCI digest.
@@ -26,7 +42,7 @@ pub fn blob_path(digest: &str) -> Option<PathBuf> {
         return None;
     }
     Some(
-        application_support_root()
+        application_support_root()?
             .join("content/blobs")
             .join(algorithm)
             .join(hex),
@@ -162,6 +178,20 @@ mod tests {
     fn a_digest_maps_into_the_content_addressed_layout() {
         let path = blob_path("sha256:abc123").expect("well-formed digest");
         assert!(path.ends_with("content/blobs/sha256/abc123"), "{path:?}");
+    }
+
+    /// Everything under this root is trusted — the image config a container's
+    /// environment comes from, the archives images are loaded out of — so a
+    /// `HOME` that does not name a private directory must yield no root at all
+    /// rather than a world-writable guess another local user can pre-populate.
+    #[test]
+    fn an_unusable_home_yields_no_content_store_root() {
+        use std::ffi::OsStr;
+
+        assert!(support_root_under(Some(OsStr::new("/Users/dev"))).is_some());
+        assert_eq!(support_root_under(None), None);
+        assert_eq!(support_root_under(Some(OsStr::new(""))), None);
+        assert_eq!(support_root_under(Some(OsStr::new("relative/home"))), None);
     }
 
     /// A digest arrives from the builder, so it must never be able to name a

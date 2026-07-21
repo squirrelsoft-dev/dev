@@ -147,7 +147,7 @@ pub(crate) async fn run_with_runtime(
             ContainerState::Stopped if !rebuild && !has_port_overrides => {
                 println!("Starting existing container '{}'...", container.name);
                 runtime.start_container(&container.id).await?;
-                verify_container_discoverable(runtime, &container.id, workspace).await?;
+                verify_container_usable(runtime, &container.id, workspace).await?;
                 if config.post_start_command.is_some() {
                     let user = resolve_remote_user(
                         runtime,
@@ -443,7 +443,7 @@ pub(crate) async fn run_with_runtime(
 
     eprintln!("Starting container '{name}'...");
     runtime.start_container(&container_id).await?;
-    verify_container_discoverable(runtime, &container_id, workspace).await?;
+    verify_container_usable(runtime, &container_id, workspace).await?;
 
     // Run lifecycle hooks — feature hooks first, then config hooks (Gap 6).
     let feature_hooks = if ordered_features.is_empty() {
@@ -478,12 +478,64 @@ const READINESS_BUDGET: std::time::Duration = std::time::Duration::from_secs(15)
 const READINESS_FIRST_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 const READINESS_MAX_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Confirm a just-started container is running, findable by the same
+/// workspace-label query `dev status`/`dev exec` use, *and* able to run a
+/// command.
+///
+/// A successful create/start call is not proof of any of the three: issue #4
+/// was a container that `dev up` had started but that neither command could
+/// find, and whose create → start → wait sequence could not run a command even
+/// once it was found. Reporting readiness is gated on this check so `dev up`
+/// and the commands that follow it can never disagree.
+async fn verify_container_usable(
+    runtime: &dyn ContainerRuntime,
+    container_id: &str,
+    workspace: &Path,
+) -> anyhow::Result<()> {
+    verify_container_discoverable(runtime, container_id, workspace).await?;
+    verify_container_execs(runtime, container_id).await
+}
+
+/// Run one trivial command in the container, the way every later command does.
+///
+/// Discovery and a `Running` state only prove `dev exec` can *locate* the
+/// container. A config with no lifecycle hooks and no dotfiles never execs
+/// anything else during `dev up`, so without this a container whose exec path
+/// is broken — the other half of issue #4 — would still be announced as ready
+/// and only fail the first time the user asked it to do something.
+///
+/// `sh -c` is what every lifecycle hook already runs through, so a container
+/// that cannot answer this could not have run them either.
+async fn verify_container_execs(
+    runtime: &dyn ContainerRuntime,
+    container_id: &str,
+) -> anyhow::Result<()> {
+    let probe = vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()];
+    let result = runtime
+        .exec(container_id, &probe, None)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Container '{container_id}' is running but no command can be run in it: {e}"
+            )
+        })?;
+
+    if result.exit_code != 0 {
+        anyhow::bail!(
+            "Container '{container_id}' is running but a trivial command exited {} \
+             instead of 0.{}",
+            result.exit_code,
+            match result.stderr.trim() {
+                "" => String::new(),
+                stderr => format!(" The runtime reported: {stderr}"),
+            }
+        );
+    }
+    Ok(())
+}
+
 /// Confirm a just-started container is actually running *and* findable by the
 /// same workspace-label query `dev status`/`dev exec` use.
-///
-/// A successful create/start call is not proof of either: issue #4 was a
-/// container that `dev up` had started but that neither command could find.
-/// Reporting readiness is gated on this check so the two can never disagree.
 ///
 /// A failing list is retried like a missing one: this runs in the window where
 /// a VM-backed runtime is still settling, so its list call is the most likely
@@ -1515,6 +1567,14 @@ mod tests {
         list_errors_before_success: Arc<AtomicUsize>,
         /// Every list call fails, standing in for a runtime that never answers.
         list_always_fails: bool,
+        /// `exec` errors, standing in for a container whose create → start →
+        /// wait sequence never reports a command's exit.
+        exec_fails: bool,
+        /// `exec` answers, but with a non-zero status for a command that
+        /// cannot fail on its own.
+        exec_exit_code: i32,
+        /// Commands `exec` was asked to run, so the gate's probe is observable.
+        execs: Arc<Mutex<Vec<Vec<String>>>>,
         created_id: String,
         created_config: Arc<Mutex<Option<ContainerConfig>>>,
         started_id: Arc<Mutex<Option<String>>>,
@@ -1532,11 +1592,36 @@ mod tests {
                 running_after_polls: Arc::new(AtomicUsize::new(0)),
                 list_errors_before_success: Arc::new(AtomicUsize::new(0)),
                 list_always_fails: false,
+                exec_fails: false,
+                exec_exit_code: 0,
+                execs: Arc::new(Mutex::new(Vec::new())),
                 created_id: "fake-id".to_string(),
                 created_config: Arc::new(Mutex::new(None)),
                 started_id: Arc::new(Mutex::new(None)),
                 containers: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        /// Create, start and discovery all succeed, but no command can be run
+        /// in the container.
+        fn cannot_exec() -> Self {
+            Self {
+                exec_fails: true,
+                ..Self::ok()
+            }
+        }
+
+        /// Create, start and discovery all succeed, but a command that cannot
+        /// fail on its own comes back non-zero.
+        fn execs_report(exit_code: i32) -> Self {
+            Self {
+                exec_exit_code: exit_code,
+                ..Self::ok()
+            }
+        }
+
+        fn execs(&self) -> Vec<Vec<String>> {
+            self.execs.lock().unwrap().clone()
         }
 
         fn failing(create: bool, start: bool) -> Self {
@@ -1686,8 +1771,26 @@ mod tests {
             unused()
         }
 
-        fn exec(&self, _id: &str, _cmd: &[String], _user: Option<&str>) -> BoxFut<'_, ExecResult> {
-            unused()
+        fn exec(&self, _id: &str, cmd: &[String], _user: Option<&str>) -> BoxFut<'_, ExecResult> {
+            let cmd = cmd.to_vec();
+            let exec_fails = self.exec_fails;
+            let exit_code = self.exec_exit_code;
+            let execs = self.execs.clone();
+            Box::pin(async move {
+                execs.lock().unwrap().push(cmd);
+                if exec_fails {
+                    return Err(DevError::Runtime("exec failed (test-injected)".to_string()));
+                }
+                Ok(ExecResult {
+                    exit_code,
+                    stdout: String::new(),
+                    stderr: if exit_code == 0 {
+                        String::new()
+                    } else {
+                        "sh: not found".to_string()
+                    },
+                })
+            })
         }
 
         fn exec_interactive(
@@ -2020,6 +2123,57 @@ mod tests {
             !msg.contains("list_containers failed"),
             "the stale error must not be reported once a later poll answered, got: {msg}"
         );
+    }
+
+    /// The acceptance criterion is that `dev up` must not report readiness for
+    /// a container `dev exec` cannot use — and discovery plus `Running` only
+    /// proves `dev exec` can *find* it. A config with no lifecycle hooks and no
+    /// dotfiles never execs anything else, so the gate has to run a command
+    /// itself or a broken exec path is announced as ready.
+    #[tokio::test]
+    async fn up_runs_a_command_in_the_container_before_reporting_readiness() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let rt = UpFakeRuntime::ok();
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("up should succeed with a cooperating fake runtime");
+
+        assert!(
+            !rt.execs().is_empty(),
+            "readiness must be gated on a command actually running in the container"
+        );
+    }
+
+    /// The other half of issue #4: the container is created, started and
+    /// discoverable, but its exec path never reports a command's exit.
+    #[tokio::test(start_paused = true)]
+    async fn up_fails_when_no_command_can_run_in_the_started_container() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let rt = UpFakeRuntime::cannot_exec();
+        let err = run_up_with_fake(&rt, &workspace)
+            .await
+            .expect_err("readiness must not be reported for a container that cannot exec");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no command can be run in it"),
+            "error should explain the exec failure, got: {msg}"
+        );
+    }
+
+    /// An exec that answers but reports failure for a command that cannot fail
+    /// on its own is a broken exec path too, not a successful one.
+    #[tokio::test(start_paused = true)]
+    async fn up_fails_when_the_probe_command_reports_a_failure() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let rt = UpFakeRuntime::execs_report(127);
+        let err = run_up_with_fake(&rt, &workspace)
+            .await
+            .expect_err("readiness must not be reported when a trivial command fails");
+        let msg = format!("{err}");
+        assert!(msg.contains("127"), "error should carry the status: {msg}");
     }
 
     /// A runtime that shortens ids (as Apple Containers does, to fit its

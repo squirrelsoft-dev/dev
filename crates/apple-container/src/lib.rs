@@ -213,11 +213,26 @@ impl AppleContainerClient {
         id: &str,
         process_id: &str,
     ) -> Result<i32, AppleContainerError> {
+        let (issued, _) = tokio::sync::oneshot::channel();
+        self.wait_process_issuing(id, process_id, issued).await
+    }
+
+    /// Wait for a process to exit, signalling `issued` as the request goes out.
+    ///
+    /// The daemon never answers a wait that reaches it while it is recording
+    /// that process's exit, so a caller that starts the process must know the
+    /// wait is already on its way — see [`XpcConnection::send_issuing`].
+    pub async fn wait_process_issuing(
+        &self,
+        id: &str,
+        process_id: &str,
+        issued: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<i32, AppleContainerError> {
         let msg = XpcMessage::with_route(XpcRoute::ContainerWait.as_str());
         msg.set_string(XpcKey::ID, id);
         msg.set_string(XpcKey::PROCESS_IDENTIFIER, process_id);
 
-        let reply = self.connection.send_async(&msg).await?;
+        let reply = self.connection.send_issuing(&msg, issued).await?;
         reply.check_error()?;
         Ok(Self::get_exit_code(&reply))
     }
