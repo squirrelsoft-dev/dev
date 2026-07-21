@@ -220,7 +220,7 @@ brew install caddy
 
 `dev` creates `~/.dev/caddy/Caddyfile` on the first `dev up` (with `forwardPorts`) or `dev forward` — you don't need to create it yourself, and the file does not exist before then. From there `dev` reloads Caddy on every change and starts it against that config if it isn't already running. On macOS that auto-start needs no `sudo`: Caddy listens on the wildcard address, which macOS exempts from the reserved-port restriction, so it binds :80/:443 as your own user.
 
-Caddy doesn't survive a reboot, but you don't have to restart it by hand: the next `dev up`/`dev forward` prints `Caddy not running, starting...` and brings it back up unprivileged against `~/.dev/caddy/Caddyfile`. Don't use `brew services start caddy`: that service runs `caddy run --config /opt/homebrew/etc/Caddyfile`, a different file a stock install doesn't create, so it crash-loops under `KeepAlive` and never serves `dev`'s site fragments. If you want Caddy up before the first `dev` command of a session, install your own root `launchd` service pointing at `~/.dev/caddy/Caddyfile`.
+Caddy doesn't survive a reboot, but you don't have to restart it by hand: the next `dev up`/`dev forward` prints `Caddy not running, starting...` and brings it back up unprivileged against `~/.dev/caddy/Caddyfile`. Don't use `brew services start caddy`: that service runs `caddy run --config "$(brew --prefix)/etc/Caddyfile"`, a different file a stock install doesn't create, so it crash-loops under `KeepAlive` and never serves `dev`'s site fragments. If you want Caddy up before the first `dev` command of a session, install a per-user `launchd` agent in `~/Library/LaunchAgents/` that runs `caddy run --config /Users/<you>/.dev/caddy/Caddyfile`. Spell that path out in full — `launchd` does not expand `~` in `ProgramArguments` — and keep the agent unprivileged so it shares the same `tls internal` CA your browser already trusts from `dev`'s own auto-start.
 
 After first-time DNS setup, flush your browser/system DNS cache or `.test` may not resolve immediately:
 
@@ -266,7 +266,10 @@ foreground one. That Ctrl-C removes the workspace's whole `.test` fragment, incl
 belonging to other forwarders still running on that workspace. To be able to stop an individual
 forwarder without disrupting those other sites, start it with `-d` (or `--daemon`) to run it in
 the background and later stop it with `dev forward <port> --stop`, which regenerates the fragment
-from the remaining forwarders. The forwarder pipes traffic through `nc`/`netcat` inside the
+from the remaining forwarders. That regeneration is rebuilt from PID files, so it only sees `-d`
+forwarders: start every forwarder on a workspace with `-d` if you want to stop them individually,
+because stopping one while a foreground forwarder shares the workspace still drops the foreground
+hostname from the fragment. The forwarder pipes traffic through `nc`/`netcat` inside the
 container, so the image needs `nc`, `ncat`, or `netcat` installed.
 
 ### Caddy config files
