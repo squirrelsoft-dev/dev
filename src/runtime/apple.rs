@@ -133,13 +133,25 @@ impl AppleRuntime {
             .await
             .map_err(|e| DevError::Runtime(format!("exec_interactive failed: {e}")))?;
 
-        self.client
-            .start_process(id, &process_id)
-            .await
-            .map_err(|e| DevError::Runtime(format!("exec_interactive start failed: {e}")))?;
+        // Registered before the start for the same reason a captured exec does
+        // it: see `start_with_registered_exit_wait`.
+        let exit_wait = self.client.wait_process(id, &process_id);
+        tokio::pin!(exit_wait);
+        if let Err(e) = start_with_registered_exit_wait(
+            "exec_interactive",
+            &mut exit_wait,
+            self.client.start_process(id, &process_id),
+        )
+        .await
+        {
+            let _ = self.client.kill_process(id, &process_id, libc::SIGKILL).await;
+            return Err(e);
+        }
 
         self.resize_to_terminal(id, &process_id).await;
-        let exit_code = self.attend_interactive_process(id, &process_id).await?;
+        let exit_code = self
+            .attend_interactive_process(id, &process_id, exit_wait)
+            .await?;
 
         // _raw_guard is dropped here, restoring the terminal.
         Ok(exit_code)
@@ -151,11 +163,15 @@ impl AppleRuntime {
     /// is keeping the guest pty's window size in sync and relaying signals
     /// aimed at this CLI (the raw-mode terminal delivers Ctrl-C to the guest as
     /// a byte, not as a host SIGINT).
-    async fn attend_interactive_process(
+    async fn attend_interactive_process<W>(
         &self,
         id: &str,
         process_id: &str,
-    ) -> Result<i32, DevError> {
+        mut wait: std::pin::Pin<&mut W>,
+    ) -> Result<i32, DevError>
+    where
+        W: std::future::Future<Output = Result<i32, AppleContainerError>>,
+    {
         use tokio::signal::unix::{SignalKind, signal};
 
         let watch = |kind: SignalKind, name: &str| {
@@ -164,9 +180,6 @@ impl AppleRuntime {
         let mut window_change = watch(SignalKind::window_change(), "SIGWINCH")?;
         let mut interrupt = watch(SignalKind::interrupt(), "SIGINT")?;
         let mut terminate = watch(SignalKind::terminate(), "SIGTERM")?;
-
-        let wait = self.client.wait_process(id, process_id);
-        tokio::pin!(wait);
 
         loop {
             tokio::select! {
@@ -599,11 +612,42 @@ impl ExecDaemon for AppleContainerClient {
     }
 }
 
-/// Create, start, and wait for one process, capturing its output.
+/// Put a process's exit wait on the wire before its start request.
 ///
-/// `create_process` only registers the process with the daemon; only
-/// `start_process` runs it. Without the latter nothing ever writes to the
-/// stdout/stderr pipes and `dev exec` hangs (issue #4).
+/// `create_process` only registers a process; only `start_process` runs it.
+/// The daemon, though, never answers a `containerWait` that reaches it while
+/// it is recording that process's exit, so a wait sent after the start is lost
+/// whenever the command finishes first — a short command like `echo` usually
+/// does, which is the `dev exec` and lifecycle-hook hang in issue #4. A wait
+/// registered while the process still cannot exit is always answered, so this
+/// polls the wait (which sends its request) before sending the start.
+async fn start_with_registered_exit_wait<W>(
+    what: &str,
+    exit_wait: &mut std::pin::Pin<&mut W>,
+    start: impl std::future::Future<Output = Result<(), AppleContainerError>>,
+) -> Result<(), DevError>
+where
+    W: std::future::Future<Output = Result<i32, AppleContainerError>>,
+{
+    tokio::select! {
+        biased;
+        // Only a daemon-side failure can answer this early: a process that has
+        // not been started has no exit to report. Taking the answer here also
+        // keeps the caller from polling a future that has already completed.
+        answered = exit_wait.as_mut() => Err(match answered {
+            Err(e) => DevError::Runtime(format!("{what} wait failed: {e}")),
+            Ok(code) => DevError::Runtime(format!(
+                "{what} wait reported exit {code} for a process that was never started"
+            )),
+        }),
+        // The wait's request is on its way; start the process behind it.
+        _ = tokio::task::yield_now() => start
+            .await
+            .map_err(|e| DevError::Runtime(format!("{what} start failed: {e}"))),
+    }
+}
+
+/// Create, start, and wait for one process, capturing its output.
 async fn run_captured_process(
     daemon: &dyn ExecDaemon,
     id: &str,
@@ -627,11 +671,6 @@ async fn run_captured_process(
         .await
         .map_err(|e| DevError::Runtime(format!("exec failed: {e}")))?;
 
-    daemon
-        .start_process(id, &process_id)
-        .await
-        .map_err(|e| DevError::Runtime(format!("exec start failed: {e}")))?;
-
     // The daemon holds its own copies of all three descriptors now. Closing
     // ours gives the process EOF on stdin — nothing writes to it, so a
     // command that reads stdin would otherwise block forever — and lets the
@@ -641,12 +680,23 @@ async fn run_captured_process(
     drop(stdout_write);
     drop(stderr_write);
 
-    // The readers are already draining on the blocking pool, so a process
-    // that fills a pipe buffer can still reach its exit.
+    // The readers drain on the blocking pool, so a process that fills a pipe
+    // buffer can still reach its exit.
     let stdout_task = read_pipe(stdout_read);
     let stderr_task = read_pipe(stderr_read);
 
-    let exit_code = match daemon.wait_process(id, &process_id).await {
+    let exit_wait = daemon.wait_process(id, &process_id);
+    tokio::pin!(exit_wait);
+    let start = daemon.start_process(id, &process_id);
+    if let Err(e) = start_with_registered_exit_wait("exec", &mut exit_wait, start).await {
+        // The wait is already registered with the daemon and the readers only
+        // finish at EOF. Tear the process down so both are released, then
+        // report the failure instead of blocking on them.
+        let _ = daemon.kill_process(id, &process_id, libc::SIGKILL).await;
+        return Err(e);
+    }
+
+    let exit_code = match exit_wait.await {
         Ok(code) => code,
         Err(e) => {
             // Waiting failed while the process may still be running, and the
@@ -1211,6 +1261,10 @@ mod tests {
     }
 
     /// Stand-in for the Apple Containers daemon's process API.
+    ///
+    /// It reproduces the daemon behaviour behind issue #4's hang: a wait that
+    /// arrives after the process has exited is silently dropped and never
+    /// answered.
     #[derive(Default)]
     struct FakeExecDaemon {
         calls: Mutex<Vec<&'static str>>,
@@ -1221,6 +1275,8 @@ mod tests {
         start_fails: bool,
         wait_fails: bool,
         stdin_reached_eof: AtomicBool,
+        /// Set once `start_process` has run the process to completion.
+        exited: AtomicBool,
     }
 
     fn dup_fd(fd: RawFd) -> OwnedFd {
@@ -1315,22 +1371,30 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
 
+        /// Each request reaches the daemon when its future is polled, not when
+        /// it is built, so the recorded call order is the order the daemon
+        /// sees — which is the whole point of registering the wait first.
         fn start_process<'a>(
             &'a self,
             _container_id: &'a str,
             _process_id: &'a str,
         ) -> DaemonFut<'a, ()> {
-            self.record("start");
-            if self.start_fails {
-                return Box::pin(async {
-                    Err(AppleContainerError::XpcError("start refused".to_string()))
-                });
-            }
-            let held = self.held.lock().unwrap();
-            let held = held.as_ref().expect("start without create");
-            write_fd(held.stdout.as_ref().expect("stdout"), &self.stdout);
-            write_fd(held.stderr.as_ref().expect("stderr"), &self.stderr);
-            Box::pin(async { Ok(()) })
+            Box::pin(async move {
+                self.record("start");
+                if self.start_fails {
+                    return Err(AppleContainerError::XpcError("start refused".to_string()));
+                }
+                {
+                    let held = self.held.lock().unwrap();
+                    let held = held.as_ref().expect("start without create");
+                    write_fd(held.stdout.as_ref().expect("stdout"), &self.stdout);
+                    write_fd(held.stderr.as_ref().expect("stderr"), &self.stderr);
+                }
+                // The command runs to completion and exits, closing its pipes.
+                self.exited.store(true, Ordering::SeqCst);
+                self.close_output();
+                Ok(())
+            })
         }
 
         fn wait_process<'a>(
@@ -1338,25 +1402,33 @@ mod tests {
             _container_id: &'a str,
             _process_id: &'a str,
         ) -> DaemonFut<'a, i32> {
-            self.record("wait");
-            let at_eof = {
-                let held = self.held.lock().unwrap();
-                let held = held.as_ref().expect("wait without create");
-                pipe_is_at_eof(held.stdin.as_raw_fd())
-            };
-            self.stdin_reached_eof.store(at_eof, Ordering::Relaxed);
-            // A process that has been waited for has exited, closing its
-            // pipes. Doing this here rather than in `start_process` keeps a
-            // regression that never starts the process a failed assertion
-            // instead of a reader blocked on a pipe that never closes.
-            self.close_output();
-            if self.wait_fails {
-                return Box::pin(async {
-                    Err(AppleContainerError::XpcError("wait refused".to_string()))
-                });
-            }
-            let exit_code = self.exit_code;
-            Box::pin(async move { Ok(exit_code) })
+            Box::pin(async move {
+                self.record("wait");
+                let at_eof = {
+                    let held = self.held.lock().unwrap();
+                    let held = held.as_ref().expect("wait without create");
+                    pipe_is_at_eof(held.stdin.as_raw_fd())
+                };
+                self.stdin_reached_eof.store(at_eof, Ordering::Relaxed);
+                if self.wait_fails {
+                    return Err(AppleContainerError::XpcError("wait refused".to_string()));
+                }
+                if self.exited.load(Ordering::SeqCst) {
+                    // The exit is already recorded, so this is a wait the
+                    // daemon drops: it is never answered.
+                    std::future::pending::<()>().await;
+                }
+                let exit_code = self.exit_code;
+                // Answered once the process the caller starts behind it exits.
+                std::future::poll_fn(move |_| {
+                    if self.exited.load(Ordering::SeqCst) {
+                        std::task::Poll::Ready(Ok(exit_code))
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                })
+                .await
+            })
         }
 
         fn kill_process<'a>(
@@ -1382,23 +1454,58 @@ mod tests {
         )
     }
 
+    /// Run one captured exec, turning a hang into a failure.
+    ///
+    /// The stand-in daemon drops a late wait exactly as the real one does, so
+    /// a regression that goes back to waiting after the start never finishes.
+    /// The bound is generous: it only has to be shorter than the harness's
+    /// patience, never shorter than a slow machine's exec.
+    async fn bounded_exec(daemon: &FakeExecDaemon) -> Result<ExecResult, DevError> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_captured_process(daemon, "cid", &exec_config()),
+        )
+        .await
+        .expect("exec must report the process's exit instead of hanging")
+    }
+
     /// The reported break: `create_process` registers a process but never runs
     /// it, so nothing writes to the output pipes and `dev exec` hangs. A
     /// create-only implementation fails here on the missing `start`.
     #[tokio::test]
     async fn exec_creates_then_starts_then_waits_for_the_process() {
         let daemon = FakeExecDaemon::producing("hello\n", "", 0);
-        let result = run_captured_process(&daemon, "cid", &exec_config())
+        let result = bounded_exec(&daemon)
             .await
             .expect("a cooperating daemon must produce a result");
 
         assert_eq!(
             daemon.calls(),
-            vec!["create", "start", "wait"],
-            "a created process must also be started, then waited for"
+            vec!["create", "wait", "start"],
+            "a created process must also be started, with its exit wait already registered"
         );
         assert_eq!(result.stdout, "hello\n");
         assert_eq!(result.exit_code, 0);
+    }
+
+    /// The daemon never answers a `containerWait` that arrives after it has
+    /// recorded the process's exit, and a short command exits before a wait
+    /// sent after the start can land — that is the `dev up` lifecycle-hook and
+    /// `dev exec` hang in issue #4. Registering the wait first is what makes a
+    /// command that exits immediately still report its exit.
+    #[tokio::test]
+    async fn exec_registers_its_exit_wait_before_the_process_can_exit() {
+        let daemon = FakeExecDaemon::producing("hello\n", "", 0);
+        let result = bounded_exec(&daemon).await.expect("exec");
+
+        assert_eq!(
+            daemon.calls().iter().position(|c| *c == "wait"),
+            Some(1),
+            "the exit wait must be sent between the create and the start, got: {:?}",
+            daemon.calls()
+        );
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "hello\n");
     }
 
     /// The exit code was hardcoded to 0, so every failing lifecycle hook and
@@ -1406,7 +1513,7 @@ mod tests {
     #[tokio::test]
     async fn exec_reports_the_processes_real_exit_code_and_stderr() {
         let daemon = FakeExecDaemon::producing("", "oops\n", 7);
-        let result = run_captured_process(&daemon, "cid", &exec_config())
+        let result = bounded_exec(&daemon)
             .await
             .expect("a cooperating daemon must produce a result");
 
@@ -1416,14 +1523,12 @@ mod tests {
     }
 
     /// Nothing writes to an exec's stdin, so both of the caller's ends must be
-    /// closed before the wait — otherwise a command that reads stdin (`cat`,
-    /// an `apt-get` prompt) blocks until the container dies.
+    /// closed before the process runs — otherwise a command that reads stdin
+    /// (`cat`, an `apt-get` prompt) blocks until the container dies.
     #[tokio::test]
     async fn exec_closes_stdin_so_the_process_sees_eof() {
         let daemon = FakeExecDaemon::producing("", "", 0);
-        run_captured_process(&daemon, "cid", &exec_config())
-            .await
-            .expect("exec");
+        bounded_exec(&daemon).await.expect("exec");
 
         assert!(
             daemon.stdin_reached_eof.load(Ordering::Relaxed),
@@ -1436,7 +1541,7 @@ mod tests {
     #[tokio::test]
     async fn exec_kills_the_process_when_waiting_fails() {
         let daemon = FakeExecDaemon::failing_wait();
-        let err = run_captured_process(&daemon, "cid", &exec_config())
+        let err = bounded_exec(&daemon)
             .await
             .expect_err("a failed wait must surface as an error");
 
@@ -1451,11 +1556,14 @@ mod tests {
         );
     }
 
-    /// A start failure must not be reported as a successful command.
+    /// A start failure must not be reported as a successful command, and it
+    /// leaves an exit wait already registered with the daemon: the process has
+    /// to be torn down so that wait is answered rather than outstanding
+    /// forever.
     #[tokio::test]
-    async fn exec_surfaces_a_start_failure_without_waiting() {
+    async fn exec_surfaces_a_start_failure_and_stops_the_process() {
         let daemon = FakeExecDaemon::failing_start();
-        let err = run_captured_process(&daemon, "cid", &exec_config())
+        let err = bounded_exec(&daemon)
             .await
             .expect_err("a failed start must surface as an error");
 
@@ -1464,8 +1572,9 @@ mod tests {
             "the error must name the failed step, got: {err}"
         );
         assert!(
-            !daemon.calls().contains(&"wait"),
-            "nothing may be waited for after a failed start"
+            daemon.calls().contains(&"kill"),
+            "a failed start must stop the process, got: {:?}",
+            daemon.calls()
         );
     }
 
