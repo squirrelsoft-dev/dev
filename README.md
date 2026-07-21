@@ -216,10 +216,13 @@ sudo mkdir -p /etc/resolver
 echo 'nameserver 127.0.0.1' | sudo tee /etc/resolver/test
 
 brew install caddy
-brew services start caddy
 ```
 
-Caddy runs as a Homebrew service and persists across reboots; `dev` handles reloads. `dev` creates `~/.dev/caddy/Caddyfile` on the first `dev up` (with `forwardPorts`) or `dev forward` — you don't need to create it yourself, and `dev` auto-starts Caddy if it isn't already running when it reloads. After first-time DNS setup, flush your browser/system DNS cache or `.test` may not resolve immediately:
+`dev` creates `~/.dev/caddy/Caddyfile` on the first `dev up` (with `forwardPorts`) or `dev forward` — you don't need to create it yourself, and the file does not exist before then. From there `dev` reloads Caddy on every change and starts it against that config if it isn't already running. That auto-start runs without `sudo`, so it can't bind :80/:443; to serve `.test` on the standard ports, start Caddy once by hand after the first `dev up`/`dev forward` with `sudo caddy start --config ~/.dev/caddy/Caddyfile`.
+
+Neither path survives a reboot — re-run that command, or let the next `dev up`/`dev forward` restart it. Don't use `brew services start caddy`: that service runs `caddy run --config /opt/homebrew/etc/Caddyfile`, a different file a stock install doesn't create, so it crash-loops under `KeepAlive` and never serves `dev`'s site fragments. For always-on persistence, install your own root `launchd` service pointing at `~/.dev/caddy/Caddyfile`.
+
+After first-time DNS setup, flush your browser/system DNS cache or `.test` may not resolve immediately:
 
 ```sh
 sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder
@@ -258,9 +261,11 @@ without it won't resolve through the dnsmasq `.test` resolver. `--list` reports 
 for the workspace, but the port argument is still required by the CLI (it is ignored).
 
 Without `-d`, `dev forward <port>` runs in the foreground and blocks until you Ctrl-C, which
-stops the forwarder and removes its `.test` site; pass `-d` (or `--daemon`) to run it in the
-background. The forwarder pipes traffic through `nc`/`netcat` inside the container, so the
-image needs `nc`, `ncat`, or `netcat` installed.
+stops the forwarder and removes the workspace's whole `.test` fragment — including hostnames
+belonging to other forwarders still running on that workspace. Use `dev forward <port> --stop`
+when those must keep working; it regenerates the fragment from the remaining forwarders. Pass
+`-d` (or `--daemon`) to run in the background. The forwarder pipes traffic through
+`nc`/`netcat` inside the container, so the image needs `nc`, `ncat`, or `netcat` installed.
 
 ### Caddy config files
 
