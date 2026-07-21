@@ -300,6 +300,22 @@ pub fn collect_context(
     Ok(entries)
 }
 
+/// Collect a directory listing, keeping any failure part-way through it.
+///
+/// `read_dir` can succeed and then fail while it is being walked, and dropping
+/// those entries would leave the image missing files with nothing said about
+/// them. Taken as an iterator so the failure can be exercised: the filesystem
+/// cannot be made to fail mid-listing on demand.
+fn listed_children<I>(listing: I) -> Result<Vec<std::fs::DirEntry>, AppleContainerError>
+where
+    I: IntoIterator<Item = std::io::Result<std::fs::DirEntry>>,
+{
+    listing
+        .into_iter()
+        .map(|child| child.map_err(AppleContainerError::Io))
+        .collect()
+}
+
 fn collect_dir(
     root: &Path,
     dir: &Path,
@@ -314,10 +330,7 @@ fn collect_dir(
         )));
     }
 
-    let mut children = Vec::new();
-    for child in std::fs::read_dir(dir).map_err(AppleContainerError::Io)? {
-        children.push(child.map_err(AppleContainerError::Io)?);
-    }
+    let mut children = listed_children(std::fs::read_dir(dir).map_err(AppleContainerError::Io)?)?;
     children.sort_by_key(std::fs::DirEntry::file_name);
 
     for child in children {
@@ -1063,6 +1076,31 @@ mod tests {
         assert!(
             matches!(error, AppleContainerError::Io(_)),
             "the filesystem's own refusal must survive, got {error:?}"
+        );
+    }
+
+    /// A listing that fails part-way through must fail the walk. Dropping the
+    /// failed entry would leave the image missing a file with nothing said —
+    /// the same silent omission an unreadable stat would cause, one step
+    /// earlier. The filesystem cannot be made to fail mid-listing on demand,
+    /// so the failure is handed to the collector directly.
+    #[test]
+    fn a_listing_that_fails_part_way_through_fails_the_walk() {
+        let dir = tempfile::tempdir().expect("temp context");
+        write(dir.path(), "app.txt", "payload");
+
+        let readable = listed_children(std::fs::read_dir(dir.path()).expect("listing"))
+            .expect("a listing that does not fail must be collected");
+        assert_eq!(readable.len(), 1);
+
+        let interrupted = std::fs::read_dir(dir.path())
+            .expect("listing")
+            .chain(std::iter::once(Err(std::io::Error::other("EIO"))));
+        let error = listed_children(interrupted)
+            .expect_err("an entry that cannot be listed must not be silently dropped");
+        assert!(
+            matches!(error, AppleContainerError::Io(_)),
+            "the filesystem's own failure must survive, got {error:?}"
         );
     }
 

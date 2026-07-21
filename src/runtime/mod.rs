@@ -161,11 +161,16 @@ pub trait ContainerRuntime: Send + Sync {
     /// Whether an [`Self::exec`] failure means the image has no such
     /// executable, rather than the runtime being unable to run one at all.
     ///
-    /// Only the runtime knows the difference, because only it knows how its
-    /// backend words the refusal: Apple's daemon runs the process and reports a
-    /// non-zero status, while docker declines to start the exec and fails the
-    /// call. Callers use this to tell an image without a shell — which is the
-    /// image's business — from a container they cannot run anything in.
+    /// Only the runtime knows the difference, because only it knows which of
+    /// its own failures can carry that meaning: docker declines to start the
+    /// exec and answers with a server error, while Apple's daemon fails the
+    /// start step. Callers use this to tell an image without a shell — which is
+    /// the image's business — from a container they cannot run anything in.
+    ///
+    /// A process that ran and exited is not this: whatever status it reported,
+    /// the runtime created, started and waited for it. Implementations must
+    /// answer `false` for anything they cannot attribute to the command itself,
+    /// so a transport, start or wait failure stays fatal to readiness.
     fn exec_reports_missing_command(&self, _error: &DevError) -> bool {
         false
     }

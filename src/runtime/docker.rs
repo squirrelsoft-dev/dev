@@ -131,6 +131,27 @@ pub struct BollardRuntime {
     client: Docker,
 }
 
+/// Whether the daemon refused this exec because the image has no such
+/// executable, rather than being unable to run one at all.
+///
+/// The daemon declines to start an exec whose executable is not in the image,
+/// so a missing shell arrives as an API error rather than as a non-zero exit
+/// status — but only an error the docker *server* answered with can mean that.
+/// Every transport failure — a restarted Docker Desktop, a moved socket — is a
+/// different variant, and matching those on text alone would read a bare ENOENT
+/// (`DevError::Io` is `#[error(transparent)]`, so it stringifies to exactly "No
+/// such file or directory") as an image without a shell, announcing readiness
+/// for a container nothing can reach.
+fn reports_missing_command(error: &DevError) -> bool {
+    let DevError::Bollard(bollard::errors::Error::DockerResponseServerError { message, .. }) =
+        error
+    else {
+        return false;
+    };
+    let message = message.to_ascii_lowercase();
+    message.contains("executable file not found") || message.contains("no such file or directory")
+}
+
 impl BollardRuntime {
     /// Connect to a specific socket path.
     pub fn connect_to_socket(socket: &str) -> Result<Self, DevError> {
@@ -912,14 +933,8 @@ impl ContainerRuntime for BollardRuntime {
         Box::pin(async move { self.exec_impl(&id, &cmd, user.as_deref()).await })
     }
 
-    /// The daemon refuses to start an exec whose executable is not in the
-    /// image, so a missing shell arrives as an API error rather than as a
-    /// non-zero exit status. These are the phrasings it and the OCI runtime
-    /// use for that.
     fn exec_reports_missing_command(&self, error: &DevError) -> bool {
-        let message = error.to_string().to_ascii_lowercase();
-        message.contains("executable file not found")
-            || message.contains("no such file or directory")
+        reports_missing_command(error)
     }
 
     fn exec_interactive(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, i32> {
@@ -1115,5 +1130,40 @@ mod tests {
     fn create_body_leaves_working_dir_unset_without_a_workspace_folder() {
         let body = BollardRuntime::to_create_body(&container_config(None));
         assert_eq!(body.working_dir, None);
+    }
+
+    fn server_error(message: &str) -> DevError {
+        DevError::Bollard(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            message: message.to_string(),
+        })
+    }
+
+    /// Only an error the docker server answered with can mean "the image has
+    /// no such executable". Everything else is the runtime failing to run
+    /// anything, and the readiness gate treats a missing command as tolerable
+    /// — so misreading a transport failure as one announces readiness for a
+    /// container nothing can reach.
+    #[test]
+    fn only_a_server_side_refusal_reads_as_a_missing_command() {
+        assert!(reports_missing_command(&server_error(
+            "OCI runtime exec failed: exec: \"sh\": executable file not found in $PATH"
+        )));
+        assert!(reports_missing_command(&server_error(
+            "no such file or directory"
+        )));
+
+        // A bare ENOENT from a restarted daemon or a moved socket carries the
+        // same words, and `DevError::Io` is transparent so it stringifies to
+        // exactly them — but nothing ran, so it must stay fatal.
+        assert!(!reports_missing_command(&DevError::Io(
+            std::io::Error::from(std::io::ErrorKind::NotFound)
+        )));
+        assert!(!reports_missing_command(&DevError::Runtime(
+            "No such file or directory (os error 2)".to_string()
+        )));
+        assert!(!reports_missing_command(&server_error(
+            "container is not running"
+        )));
     }
 }

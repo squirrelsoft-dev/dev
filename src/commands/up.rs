@@ -17,8 +17,8 @@ use crate::devcontainer::{
     substitute_variables_with_user,
 };
 use crate::runtime::{
-    BindMount, ContainerConfig, ContainerRuntime, ContainerState, PortMapping, VolumeMount,
-    WorkspaceMount, detect_runtime, resolve_remote_user,
+    BindMount, ContainerConfig, ContainerRuntime, ContainerState, ExecResult, PortMapping,
+    VolumeMount, WorkspaceMount, detect_runtime, resolve_remote_user,
 };
 use crate::util::{
     ConfigSource, container_name, find_config_source, workspace_folder_name, workspace_labels,
@@ -554,13 +554,18 @@ async fn verify_container_execs(
 
     loop {
         let failure = match runtime.exec(container_id, &probe, remote_user).await {
-            Ok(result) if result.exit_code == 0 => return Ok(()),
+            // A process that ran to completion proves the create → start → wait
+            // sequence works, whatever status it reported — and that sequence
+            // is the whole of what this gate certifies. The status belongs to
+            // the image, so it is passed on as it actually is.
             Ok(result) => {
-                warn_probe_did_not_run(container_id, &format!("`sh` exited {}", result.exit_code));
+                if result.exit_code != 0 {
+                    warn_probe_exited_non_zero(container_id, remote_user, &result);
+                }
                 return Ok(());
             }
             Err(e) if runtime.exec_reports_missing_command(&e) => {
-                warn_probe_did_not_run(container_id, &e.to_string());
+                warn_probe_command_missing(container_id, &e.to_string());
                 return Ok(());
             }
             Err(e) => e,
@@ -576,8 +581,37 @@ async fn verify_container_execs(
     }
 }
 
-/// Report a container whose exec path works but whose image has no shell.
-fn warn_probe_did_not_run(container_id: &str, reason: &str) {
+/// Report a probe that ran and exited non-zero, saying what that status means.
+///
+/// The runtime is fine — it ran the process and reported its exit — so this is
+/// a warning, not a readiness failure. What went wrong is worth getting right:
+/// 127 and 126 are different problems, and calling a permission problem a
+/// missing shell sends the user looking in the wrong place.
+fn warn_probe_exited_non_zero(container_id: &str, remote_user: Option<&str>, result: &ExecResult) {
+    let as_user = match remote_user {
+        Some(user) => format!(" as user '{user}'"),
+        None => String::new(),
+    };
+    let diagnosis = match result.exit_code {
+        127 => "no `sh` was found in it".to_string(),
+        126 => "`sh` is present but could not be executed — check its mode and whether this \
+                user may run it"
+            .to_string(),
+        code => format!("`sh -c 'exit 0'` exited {code}"),
+    };
+    let reported = match result.stderr.trim() {
+        "" => String::new(),
+        stderr => format!(" The runtime reported: {stderr}"),
+    };
+    eprintln!(
+        "Warning: container '{container_id}' runs commands{as_user}, but {diagnosis}. \
+         Lifecycle hooks, `dev exec` and `dev shell` will fail the same way.{reported}"
+    );
+}
+
+/// Report a runtime that declined to run the probe because the image has no
+/// such command.
+fn warn_probe_command_missing(container_id: &str, reason: &str) {
     eprintln!(
         "Warning: container '{container_id}' accepts commands but has no usable shell ({reason}). \
          Lifecycle hooks, `dev exec` and `dev shell` need one."
@@ -2304,6 +2338,26 @@ mod tests {
         run_up_with_fake(&rt, &workspace)
             .await
             .expect("an image without a shell must not fail a container that runs commands");
+    }
+
+    /// Any status a completed process reported is proof the transport worked,
+    /// so it is accepted without a second attempt — the probe only retries a
+    /// runtime that could not run the process at all.
+    #[tokio::test(start_paused = true)]
+    async fn up_accepts_any_status_a_completed_probe_reported() {
+        for exit_code in [126, 127, 1] {
+            let workspace = TempDir::new().unwrap();
+            write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+            let rt = UpFakeRuntime::execs_report(exit_code);
+            run_up_with_fake(&rt, &workspace)
+                .await
+                .unwrap_or_else(|e| panic!("exit {exit_code} proves the exec path works: {e}"));
+            assert_eq!(
+                rt.execs().len(),
+                1,
+                "a process that ran needs no retry, exit {exit_code}"
+            );
+        }
     }
 
     /// Some runtimes decline to start an exec whose executable is not in the

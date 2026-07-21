@@ -65,7 +65,9 @@ column of `dev list templates`, not a fully qualified OCI reference.
 
 `dev up` resolves the effective config (merging the layers below), builds the derived image if features have changed, creates and starts the container, confirms it is usable, runs lifecycle hooks, and prints `Container '<name>' is ready.` If that confirmation does not come, `dev up` fails with what it saw instead of reporting readiness — a container `dev status` cannot find, or one no command can be run in, is never announced as ready.
 
-Confirming a container is usable means three things: the runtime reports it running, it is findable by the same workspace labels `dev status` and `dev exec` search for, and one trivial command actually runs in it as the resolved `remoteUser`. Both checks are retried for up to 15 seconds, because a VM-backed runtime boots a guest before its daemon settles. The command is a probe of the runtime, not of the image: a scratch or distroless image with no shell reports a warning and still comes up, while a container that cannot run a process at all fails the gate.
+Confirming a container is usable means three things: the runtime reports it running, it is findable by the same workspace labels `dev status` and `dev exec` search for, and one trivial command actually runs in it as the resolved `remoteUser`. Both checks are retried for up to 15 seconds, because a VM-backed runtime boots a guest before its daemon settles.
+
+The command is a probe of the runtime, not of the image. A process that ran and exited — whatever status it reported — proves the create/start/wait sequence `dev exec` depends on, so `dev up` comes up and reports what the status means: exit 127 as no `sh` in the image (a scratch or distroless base), exit 126 as an `sh` the `remoteUser` may not execute. Only a runtime that could not run a process at all fails the gate, and a runtime that declines because the image has no such command is reported the same way rather than failing it.
 
 ```sh
 dev up                  # build if needed and start

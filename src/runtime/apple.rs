@@ -721,8 +721,32 @@ where
         // process nothing is watching.
         _ = on_the_wire => start
             .await
-            .map_err(|e| DevError::Runtime(format!("{what} start failed: {e}"))),
+            .map_err(|e| DevError::Runtime(format!("{what} {START_FAILED}: {e}"))),
     }
+}
+
+/// How a failure of the start step is worded, so the wording and the code that
+/// reads it back cannot drift apart.
+const START_FAILED: &str = "start failed";
+
+/// Whether an exec failure is the daemon refusing to run a command the image
+/// does not have.
+///
+/// Deliberately narrow. Only the *start* step can carry that meaning: the
+/// daemon has accepted the process configuration by then and is trying to
+/// execute it, so a not-found reported there is about the executable. A create
+/// failure, a wait failure and every XPC transport error are the runtime
+/// failing to run anything at all, and must stay fatal to readiness — so the
+/// step is checked before the wording, and an unrecognised start failure is
+/// treated as the runtime's, not the image's.
+fn is_missing_command_failure(message: &str) -> bool {
+    let Some((_, detail)) = message.split_once(START_FAILED) else {
+        return false;
+    };
+    let detail = detail.to_ascii_lowercase();
+    ["no such file or directory", "executable file not found"]
+        .iter()
+        .any(|phrase| detail.contains(phrase))
 }
 
 /// Create, start, and wait for one process, capturing its output.
@@ -1201,6 +1225,10 @@ impl ContainerRuntime for AppleRuntime {
         let cmd = cmd.to_vec();
         let user = user.map(|u| u.to_string());
         Box::pin(async move { self.exec_impl(&id, &cmd, user.as_deref()).await })
+    }
+
+    fn exec_reports_missing_command(&self, error: &DevError) -> bool {
+        is_missing_command_failure(&error.to_string())
     }
 
     fn exec_interactive(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, i32> {
@@ -1834,6 +1862,57 @@ mod tests {
                 other => panic!("{spec:?} must default to uid/gid 0, got {other:?}"),
             }
         }
+    }
+
+    /// Only the start step can mean "the image has no such executable": by
+    /// then the daemon has accepted the process configuration and is trying to
+    /// execute it. A create failure, a wait failure and every XPC transport
+    /// error are the runtime failing to run anything at all — and the readiness
+    /// gate lets a missing command through, so misreading one of those as a
+    /// missing shell would announce readiness for a container `dev exec` cannot
+    /// use, which is the whole of issue #4.
+    #[test]
+    fn only_a_start_step_not_found_reads_as_a_missing_command() {
+        assert!(is_missing_command_failure(
+            "exec start failed: internalError: no such file or directory"
+        ));
+        assert!(is_missing_command_failure(
+            "exec start failed: executable file not found"
+        ));
+
+        // The same words on a step that never got as far as the executable.
+        assert!(!is_missing_command_failure(
+            "exec failed: no such file or directory"
+        ));
+        assert!(!is_missing_command_failure(
+            "exec wait failed: no such file or directory"
+        ));
+        // A start that failed for a reason of the runtime's own.
+        assert!(!is_missing_command_failure(
+            "exec start failed: XPC send returned null"
+        ));
+        assert!(!is_missing_command_failure("exec start failed"));
+        assert!(!is_missing_command_failure("no such file or directory"));
+    }
+
+    /// The wording the classifier reads back is the wording the exec path
+    /// actually produces, so the two cannot drift apart unnoticed.
+    #[tokio::test]
+    async fn a_failed_start_is_worded_the_way_the_classifier_reads_it() {
+        let daemon = FakeExecDaemon::failing_start();
+        let err = bounded_exec(&daemon)
+            .await
+            .expect_err("a failed start must surface as an error");
+
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("exec {START_FAILED}: ")),
+            "the classifier keys off this wording, got: {message}"
+        );
+        assert!(
+            !is_missing_command_failure(&message),
+            "a start refused for the runtime's own reason must stay fatal: {message}"
+        );
     }
 
     /// The daemon keys processes by identifier within a container, and `dev up`
