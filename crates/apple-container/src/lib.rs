@@ -10,7 +10,7 @@ use std::path::Path;
 use error::AppleContainerError;
 use models::{
     ContainerConfiguration, ContainerSnapshot, ContainerStats, ImageDescription,
-    ProcessConfiguration,
+    ProcessConfiguration, decode_snapshots,
 };
 use routes::{IMAGE_SERVICE_NAME, ImageRoute, SERVICE_NAME, XpcKey, XpcRoute};
 use xpc::connection::XpcConnection;
@@ -46,8 +46,7 @@ impl AppleContainerClient {
         if data.is_empty() {
             return Ok(Vec::new());
         }
-        let snapshots: Vec<ContainerSnapshot> = serde_json::from_slice(&data)?;
-        Ok(snapshots)
+        Ok(decode_snapshots(&data)?)
     }
 
     /// Get a single container by ID.
@@ -159,9 +158,7 @@ impl AppleContainerClient {
         Ok(())
     }
 
-    /// Wait for a process to exit and return its exit code.
-    /// The exit code is returned in the create_process reply when the process exits.
-    /// For long-running processes, this polls the container state.
+    /// Read the exit code out of a reply that carries one.
     pub fn get_exit_code(reply: &XpcMessage) -> i32 {
         reply.get_int64(XpcKey::EXIT_CODE) as i32
     }
@@ -181,10 +178,65 @@ impl AppleContainerClient {
         Ok(())
     }
 
-    /// Send a signal to a container.
+    /// Block until a process inside a container exits, returning its exit code.
+    ///
+    /// Mirrors the daemon's `wait(id:processID:)` handler: the reply is only
+    /// sent once the process has exited, and carries `exitCode`. Callers that
+    /// also read the process's stdout/stderr should drive this concurrently
+    /// with those reads.
+    pub async fn wait_process(
+        &self,
+        id: &str,
+        process_id: &str,
+    ) -> Result<i32, AppleContainerError> {
+        let msg = XpcMessage::with_route(XpcRoute::ContainerWait.as_str());
+        msg.set_string(XpcKey::ID, id);
+        msg.set_string(XpcKey::PROCESS_IDENTIFIER, process_id);
+
+        let reply = self.connection.send_async(&msg).await?;
+        reply.check_error()?;
+        Ok(Self::get_exit_code(&reply))
+    }
+
+    /// Tell a process's pseudo-terminal about a new window size.
+    ///
+    /// Only meaningful for processes created with `terminal: true`.
+    pub async fn resize_process(
+        &self,
+        id: &str,
+        process_id: &str,
+        columns: u16,
+        rows: u16,
+    ) -> Result<(), AppleContainerError> {
+        let msg = XpcMessage::with_route(XpcRoute::ContainerResize.as_str());
+        msg.set_string(XpcKey::ID, id);
+        msg.set_string(XpcKey::PROCESS_IDENTIFIER, process_id);
+        msg.set_uint64(XpcKey::WIDTH, columns as u64);
+        msg.set_uint64(XpcKey::HEIGHT, rows as u64);
+
+        let reply = self.connection.send_async(&msg).await?;
+        reply.check_error()?;
+        Ok(())
+    }
+
+    /// Send a signal to a container's init process.
     pub async fn kill(&self, id: &str, signal: i32) -> Result<(), AppleContainerError> {
+        self.kill_process(id, id, signal).await
+    }
+
+    /// Send a signal to a specific process inside a container.
+    ///
+    /// The daemon's handler is `kill(id:processID:signal:)`; omitting the
+    /// process identifier targets the container's init process.
+    pub async fn kill_process(
+        &self,
+        id: &str,
+        process_id: &str,
+        signal: i32,
+    ) -> Result<(), AppleContainerError> {
         let msg = XpcMessage::with_route(XpcRoute::ContainerKill.as_str());
         msg.set_string(XpcKey::ID, id);
+        msg.set_string(XpcKey::PROCESS_IDENTIFIER, process_id);
         msg.set_int64(XpcKey::SIGNAL, signal as i64);
 
         let reply = self.connection.send_async(&msg).await?;

@@ -1,6 +1,34 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Decode a `containerList` payload one entry at a time.
+///
+/// The daemon returns every container it knows about in a single array, so an
+/// all-or-nothing decode lets one container the models cannot represent hide
+/// all the others — which is how `dev status`/`dev exec`/`dev up` discovery
+/// broke in issue #4. Entries that fail to decode are reported on stderr and
+/// skipped so the remaining containers stay discoverable.
+pub fn decode_snapshots(data: &[u8]) -> Result<Vec<ContainerSnapshot>, serde_json::Error> {
+    let entries: Vec<serde_json::Value> = serde_json::from_slice(data)?;
+    let mut snapshots = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let id = entry
+            .get("configuration")
+            .and_then(|c| c.get("id"))
+            .and_then(|id| id.as_str())
+            .unwrap_or("<unknown>")
+            .to_string();
+        match serde_json::from_value::<ContainerSnapshot>(entry) {
+            Ok(snapshot) => snapshots.push(snapshot),
+            Err(e) => eprintln!(
+                "Warning: ignoring container '{id}': the daemon returned a record this \
+                 version cannot read ({e})"
+            ),
+        }
+    }
+    Ok(snapshots)
+}
+
 /// Snapshot of a container's full state, returned by list/get operations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -132,12 +160,18 @@ pub struct Filesystem {
 /// `list`/`inspect` must deserialize these or `dev status`/`dev exec`/`dev up`
 /// discovery fails whenever any container in the daemon uses a named volume
 /// (issue #4).
+///
+/// `Other` keeps that class of failure from recurring: any case a newer daemon
+/// adds is retained verbatim instead of failing the whole reply. It round-trips
+/// unchanged because it is `untagged`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FSType {
     Virtiofs(Empty),
     Tmpfs(Empty),
     Volume(VolumeFilesystem),
+    #[serde(untagged)]
+    Other(serde_json::Value),
 }
 
 /// Empty unit struct used for Swift-compatible enum case encoding.
@@ -405,5 +439,91 @@ mod tests {
             FSType::Volume(_)
         ));
         assert_eq!(snap.status, RuntimeStatus::Running);
+    }
+
+    /// A mount case this version does not model must still deserialize, and must
+    /// survive a round-trip unchanged — otherwise the next filesystem type the
+    /// daemon adds reproduces the issue #4 discovery break.
+    #[test]
+    fn filesystem_with_unknown_type_falls_back_to_other() {
+        let json = r#"{
+            "type": {"blockDevice": {"path": "/dev/disk4", "readOnly": true}},
+            "source": "/dev/disk4",
+            "destination": "/mnt/data",
+            "options": []
+        }"#;
+        let fs: Filesystem =
+            serde_json::from_str(json).expect("unknown filesystem type must deserialize");
+        match &fs.fs_type {
+            FSType::Other(value) => assert_eq!(
+                value.get("blockDevice").and_then(|b| b.get("path")),
+                Some(&serde_json::Value::from("/dev/disk4"))
+            ),
+            other => panic!("expected Other, got {other:?}"),
+        }
+
+        let reencoded = serde_json::to_value(&fs).expect("re-encode");
+        assert_eq!(
+            reencoded.get("type"),
+            serde_json::from_str::<serde_json::Value>(json)
+                .unwrap()
+                .get("type"),
+            "an unmodelled mount type must round-trip verbatim"
+        );
+    }
+
+    fn snapshot_json(id: &str, mount_type: &str) -> String {
+        format!(
+            r#"{{
+                "configuration": {{
+                    "id": "{id}",
+                    "image": {{"reference": "docker.io/library/alpine:latest"}},
+                    "mounts": [{{
+                        "type": {mount_type},
+                        "source": "/src",
+                        "destination": "/dst",
+                        "options": []
+                    }}],
+                    "labels": {{"devcontainer.local_folder": "/w/{id}"}}
+                }},
+                "status": "running"
+            }}"#
+        )
+    }
+
+    /// One container the models cannot represent must not hide the rest of the
+    /// list. This is the issue #4 failure mode: an unrelated container in the
+    /// daemon made `dev status`/`dev exec`/`dev up` discovery fail for *every*
+    /// workspace, because `containerList` was decoded all-or-nothing.
+    #[test]
+    fn decode_snapshots_skips_unreadable_entries() {
+        // `status` is required, so an entry missing it cannot be decoded at all
+        // — it stands in for whatever the next unmodelled daemon field is.
+        let payload = format!(
+            "[{},{},{}]",
+            snapshot_json("good-one", r#"{"virtiofs": {}}"#),
+            r#"{"configuration": {"id": "unreadable"}}"#,
+            snapshot_json("good-two", r#"{"volume": {"name": "v", "format": "ext4"}}"#),
+        );
+
+        let snapshots = decode_snapshots(payload.as_bytes()).expect("list payload must decode");
+
+        let ids: Vec<&str> = snapshots
+            .iter()
+            .map(|s| s.configuration.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["good-one", "good-two"],
+            "readable containers must stay discoverable when a sibling entry cannot be decoded"
+        );
+    }
+
+    /// A payload that is not a JSON array at all is still a hard error — the
+    /// per-entry tolerance must not turn a malformed reply into "no containers".
+    #[test]
+    fn decode_snapshots_rejects_non_array_payload() {
+        decode_snapshots(b"{\"containers\": []}")
+            .expect_err("a non-array containerList payload must surface as an error");
     }
 }

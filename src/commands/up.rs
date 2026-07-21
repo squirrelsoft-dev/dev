@@ -147,6 +147,7 @@ pub(crate) async fn run_with_runtime(
             ContainerState::Stopped if !rebuild && !has_port_overrides => {
                 println!("Starting existing container '{}'...", container.name);
                 runtime.start_container(&container.id).await?;
+                verify_container_discoverable(runtime, &container.id, workspace).await?;
                 if config.post_start_command.is_some() {
                     let user = resolve_remote_user(
                         runtime,
@@ -441,6 +442,7 @@ pub(crate) async fn run_with_runtime(
 
     eprintln!("Starting container '{name}'...");
     runtime.start_container(&container_id).await?;
+    verify_container_discoverable(runtime, &container_id, workspace).await?;
 
     // Run lifecycle hooks — feature hooks first, then config hooks (Gap 6).
     let feature_hooks = if ordered_features.is_empty() {
@@ -464,6 +466,63 @@ pub(crate) async fn run_with_runtime(
     }
 
     Ok(())
+}
+
+/// How long to give the runtime to report a just-started container as running.
+const READINESS_ATTEMPTS: usize = 10;
+const READINESS_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Confirm a just-started container is actually running *and* findable by the
+/// same workspace-label query `dev status`/`dev exec` use.
+///
+/// A successful create/start call is not proof of either: issue #4 was a
+/// container that `dev up` had started but that neither command could find.
+/// Reporting readiness is gated on this check so the two can never disagree.
+async fn verify_container_discoverable(
+    runtime: &dyn ContainerRuntime,
+    container_id: &str,
+    workspace: &Path,
+) -> anyhow::Result<()> {
+    let filters: Vec<String> = workspace_labels(workspace, None)
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+
+    let mut last_state = None;
+    for attempt in 0..READINESS_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(READINESS_POLL).await;
+        }
+        let found = runtime.list_containers(&filters).await?;
+        match found.iter().find(|c| same_container(&c.id, container_id)) {
+            Some(c) if c.state == ContainerState::Running => return Ok(()),
+            Some(c) => last_state = Some(c.state.clone()),
+            None => last_state = None,
+        }
+    }
+
+    match last_state {
+        Some(state) => anyhow::bail!(
+            "Container '{container_id}' was started but is {state:?}, not running. \
+             Check the runtime's logs for why its init process exited."
+        ),
+        None => anyhow::bail!(
+            "Container '{container_id}' was started but is not discoverable by the \
+             workspace labels `dev status` and `dev exec` search for ({}). \
+             The container exists but no command can reach it.",
+            filters.join(", ")
+        ),
+    }
+}
+
+/// Compare a listed container id with the one create returned.
+///
+/// Runtimes are inconsistent about returning full or shortened ids, so a
+/// prefix match on either side counts as the same container.
+fn same_container(listed: &str, created: &str) -> bool {
+    !listed.is_empty()
+        && !created.is_empty()
+        && (listed.starts_with(created) || created.starts_with(listed))
 }
 
 fn apply_cli_overrides(
@@ -1103,8 +1162,8 @@ mod tests {
     use crate::devcontainer::effective::load_effective_config_value;
     use crate::error::DevError;
     use crate::runtime::{
-        AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ExecResult,
-        ImageMetadata,
+        AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ContainerState,
+        ExecResult, ImageMetadata,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -1235,7 +1294,7 @@ mod tests {
             _id: &str,
             _cmd: &[String],
             _user: Option<&str>,
-        ) -> BoxFut<'_, ()> {
+        ) -> BoxFut<'_, i32> {
             unused()
         }
 
@@ -1398,16 +1457,25 @@ mod tests {
     use crate::util::workspace_labels;
     use std::sync::{Arc, Mutex};
 
-    /// Stand-in runtime for `run_with_runtime`. Captures the `ContainerConfig`
-    /// handed to `create_container` and the id handed to `start_container`, and
-    /// can be told to fail either step so error propagation can be asserted.
+    /// Stand-in runtime for `run_with_runtime`, modelling a daemon: created
+    /// containers land in `containers`, `start_container` marks them running,
+    /// and `list_containers` answers label queries out of that same state — so
+    /// the create → discover contract is exercised end to end.
+    ///
+    /// Each knob reproduces one way the issue #4 path failed: create/start
+    /// erroring, the container never reaching running, and the container
+    /// existing but being invisible to the label query `dev status`/`dev exec`
+    /// use (which is what an undecodable `containerList` reply looks like).
     struct UpFakeRuntime {
         image_exists: bool,
         create_fails: bool,
         start_fails: bool,
+        discoverable: bool,
+        starts_running: bool,
         created_id: String,
         created_config: Arc<Mutex<Option<ContainerConfig>>>,
         started_id: Arc<Mutex<Option<String>>>,
+        containers: Arc<Mutex<Vec<ContainerInfo>>>,
     }
 
     impl UpFakeRuntime {
@@ -1416,20 +1484,37 @@ mod tests {
                 image_exists: true,
                 create_fails: false,
                 start_fails: false,
+                discoverable: true,
+                starts_running: true,
                 created_id: "fake-id".to_string(),
                 created_config: Arc::new(Mutex::new(None)),
                 started_id: Arc::new(Mutex::new(None)),
+                containers: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
         fn failing(create: bool, start: bool) -> Self {
             Self {
-                image_exists: true,
                 create_fails: create,
                 start_fails: start,
-                created_id: "fake-id".to_string(),
-                created_config: Arc::new(Mutex::new(None)),
-                started_id: Arc::new(Mutex::new(None)),
+                ..Self::ok()
+            }
+        }
+
+        /// Create and start succeed, but the container never shows up in the
+        /// workspace-label query.
+        fn undiscoverable() -> Self {
+            Self {
+                discoverable: false,
+                ..Self::ok()
+            }
+        }
+
+        /// Create and start succeed, but the container never reaches running.
+        fn never_running() -> Self {
+            Self {
+                starts_running: false,
+                ..Self::ok()
             }
         }
 
@@ -1469,12 +1554,20 @@ mod tests {
             let create_fails = self.create_fails;
             let created_id = self.created_id.clone();
             let capture = self.created_config.clone();
+            let containers = self.containers.clone();
             Box::pin(async move {
                 if create_fails {
                     return Err(DevError::Runtime(
                         "create_container failed (test-injected)".to_string(),
                     ));
                 }
+                containers.lock().unwrap().push(ContainerInfo {
+                    id: created_id.clone(),
+                    name: config.name.clone(),
+                    state: ContainerState::Stopped,
+                    labels: config.labels.clone(),
+                    image: config.image.clone(),
+                });
                 *capture.lock().unwrap() = Some(config);
                 Ok(created_id)
             })
@@ -1483,12 +1576,21 @@ mod tests {
         fn start_container(&self, id: &str) -> BoxFut<'_, ()> {
             let id = id.to_string();
             let start_fails = self.start_fails;
+            let starts_running = self.starts_running;
             let capture = self.started_id.clone();
+            let containers = self.containers.clone();
             Box::pin(async move {
                 if start_fails {
                     return Err(DevError::Runtime(
                         "start_container failed (test-injected)".to_string(),
                     ));
+                }
+                if starts_running {
+                    for container in containers.lock().unwrap().iter_mut() {
+                        if container.id == id {
+                            container.state = ContainerState::Running;
+                        }
+                    }
                 }
                 *capture.lock().unwrap() = Some(id);
                 Ok(())
@@ -1512,7 +1614,7 @@ mod tests {
             _id: &str,
             _cmd: &[String],
             _user: Option<&str>,
-        ) -> BoxFut<'_, ()> {
+        ) -> BoxFut<'_, i32> {
             unused()
         }
 
@@ -1520,9 +1622,30 @@ mod tests {
             unused()
         }
 
-        fn list_containers(&self, _label_filters: &[String]) -> BoxFut<'_, Vec<ContainerInfo>> {
-            // No pre-existing container for a fresh temp workspace.
-            Box::pin(async move { Ok(Vec::new()) })
+        fn list_containers(&self, label_filters: &[String]) -> BoxFut<'_, Vec<ContainerInfo>> {
+            let filters: Vec<(String, String)> = label_filters
+                .iter()
+                .map(|f| {
+                    let (key, value) = f.split_once('=').unwrap_or((f.as_str(), ""));
+                    (key.to_string(), value.to_string())
+                })
+                .collect();
+            let discoverable = self.discoverable;
+            let containers = self.containers.clone();
+            Box::pin(async move {
+                if !discoverable {
+                    return Ok(Vec::new());
+                }
+                let known = containers.lock().unwrap().clone();
+                Ok(known
+                    .into_iter()
+                    .filter(|c| {
+                        filters
+                            .iter()
+                            .all(|(key, value)| c.labels.get(key).is_some_and(|got| got == value))
+                    })
+                    .collect())
+            })
         }
 
         fn image_exists(&self, _image: &str) -> BoxFut<'_, bool> {
@@ -1633,5 +1756,52 @@ mod tests {
             &abs_workspace.to_string_lossy().to_string(),
             "local_folder label must be the absolute workspace path"
         );
+    }
+
+    /// The reported issue #4 failure: create and start both succeed, but the
+    /// container cannot be found by the workspace labels `dev status`/`dev exec`
+    /// query with. `dev up` must fail instead of announcing readiness.
+    #[tokio::test]
+    async fn up_fails_when_started_container_is_not_discoverable() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let rt = UpFakeRuntime::undiscoverable();
+        let err = run_up_with_fake(&rt, &workspace)
+            .await
+            .expect_err("readiness must not be reported for an undiscoverable container");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not discoverable"),
+            "error should explain the discovery failure, got: {msg}"
+        );
+    }
+
+    /// A container that is created and started but never reaches the running
+    /// state is not usable by `dev exec`, so `dev up` must not report readiness.
+    #[tokio::test]
+    async fn up_fails_when_started_container_never_runs() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let rt = UpFakeRuntime::never_running();
+        let err = run_up_with_fake(&rt, &workspace)
+            .await
+            .expect_err("readiness must not be reported for a container that is not running");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not running"),
+            "error should explain the container is not running, got: {msg}"
+        );
+    }
+
+    /// A runtime that shortens ids (as Apple Containers does, to fit its
+    /// 36-character limit) must still count as discovered.
+    #[test]
+    fn same_container_tolerates_shortened_ids() {
+        assert!(super::same_container("abc123def456", "abc123def456"));
+        assert!(super::same_container("abc123def456", "abc123"));
+        assert!(super::same_container("abc123", "abc123def456"));
+        assert!(!super::same_container("abc123", "xyz789"));
+        assert!(!super::same_container("", "abc123"));
+        assert!(!super::same_container("abc123", ""));
     }
 }

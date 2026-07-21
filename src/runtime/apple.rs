@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use apple_container::AppleContainerClient;
 use apple_container::models::{
@@ -11,7 +12,7 @@ use apple_container::models::{
 use crate::error::DevError;
 use crate::runtime::{
     AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ContainerState,
-    ExecResult, ImageMetadata,
+    ExecResult, ImageMetadata, terminal_size,
 };
 
 /// Apple Containers runtime using native XPC.
@@ -32,6 +33,162 @@ impl AppleRuntime {
             .await
             .map_err(|e| DevError::Runtime(format!("Apple Containers ping failed: {e}")))?;
         Ok(())
+    }
+
+    /// Run a command in the container, capturing its output and exit code.
+    ///
+    /// `create_process` only registers the process with the daemon; only
+    /// `start_process` runs it. Without the latter nothing ever writes to the
+    /// stdout/stderr pipes and `dev exec` hangs (issue #4).
+    async fn exec_impl(
+        &self,
+        id: &str,
+        cmd: &[String],
+        user: Option<&str>,
+    ) -> Result<ExecResult, DevError> {
+        let (stdin_read, stdin_write) = exec_pipe()?;
+        let (stdout_read, stdout_write) = exec_pipe()?;
+        let (stderr_read, stderr_write) = exec_pipe()?;
+
+        let process_id = next_process_id("exec");
+        let proc_config = exec_process_config(cmd, user, false);
+
+        self.client
+            .create_process(
+                id,
+                &process_id,
+                &proc_config,
+                stdin_read.as_raw_fd(),
+                stdout_write.as_raw_fd(),
+                stderr_write.as_raw_fd(),
+            )
+            .await
+            .map_err(|e| DevError::Runtime(format!("exec failed: {e}")))?;
+
+        self.client
+            .start_process(id, &process_id)
+            .await
+            .map_err(|e| DevError::Runtime(format!("exec start failed: {e}")))?;
+
+        // The daemon holds its own copies of all three descriptors now. Closing
+        // ours gives the process EOF on stdin — nothing writes to it, so a
+        // command that reads stdin would otherwise block forever — and lets the
+        // readers below see EOF once the process exits.
+        drop(stdin_write);
+        drop(stdin_read);
+        drop(stdout_write);
+        drop(stderr_write);
+
+        // Wait alongside the reads rather than after them: a process that fills
+        // a pipe buffer cannot exit until the pipe is drained.
+        let (exit_code, stdout_buf, stderr_buf) = tokio::join!(
+            self.client.wait_process(id, &process_id),
+            read_pipe(stdout_read),
+            read_pipe(stderr_read),
+        );
+
+        Ok(ExecResult {
+            exit_code: exit_code
+                .map_err(|e| DevError::Runtime(format!("exec wait failed: {e}")))?,
+            stdout: finish_read(stdout_buf, "stdout")?,
+            stderr: finish_read(stderr_buf, "stderr")?,
+        })
+    }
+
+    /// Run a command against the caller's terminal and wait for it to exit.
+    async fn exec_interactive_impl(
+        &self,
+        id: &str,
+        cmd: &[String],
+        user: Option<&str>,
+    ) -> Result<i32, DevError> {
+        let _raw_guard = RawModeGuard::enter()?;
+
+        let process_id = next_process_id("exec-interactive");
+        let proc_config = exec_process_config(cmd, user, true);
+
+        // Hand the real terminal descriptors to the daemon; it drives the pty.
+        self.client
+            .create_process(
+                id,
+                &process_id,
+                &proc_config,
+                std::io::stdin().as_raw_fd(),
+                std::io::stdout().as_raw_fd(),
+                std::io::stderr().as_raw_fd(),
+            )
+            .await
+            .map_err(|e| DevError::Runtime(format!("exec_interactive failed: {e}")))?;
+
+        self.client
+            .start_process(id, &process_id)
+            .await
+            .map_err(|e| DevError::Runtime(format!("exec_interactive start failed: {e}")))?;
+
+        self.resize_to_terminal(id, &process_id).await;
+        let exit_code = self.attend_interactive_process(id, &process_id).await?;
+
+        // _raw_guard is dropped here, restoring the terminal.
+        Ok(exit_code)
+    }
+
+    /// Forward window-size changes and signals until the process exits.
+    ///
+    /// The daemon copies terminal bytes itself, so the only host-side work left
+    /// is keeping the guest pty's window size in sync and relaying signals
+    /// aimed at this CLI (the raw-mode terminal delivers Ctrl-C to the guest as
+    /// a byte, not as a host SIGINT).
+    async fn attend_interactive_process(
+        &self,
+        id: &str,
+        process_id: &str,
+    ) -> Result<i32, DevError> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let watch = |kind: SignalKind, name: &str| {
+            signal(kind).map_err(|e| DevError::Runtime(format!("watch {name}: {e}")))
+        };
+        let mut window_change = watch(SignalKind::window_change(), "SIGWINCH")?;
+        let mut interrupt = watch(SignalKind::interrupt(), "SIGINT")?;
+        let mut terminate = watch(SignalKind::terminate(), "SIGTERM")?;
+
+        let wait = self.client.wait_process(id, process_id);
+        tokio::pin!(wait);
+
+        loop {
+            tokio::select! {
+                exited = &mut wait => {
+                    return exited.map_err(|e| {
+                        DevError::Runtime(format!("exec_interactive wait failed: {e}"))
+                    });
+                }
+                _ = window_change.recv() => self.resize_to_terminal(id, process_id).await,
+                _ = interrupt.recv() => self.forward_signal(id, process_id, libc::SIGINT).await,
+                _ = terminate.recv() => self.forward_signal(id, process_id, libc::SIGTERM).await,
+            }
+        }
+    }
+
+    /// Best-effort sync of the guest pty's window size with the host terminal.
+    async fn resize_to_terminal(&self, id: &str, process_id: &str) {
+        let Some((columns, rows)) = terminal_size() else {
+            return;
+        };
+        if let Err(e) = self
+            .client
+            .resize_process(id, process_id, columns, rows)
+            .await
+        {
+            // Written with CRLF: the terminal is in raw mode here.
+            eprint!("\r\nWarning: could not resize container terminal: {e}\r\n");
+        }
+    }
+
+    /// Best-effort relay of a host signal to the process inside the container.
+    async fn forward_signal(&self, id: &str, process_id: &str, signal: i32) {
+        if let Err(e) = self.client.kill_process(id, process_id, signal).await {
+            eprint!("\r\nWarning: could not deliver signal {signal} to container: {e}\r\n");
+        }
     }
 
     /// Search the Apple Container local image store for a reference.
@@ -212,6 +369,92 @@ impl Drop for RawModeGuard {
     fn drop(&mut self) {
         unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) };
     }
+}
+
+/// Serial number making every exec process identifier unique within this process.
+static EXEC_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Build a process identifier that is unique per exec call.
+///
+/// The daemon keys processes by this identifier within a container, so two
+/// execs sharing one identifier collide. `dev up` runs lifecycle hooks
+/// concurrently, so a host-PID-only identifier is not enough.
+fn next_process_id(prefix: &str) -> String {
+    let seq = EXEC_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}-{}-{seq}", std::process::id())
+}
+
+/// Map a devcontainer user spec onto Apple's process user model.
+///
+/// `remoteUser` is normally a name (`vscode`), which only `User::Raw` can
+/// carry — the daemon resolves it against the image's `/etc/passwd`. Numeric
+/// `uid` and `uid:gid` specs map onto `User::Id`.
+fn to_apple_user(user: Option<&str>) -> User {
+    let Some(spec) = user.map(str::trim).filter(|u| !u.is_empty()) else {
+        return User::Id {
+            id: UserId { uid: 0, gid: 0 },
+        };
+    };
+    match parse_numeric_user(spec) {
+        Some(id) => User::Id { id },
+        None => User::Raw {
+            raw: UserString {
+                user_string: spec.to_string(),
+            },
+        },
+    }
+}
+
+/// Parse `uid` or `uid:gid`, returning None for anything non-numeric.
+fn parse_numeric_user(spec: &str) -> Option<UserId> {
+    match spec.split_once(':') {
+        Some((uid, gid)) => Some(UserId {
+            uid: uid.parse().ok()?,
+            gid: gid.parse().ok()?,
+        }),
+        None => {
+            let uid = spec.parse().ok()?;
+            Some(UserId { uid, gid: uid })
+        }
+    }
+}
+
+/// Build the process configuration for an exec'd command.
+fn exec_process_config(cmd: &[String], user: Option<&str>, terminal: bool) -> ProcessConfiguration {
+    ProcessConfiguration {
+        executable: cmd.first().cloned().unwrap_or_default(),
+        arguments: cmd.get(1..).map(<[String]>::to_vec).unwrap_or_default(),
+        environment: Vec::new(),
+        working_directory: "/".to_string(),
+        terminal,
+        user: to_apple_user(user),
+        supplemental_groups: vec![],
+        rlimits: vec![],
+    }
+}
+
+/// Create a pipe, mapping the OS error into a runtime error.
+fn exec_pipe() -> Result<(os_pipe::PipeReader, os_pipe::PipeWriter), DevError> {
+    os_pipe::pipe().map_err(|e| DevError::Runtime(format!("pipe: {e}")))
+}
+
+/// Drain a pipe to a string on the blocking pool.
+fn read_pipe(mut reader: os_pipe::PipeReader) -> tokio::task::JoinHandle<std::io::Result<String>> {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut buf = String::new();
+        reader.read_to_string(&mut buf).map(|_| buf)
+    })
+}
+
+/// Unwrap the two error layers a [`read_pipe`] task can fail with.
+fn finish_read(
+    joined: Result<std::io::Result<String>, tokio::task::JoinError>,
+    stream: &str,
+) -> Result<String, DevError> {
+    joined
+        .map_err(|e| DevError::Runtime(format!("{stream} reader join: {e}")))?
+        .map_err(|e| DevError::Runtime(format!("read {stream}: {e}")))
 }
 
 /// Translate Shift+Enter escape sequences into a plain carriage return.
@@ -527,165 +770,14 @@ impl ContainerRuntime for AppleRuntime {
         let id = id.to_string();
         let cmd = cmd.to_vec();
         let user = user.map(|u| u.to_string());
-        Box::pin(async move {
-            let (stdin_read, _stdin_write) =
-                os_pipe::pipe().map_err(|e| DevError::Runtime(format!("pipe: {e}")))?;
-            let (stdout_read, stdout_write) =
-                os_pipe::pipe().map_err(|e| DevError::Runtime(format!("pipe: {e}")))?;
-            let (stderr_read, stderr_write) =
-                os_pipe::pipe().map_err(|e| DevError::Runtime(format!("pipe: {e}")))?;
-
-            let executable = cmd.first().cloned().unwrap_or_default();
-            let arguments = if cmd.len() > 1 {
-                cmd[1..].to_vec()
-            } else {
-                Vec::new()
-            };
-
-            let process_id = format!("exec-{}", std::process::id());
-
-            let uid = user
-                .as_deref()
-                .and_then(|u| u.parse::<u32>().ok())
-                .unwrap_or(0);
-
-            let proc_config = ProcessConfiguration {
-                executable,
-                arguments,
-                environment: Vec::new(),
-                working_directory: "/".to_string(),
-                terminal: false,
-                user: User::Id {
-                    id: UserId { uid, gid: uid },
-                },
-                supplemental_groups: vec![],
-                rlimits: vec![],
-            };
-
-            self.client
-                .create_process(
-                    &id,
-                    &process_id,
-                    &proc_config,
-                    stdin_read.as_raw_fd(),
-                    stdout_write.as_raw_fd(),
-                    stderr_write.as_raw_fd(),
-                )
-                .await
-                .map_err(|e| DevError::Runtime(format!("exec failed: {e}")))?;
-
-            // `create_process` only registers the process with the daemon; it does
-            // not run it. Without `start_process` the process never executes, the
-            // stdout/stderr pipe write ends are never closed, and `read_to_string`
-            // below blocks forever — so `dev exec` hangs (issue #4). Mirrors
-            // Apple's CLI, which calls `process.start()` after `createProcess`.
-            self.client
-                .start_process(&id, &process_id)
-                .await
-                .map_err(|e| DevError::Runtime(format!("exec start failed: {e}")))?;
-
-            // Close our write ends so reads see EOF once the process exits and
-            // the daemon closes its copies.
-            drop(stdout_write);
-            drop(stderr_write);
-
-            // Read stdout and stderr concurrently so a process that writes a lot
-            // to one stream does not deadlock against the other.
-            let mut stdout_read = stdout_read;
-            let mut stderr_read = stderr_read;
-            let stdout_handle = tokio::task::spawn_blocking(move || {
-                use std::io::Read;
-                let mut buf = String::new();
-                stdout_read.read_to_string(&mut buf).map(|_| buf)
-            });
-            let stderr_handle = tokio::task::spawn_blocking(move || {
-                use std::io::Read;
-                let mut buf = String::new();
-                stderr_read.read_to_string(&mut buf).map(|_| buf)
-            });
-
-            let stdout_buf = stdout_handle
-                .await
-                .map_err(|e| DevError::Runtime(format!("stdout reader join: {e}")))?
-                .map_err(|e| DevError::Runtime(format!("read stdout: {e}")))?;
-            let stderr_buf = stderr_handle
-                .await
-                .map_err(|e| DevError::Runtime(format!("stderr reader join: {e}")))?
-                .map_err(|e| DevError::Runtime(format!("read stderr: {e}")))?;
-
-            // The exit code is not surfaced by the current XPC reply set, so a
-            // non-zero exit is reported as 0. Output is still captured and
-            // returned, which is enough for `dev exec` to be usable; correct
-            // exit-code propagation is tracked separately.
-            Ok(ExecResult {
-                exit_code: 0,
-                stdout: stdout_buf,
-                stderr: stderr_buf,
-            })
-        })
+        Box::pin(async move { self.exec_impl(&id, &cmd, user.as_deref()).await })
     }
 
-    fn exec_interactive(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, ()> {
+    fn exec_interactive(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, i32> {
         let id = id.to_string();
         let cmd = cmd.to_vec();
         let user = user.map(|u| u.to_string());
-        Box::pin(async move {
-            let _raw_guard = RawModeGuard::enter()?;
-
-            let executable = cmd.first().cloned().unwrap_or_default();
-            let arguments = if cmd.len() > 1 {
-                cmd[1..].to_vec()
-            } else {
-                Vec::new()
-            };
-
-            let process_id = format!("exec-interactive-{}", std::process::id());
-
-            let uid = user
-                .as_deref()
-                .and_then(|u| u.parse::<u32>().ok())
-                .unwrap_or(0);
-
-            let proc_config = ProcessConfiguration {
-                executable,
-                arguments,
-                environment: Vec::new(),
-                working_directory: "/".to_string(),
-                terminal: true,
-                user: User::Id {
-                    id: UserId { uid, gid: uid },
-                },
-                supplemental_groups: vec![],
-                rlimits: vec![],
-            };
-
-            // For interactive mode, pass the real terminal fds directly.
-            let stdin_fd = std::io::stdin().as_raw_fd();
-            let stdout_fd = std::io::stdout().as_raw_fd();
-            let stderr_fd = std::io::stderr().as_raw_fd();
-
-            self.client
-                .create_process(
-                    &id,
-                    &process_id,
-                    &proc_config,
-                    stdin_fd,
-                    stdout_fd,
-                    stderr_fd,
-                )
-                .await
-                .map_err(|e| DevError::Runtime(format!("exec_interactive failed: {e}")))?;
-
-            // `create_process` does not run the process; `start_process` does.
-            // Without it the interactive shell never starts (issue #4).
-            self.client
-                .start_process(&id, &process_id)
-                .await
-                .map_err(|e| DevError::Runtime(format!("exec_interactive start failed: {e}")))?;
-
-            // _raw_guard is dropped here, restoring the terminal.
-            Ok(())
-        })
+        Box::pin(async move { self.exec_interactive_impl(&id, &cmd, user.as_deref()).await })
     }
 
     fn inspect_container(&self, id: &str) -> BoxFut<'_, ContainerInfo> {
@@ -815,6 +907,75 @@ mod tests {
     use std::collections::HashMap;
     use tempfile::TempDir;
 
+    /// `remoteUser` is normally a name, and a name must not silently become
+    /// root: `dev exec --user vscode` and every lifecycle hook would otherwise
+    /// run as uid 0 on this runtime but as the named user on docker/podman.
+    #[test]
+    fn named_user_maps_to_raw_user_string() {
+        match to_apple_user(Some("vscode")) {
+            User::Raw { raw } => assert_eq!(raw.user_string, "vscode"),
+            other => panic!("named user must map to User::Raw, got {other:?}"),
+        }
+        match to_apple_user(Some("node:node")) {
+            User::Raw { raw } => assert_eq!(raw.user_string, "node:node"),
+            other => panic!("named user:group must map to User::Raw, got {other:?}"),
+        }
+    }
+
+    /// Numeric specs still take the id path, including the `uid:gid` form.
+    #[test]
+    fn numeric_user_maps_to_ids() {
+        match to_apple_user(Some("1000")) {
+            User::Id { id } => assert_eq!((id.uid, id.gid), (1000, 1000)),
+            other => panic!("numeric user must map to User::Id, got {other:?}"),
+        }
+        match to_apple_user(Some("1000:2000")) {
+            User::Id { id } => assert_eq!((id.uid, id.gid), (1000, 2000)),
+            other => panic!("numeric uid:gid must map to User::Id, got {other:?}"),
+        }
+    }
+
+    /// No user (and no meaningful user) means root, as before.
+    #[test]
+    fn missing_user_defaults_to_root_ids() {
+        for spec in [None, Some(""), Some("   ")] {
+            match to_apple_user(spec) {
+                User::Id { id } => assert_eq!((id.uid, id.gid), (0, 0)),
+                other => panic!("{spec:?} must default to uid/gid 0, got {other:?}"),
+            }
+        }
+    }
+
+    /// The daemon keys processes by identifier within a container, and `dev up`
+    /// execs lifecycle hooks concurrently — so two execs from one CLI run must
+    /// never share an identifier.
+    #[test]
+    fn exec_process_ids_are_unique_per_call() {
+        let ids: Vec<String> = (0..64).map(|_| next_process_id("exec")).collect();
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "exec process ids must be unique");
+        assert!(ids.iter().all(|id| id.starts_with("exec-")));
+    }
+
+    /// The command's first word is the executable and the rest are arguments;
+    /// an empty command must not panic.
+    #[test]
+    fn exec_process_config_splits_command() {
+        let config = exec_process_config(
+            &["sh".to_string(), "-c".to_string(), "echo hi".to_string()],
+            None,
+            false,
+        );
+        assert_eq!(config.executable, "sh");
+        assert_eq!(config.arguments, vec!["-c", "echo hi"]);
+        assert!(!config.terminal);
+
+        let empty = exec_process_config(&[], None, true);
+        assert_eq!(empty.executable, "");
+        assert!(empty.arguments.is_empty());
+        assert!(empty.terminal);
+    }
+
     /// A name at or under the limit must pass through untouched.
     #[test]
     fn short_container_id_is_not_truncated() {
@@ -854,13 +1015,14 @@ mod tests {
     /// must (a) truncate the ID to Apple's limit and (b) carry the
     /// `devcontainer.local_folder` label that `dev status`/`dev exec` filter on.
     ///
-    /// This is the creation→discovery round-trip at the heart of issue #4: the
-    /// reported bug was that `dev up` reported readiness but the container was
-    /// not discoverable by `dev status`/`dev exec`. On the broken path the ID
-    /// was not truncated (so `container inspect` came back empty) and discovery
-    /// was ID-based rather than label-based. This test pins both halves: the ID
-    /// fits the daemon limit, and the label that `workspace_labels(workspace, None)`
-    /// produces matches a label actually set on the created container.
+    /// This characterizes the creation→discovery contract at the heart of issue
+    /// #4 — `dev up` reported readiness for a container `dev status`/`dev exec`
+    /// could not find. It does not reproduce the original break (which was a
+    /// `containerList` decode failure, covered in
+    /// `apple_container::models::tests`); it pins the two invariants any future
+    /// change to `to_apple_config` must preserve: the ID stays inside the
+    /// daemon's length limit, and the labels `workspace_labels(workspace, None)`
+    /// queries with are actually set on the created container.
     #[test]
     fn to_apple_config_truncates_id_and_carries_discovery_label() {
         use crate::runtime::WorkspaceMount;
@@ -1173,10 +1335,11 @@ mod tests {
             .expect("delete failed");
     }
 
-    /// Integration test for the `dev exec` path: after create + start, a
-    /// short-lived command must actually run and return its output within a
-    /// bounded time. Before `start_process` was added after `create_process`,
-    /// the process was never started and `exec` hung forever (issue #4).
+    /// Integration test for the `dev exec` path. Covers the three ways exec was
+    /// broken on the issue #4 path: the process was never started (so `exec`
+    /// hung forever), the exit code was hardcoded to 0 (so every failure looked
+    /// like success), and stdin was never closed (so any command that reads it
+    /// hung forever).
     ///
     /// Ignored by default: requires a running Apple Container daemon and pulls
     /// an image over the network. Run with
@@ -1271,23 +1434,44 @@ mod tests {
             .await
             .expect("start_process failed");
 
-        // The regression: before the fix, `exec` created the process but never
-        // started it, so this hung indefinitely. Wrap in a timeout so a
-        // regression fails fast instead of stalling CI.
-        let exec_fut = runtime.exec(
-            container_id,
-            &["echo".to_string(), "hello".to_string()],
-            None,
-        );
-        let result = tokio::time::timeout(std::time::Duration::from_secs(30), exec_fut)
+        // Each exec is wrapped in a timeout so a regression that reintroduces a
+        // hang fails fast instead of stalling CI.
+        async fn bounded(runtime: &AppleRuntime, id: &str, cmd: &[&str]) -> ExecResult {
+            let cmd: Vec<String> = cmd.iter().map(|s| s.to_string()).collect();
+            let described = cmd.join(" ");
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                runtime.exec(id, &cmd, None),
+            )
             .await
-            .expect("exec hung — start_process was not called after create_process")
-            .expect("exec failed");
+            .unwrap_or_else(|_| panic!("exec hung: {described}"))
+            .unwrap_or_else(|e| panic!("exec failed: {described}: {e}"))
+        }
+
+        let result = bounded(&runtime, container_id, &["echo", "hello"]).await;
         assert_eq!(
             result.stdout.trim(),
             "hello",
             "exec should return command output"
         );
+        assert_eq!(result.exit_code, 0, "a successful command must report 0");
+
+        // A failing command must report its real status, or lifecycle hook
+        // failures and `dev exec` exit codes are silently swallowed.
+        let failed = bounded(
+            &runtime,
+            container_id,
+            &["sh", "-c", "echo oops >&2; exit 7"],
+        )
+        .await;
+        assert_eq!(failed.exit_code, 7, "exit code must be propagated");
+        assert_eq!(failed.stderr.trim(), "oops");
+
+        // Nothing writes to the exec'd process's stdin, so it must see EOF.
+        // `cat` would otherwise block until the container is killed.
+        let piped = bounded(&runtime, container_id, &["cat"]).await;
+        assert_eq!(piped.exit_code, 0, "cat must exit once stdin reaches EOF");
+        assert!(piped.stdout.is_empty());
 
         // Clean up.
         runtime

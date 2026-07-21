@@ -62,9 +62,13 @@ pub async fn run(
         "-c".to_string(),
         format!("cd {workdir} 2>/dev/null; exec {shell_cmd} -l"),
     ];
-    runtime
+    let exit_code = runtime
         .exec_interactive(&container.id, &cmd, user.as_deref())
         .await?;
+
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
 
     Ok(())
 }

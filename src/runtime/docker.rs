@@ -12,7 +12,7 @@ use tokio::io::AsyncWriteExt;
 use crate::error::DevError;
 use crate::runtime::{
     AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ContainerState,
-    ExecResult, ImageMetadata,
+    ExecResult, ImageMetadata, terminal_size,
 };
 
 /// RAII guard that puts the terminal into raw mode and restores it on drop.
@@ -43,19 +43,6 @@ impl RawModeGuard {
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) };
-    }
-}
-
-/// Query the current terminal size via TIOCGWINSZ ioctl.
-fn terminal_size() -> Option<(u16, u16)> {
-    use std::os::fd::AsRawFd;
-    let fd = std::io::stdout().as_raw_fd();
-    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0 && ws.ws_row > 0
-    {
-        Some((ws.ws_col, ws.ws_row))
-    } else {
-        None
     }
 }
 
@@ -487,7 +474,7 @@ impl BollardRuntime {
         id: &str,
         cmd: &[String],
         user: Option<&str>,
-    ) -> Result<(), DevError> {
+    ) -> Result<i32, DevError> {
         use futures_util::StreamExt;
 
         let exec = self
@@ -675,8 +662,18 @@ impl BollardRuntime {
             sigwinch_abort.abort();
         }
 
+        // Report the command's own status; an exec whose code Docker has not
+        // recorded yet is treated as success, as it was before.
+        let exit_code = self
+            .client
+            .inspect_exec(&exec.id)
+            .await
+            .ok()
+            .and_then(|info| info.exit_code)
+            .unwrap_or(0) as i32;
+
         // _raw_guard is dropped here, restoring the terminal.
-        Ok(())
+        Ok(exit_code)
     }
 
     async fn exec_attached_impl(
@@ -905,7 +902,7 @@ impl ContainerRuntime for BollardRuntime {
         Box::pin(async move { self.exec_impl(&id, &cmd, user.as_deref()).await })
     }
 
-    fn exec_interactive(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, ()> {
+    fn exec_interactive(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, i32> {
         let id = id.to_string();
         let cmd = cmd.to_vec();
         let user = user.map(|u| u.to_string());
@@ -1015,7 +1012,7 @@ impl ContainerRuntime for DockerRuntime {
         self.0.exec(id, cmd, user)
     }
 
-    fn exec_interactive(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, ()> {
+    fn exec_interactive(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, i32> {
         self.0.exec_interactive(id, cmd, user)
     }
 

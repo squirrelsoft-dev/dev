@@ -113,6 +113,19 @@ pub struct AttachedExec {
 /// A boxed future that is Send.
 pub(crate) type BoxFut<'a, T> = Pin<Box<dyn Future<Output = Result<T, DevError>> + Send + 'a>>;
 
+/// Current terminal size as (columns, rows), or None when stdout is not a tty.
+pub(crate) fn terminal_size() -> Option<(u16, u16)> {
+    use std::os::fd::AsRawFd;
+    let fd = std::io::stdout().as_raw_fd();
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0 && ws.ws_row > 0
+    {
+        Some((ws.ws_col, ws.ws_row))
+    } else {
+        None
+    }
+}
+
 /// Trait abstracting over container runtimes (Docker, Podman, Apple Containers).
 #[allow(dead_code)]
 pub trait ContainerRuntime: Send + Sync {
@@ -141,7 +154,9 @@ pub trait ContainerRuntime: Send + Sync {
 
     fn exec(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, ExecResult>;
 
-    fn exec_interactive(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, ()>;
+    /// Run a command attached to the caller's terminal, returning its exit code
+    /// once it finishes.
+    fn exec_interactive(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, i32>;
 
     fn inspect_container(&self, id: &str) -> BoxFut<'_, ContainerInfo>;
 

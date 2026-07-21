@@ -21,6 +21,8 @@ pub enum XpcRoute {
     GetDefaultKernel,
     ContainerCreateProcess,
     ContainerStartProcess,
+    ContainerWait,
+    ContainerResize,
     ContainerKill,
     ContainerStop,
     ContainerDelete,
@@ -42,6 +44,8 @@ impl XpcRoute {
             Self::GetDefaultKernel => "getDefaultKernel",
             Self::ContainerCreateProcess => "containerCreateProcess",
             Self::ContainerStartProcess => "containerStartProcess",
+            Self::ContainerWait => "containerWait",
+            Self::ContainerResize => "containerResize",
             Self::ContainerKill => "containerKill",
             Self::ContainerStop => "containerStop",
             Self::ContainerDelete => "containerDelete",
@@ -66,6 +70,10 @@ impl XpcKey {
     pub const PROCESS_CONFIG: &str = "processConfig";
     pub const SIGNAL: &str = "signal";
     pub const EXIT_CODE: &str = "exitCode";
+    /// Terminal columns, used by `containerResize`.
+    pub const WIDTH: &str = "width";
+    /// Terminal rows, used by `containerResize`.
+    pub const HEIGHT: &str = "height";
     pub const SNAPSHOT: &str = "snapshot";
     pub const STATUS: &str = "status";
     pub const STDIN: &str = "stdin";
