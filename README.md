@@ -52,12 +52,14 @@ If you have no `.devcontainer/` yet, scaffold one:
 
 ```sh
 dev init                                  # minimal .devcontainer/ with a Dockerfile
-dev new                                   # interactive: pick a template from the registry
+dev new                                   # interactive: pick a template, writes a recipe
 dev new --template rust                   # by template id
 ```
 
-`--template` takes the short id from the `ID` column of `dev list templates`, not a fully
-qualified OCI reference.
+`dev init` writes a real `devcontainer.json` plus a Dockerfile. `dev new` instead writes a
+`recipe.json` that references a global template by name (see [Recipes](#recipes-workspace-vs-user-scope));
+the full config is composed at build/run time. `--template` takes the short id from the `ID`
+column of `dev list templates`, not a fully qualified OCI reference.
 
 ## Bringing a container up with `dev up`
 
@@ -207,16 +209,20 @@ Docker Compose (`dockerComposeFile`) is supported for the full lifecycle — bui
 
 ```sh
 brew install dnsmasq
-echo 'address=/.test/127.0.0.1' >> /opt/homebrew/etc/dnsmasq.conf
+# $(brew --prefix) resolves to /opt/homebrew (Apple Silicon) or /usr/local (Intel)
+echo 'address=/.test/127.0.0.1' >> "$(brew --prefix)/etc/dnsmasq.conf"
 sudo brew services start dnsmasq
 sudo mkdir -p /etc/resolver
 echo 'nameserver 127.0.0.1' | sudo tee /etc/resolver/test
 
 brew install caddy
-sudo caddy start --config ~/.dev/caddy/Caddyfile
 ```
 
-Caddy only needs to be started once — it persists across reboots and `dev` handles reloads. After first-time DNS setup, flush your browser/system DNS cache or `.test` may not resolve immediately:
+`dev` creates `~/.dev/caddy/Caddyfile` on the first `dev up` (with `forwardPorts`) or `dev forward` — you don't need to create it yourself, and the file does not exist before then. From there `dev` reloads Caddy on every change and starts it against that config if it isn't already running. On macOS that auto-start needs no `sudo`: Caddy listens on the wildcard address, which macOS exempts from the reserved-port restriction, so it binds :80/:443 as your own user.
+
+Caddy doesn't survive a reboot, but you don't have to restart it by hand: the next `dev up`/`dev forward` prints `Caddy not running, starting...` and brings it back up unprivileged against `~/.dev/caddy/Caddyfile`. Don't use `brew services start caddy`: that service runs `caddy run --config "$(brew --prefix)/etc/Caddyfile"`, a different file a stock install doesn't create, so it crash-loops under `KeepAlive` and never serves `dev`'s site fragments. If you want Caddy up before the first `dev` command of a session, wait until a `dev up`/`dev forward` has created `~/.dev/caddy/Caddyfile` — an agent pointed at a config that doesn't exist yet fails the same way `brew services` does — then install a per-user `launchd` agent in `~/Library/LaunchAgents/` that runs `caddy run --config /Users/<you>/.dev/caddy/Caddyfile`. Spell that path out in full — `launchd` does not expand `~` in `ProgramArguments` — and keep the agent unprivileged so it shares the same `tls internal` CA your browser already trusts from `dev`'s own auto-start.
+
+After first-time DNS setup, flush your browser/system DNS cache or `.test` may not resolve immediately:
 
 ```sh
 sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder
@@ -245,14 +251,30 @@ For ad-hoc forwarding (a port not in `forwardPorts`, or a custom subdomain like 
 dev forward 3000                            # forward 3000 → 3000
 dev forward 8080:3000                       # host 8080 → container 3000
 dev forward 3000 --name admin.appname.test  # custom .test subdomain
+dev forward 3000 -d                         # run in the background
 dev forward 3000 --keepalive 30s
 dev forward 3000 --stop                     # stop a forwarder
 dev forward 3000 --list                     # list this workspace's forwarders
 ```
 
 `--name` is used verbatim as the Caddy site hostname, so include the `.test` suffix — a name
-without it won't resolve through the dnsmasq `.test` resolver. `--list` reports every forwarder
-for the workspace, but the port argument is still required by the CLI (it is ignored).
+without it won't resolve through the dnsmasq `.test` resolver. `--list` reports the workspace's
+daemonized (`-d`) forwarders — those are the only ones that record a PID file — but the port
+argument is still required by the CLI (it is ignored).
+
+Without `-d`, `dev forward <port>` runs in the foreground and blocks until you `Ctrl-C`, which is
+the only way to stop it — only `-d` forwarders record a PID file, so `--stop` can't target a
+foreground one. That `Ctrl-C` removes the workspace's whole `.test` fragment, including hostnames
+belonging to other forwarders still running on that workspace. To be able to stop an individual
+forwarder without disrupting those other sites, start it with `-d` (or `--daemon`) to run it in
+the background and later stop it with `dev forward <port> --stop`, which regenerates the fragment
+from the remaining forwarders. That regeneration is rebuilt from PID files, so it only sees `-d`
+forwarders: start every forwarder on a workspace with `-d` if you want to stop them individually,
+because stopping one while a foreground forwarder shares the workspace still drops the foreground
+hostname from the fragment. The forwarder pipes traffic through `nc`/`netcat` inside the
+container, so the image needs `nc`, `ncat`, or `netcat` installed.
+
+### Caddy config files
 
 | Path                              | Purpose                                 |
 | --------------------------------- | --------------------------------------- |
@@ -263,7 +285,7 @@ for the workspace, but the port argument is still required by the CLI (it is ign
 
 ```sh
 dev init                                     # minimal .devcontainer/ with a Dockerfile
-dev new [--template <id>] [--options <k=v>…] # .devcontainer/ from a registry template
+dev new [--template <id>] [--options <k=v>…] # writes .devcontainer/recipe.json from a template
 
 dev build [--tag <t>] [--no-cache] [--buildkit] [--no-base] [--frozen-lockfile]
           [--update-remote-user-uid-default never|on|off]
