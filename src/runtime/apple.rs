@@ -144,7 +144,10 @@ impl AppleRuntime {
         )
         .await
         {
-            let _ = self.client.kill_process(id, &process_id, libc::SIGKILL).await;
+            let _ = self
+                .client
+                .kill_process(id, &process_id, libc::SIGKILL)
+                .await;
             return Err(e);
         }
 

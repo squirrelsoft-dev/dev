@@ -32,7 +32,7 @@ cargo fmt --all --check
 cargo check
 ```
 
-**Note:** The `apple-container` crate requires macOS to compile. On other platforms, builds will exclude it automatically. CI covers that path in a separate `macos-latest` job that runs `cargo build/test --features apple`, so if you touch the Apple Containers runtime, run those on a Mac before submitting. Building with `--features apple` also needs `protoc` on `PATH` (`brew install protobuf`) — the crate's build script generates gRPC bindings with `tonic-build`.
+**Note:** The `apple-container` crate requires macOS to compile. On other platforms, builds will exclude it automatically. CI covers that path in a separate `macos-latest` job that runs `cargo build --features apple` and `cargo test --workspace --features apple`, so if you touch the Apple Containers runtime, run those on a Mac before submitting. `--workspace` is what makes the `apple-container` crate's own tests run — without it cargo tests only the root package. Building with `--features apple` also needs `protoc` on `PATH` (`brew install protobuf`) — the crate's build script generates gRPC bindings with `tonic-build`.
 
 ## Making Changes
 

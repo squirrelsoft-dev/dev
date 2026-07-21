@@ -37,7 +37,7 @@ dev up
 dev shell
 ```
 
-`dev shell` opens an interactive shell as the configured `remoteUser`, in the workspace folder, with `REMOTE_CONTAINERS=true` set — the same environment VS Code's devcontainer integration would give you. It probes for `zsh`, `bash`, then `sh`; pass `--shell /bin/bash` to force one.
+`dev shell` opens an interactive shell as the configured `remoteUser`, in the workspace folder, with `REMOTE_CONTAINERS=true` set — the same environment VS Code's devcontainer integration would give you. It probes for `zsh`, `bash`, then `sh`; pass `--shell /bin/bash` to force one. The workspace folder is the config's `workspaceFolder`, falling back to the `workspaceMount` target and then to `/workspaces/<name>`; `dev up` makes it the created container's working directory, so `dev exec` and the lifecycle hooks start there too.
 
 To run a one-off command instead of an interactive shell:
 
@@ -63,7 +63,7 @@ column of `dev list templates`, not a fully qualified OCI reference.
 
 ## Bringing a container up with `dev up`
 
-`dev up` resolves the effective config (merging the layers below), builds the derived image if features have changed, creates and starts the container, runs lifecycle hooks, and prints `Container '<name>' is ready.`
+`dev up` resolves the effective config (merging the layers below), builds the derived image if features have changed, creates and starts the container, confirms the runtime reports it running and findable by the same workspace labels `dev status` and `dev exec` search for, runs lifecycle hooks, and prints `Container '<name>' is ready.` If that confirmation does not come, `dev up` fails with what it saw instead of reporting readiness — a container `dev status` cannot find is never announced as ready.
 
 ```sh
 dev up                  # build if needed and start

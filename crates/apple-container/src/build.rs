@@ -820,10 +820,10 @@ async fn handle_info(
     );
     metadata.insert("uid".to_string(), file.uid().to_string());
     metadata.insert("gid".to_string(), file.gid().to_string());
-    if file.is_symlink() {
-        if let Ok(target) = std::fs::read_link(&path) {
-            metadata.insert("target".to_string(), target.to_string_lossy().into_owned());
-        }
+    if file.is_symlink()
+        && let Ok(target) = std::fs::read_link(&path)
+    {
+        metadata.insert("target".to_string(), target.to_string_lossy().into_owned());
     }
 
     send_build_transfer(
@@ -881,6 +881,10 @@ fn split_platform(platform: &str) -> (String, String) {
     (os, arch)
 }
 
+/// Picks the image-index entry to pull, in the shape `oci_client` expects.
+type ImageIndexResolver =
+    Box<dyn Fn(&[oci_client::manifest::ImageIndexEntry]) -> Option<String> + Send + Sync>;
+
 /// Build an image-index resolver that selects the entry matching `platform`.
 ///
 /// `oci_client`'s default resolver matches the *running* platform, which on
@@ -891,9 +895,7 @@ fn split_platform(platform: &str) -> (String, String) {
 ///
 /// Variants are ignored, matching `oci_client`'s own resolvers: an index
 /// distinguishes `arm64` from `arm`, not `arm64/v8` from bare `arm64`.
-fn platform_resolver(
-    platform: &str,
-) -> Box<dyn Fn(&[oci_client::manifest::ImageIndexEntry]) -> Option<String> + Send + Sync> {
+fn platform_resolver(platform: &str) -> ImageIndexResolver {
     let (os, arch) = split_platform(platform);
     Box::new(move |manifests| {
         manifests
