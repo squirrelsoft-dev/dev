@@ -13,12 +13,18 @@ use crate::{content, fssync};
 const CONTENT_INFO_METHOD: &str = "/containerd.services.content.v1.Content/Info";
 const CONTENT_READER_AT_METHOD: &str = "/containerd.services.content.v1.Content/ReaderAt";
 
-/// How long to wait for the builder to send anything before giving up.
+/// How long either direction of the build stream may go without progress.
 ///
 /// Every stall in this protocol is silent on both sides — the shim's receivers
 /// have no deadline — so without this a protocol mismatch presents as an
 /// indefinite hang rather than an error. The window is wide enough that a long
 /// silent `RUN` step cannot trip it.
+///
+/// It bounds sends as well as receives. This is a bidirectional gRPC stream, so
+/// the two block each other: the shim only drains our packets while it is not
+/// itself blocked handing us one, and this loop only drains its packets while it
+/// is not blocked sending. Covering one direction alone leaves the deadlock the
+/// deadline exists to break.
 const BUILDER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Include the generated protobuf/gRPC code.
@@ -418,6 +424,32 @@ fn handle_io(io: &proto::Io, verbose: bool) {
     }
 }
 
+/// Hand one packet to the builder, or fail once the stream has stalled.
+///
+/// Every reply leaves through here so the deadline and the fatality rule are
+/// applied once rather than restated at each call site.
+///
+/// A failure to enqueue is fatal in either form: the builder is waiting for
+/// this packet and has no deadline of its own, so a swallowed error — or an
+/// unbounded wait — hangs the build with nothing to report.
+async fn send_to_builder(
+    client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
+    message: ClientStream,
+    what: &str,
+) -> Result<(), AppleContainerError> {
+    match tokio::time::timeout(BUILDER_IDLE_TIMEOUT, client_tx.send(message)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(AppleContainerError::XpcError(format!(
+            "failed to send {what}: {e}"
+        ))),
+        Err(_) => Err(AppleContainerError::XpcError(format!(
+            "builder stopped accepting packets for {}s while sending {what}; \
+             giving up on the build",
+            BUILDER_IDLE_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
 /// Send an IO ack response.
 ///
 /// The Go builder shim's StdioProxy.Write() blocks until the client sends a
@@ -440,10 +472,7 @@ async fn send_io_ack(
         })),
     };
 
-    client_tx
-        .send(response)
-        .await
-        .map_err(|e| AppleContainerError::XpcError(format!("failed to send IO ack: {e}")))
+    send_to_builder(client_tx, response, "the IO ack").await
 }
 
 /// Handle BuildTransfer packets — the server asking for file data (fssync).
@@ -493,9 +522,6 @@ fn fssync_metadata(method: &str) -> HashMap<String, String> {
 }
 
 /// Send one `BuildTransfer` reply on the request's id.
-///
-/// A failure to enqueue is fatal: the builder is waiting for this packet and
-/// has no deadline of its own, so swallowing the error would hang the build.
 async fn send_build_transfer(
     client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
     build_id: &str,
@@ -519,10 +545,7 @@ async fn send_build_transfer(
         })),
     };
 
-    client_tx
-        .send(response)
-        .await
-        .map_err(|e| AppleContainerError::XpcError(format!("failed to send fssync reply: {e}")))
+    send_to_builder(client_tx, response, "an fssync reply").await
 }
 
 /// Tell the builder a request failed instead of leaving it waiting.
@@ -622,6 +645,12 @@ async fn prepare_walk(
 /// otherwise register content under a hash that does not describe it — and the
 /// shim caches its unpacked context by that hash, so a later stable build would
 /// silently reuse the wrong tree.
+///
+/// The writer's `blocking_send` has no deadline of its own and needs none: it
+/// can only block while this loop is draining, this loop is bounded by
+/// [`BUILDER_IDLE_TIMEOUT`] on every send, and every exit from it drops the
+/// receiver — which fails the pending `blocking_send` rather than parking a
+/// pool thread for the rest of the process.
 async fn stream_walk_archive(
     entries: Vec<fssync::ContextEntry>,
     announced: &str,
@@ -950,8 +979,7 @@ async fn handle_image_resolve(
             metadata,
         })),
     };
-    let _ = client_tx.send(response).await;
-    Ok(())
+    send_to_builder(client_tx, response, "the resolver reply").await
 }
 
 /// Handle content-store requests from the builder (BuildRemoteContentProxy).
@@ -1106,9 +1134,7 @@ async fn send_image_transfer(
         })),
     };
 
-    client_tx.send(response).await.map_err(|e| {
-        AppleContainerError::XpcError(format!("failed to send content-store reply: {e}"))
-    })
+    send_to_builder(client_tx, response, "a content-store reply").await
 }
 
 /// Report a content-store failure rather than leaving the builder waiting.
@@ -1549,6 +1575,30 @@ mod tests {
             .block_on(future)
     }
 
+    /// Run on a clock that jumps ahead whenever the future is only waiting on a
+    /// timer, so a deadline can be reached without spending it.
+    fn run_paused<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("test runtime")
+            .block_on(future)
+    }
+
+    /// Await something that must bound itself, failing rather than hanging if
+    /// it does not.
+    ///
+    /// The outer deadline is the backstop: on the paused clock it is only
+    /// reached when the work under test registered no deadline of its own, so
+    /// a regression that drops the bound is a failed assertion instead of a
+    /// test run that never finishes.
+    async fn must_bound_itself<F: std::future::Future>(future: F) -> F::Output {
+        tokio::time::timeout(BUILDER_IDLE_TIMEOUT * 2, future)
+            .await
+            .expect("the build stream must bound this itself rather than wait forever")
+    }
+
     const REPLY_ID: &str = "per-request-demux-id";
 
     fn build_transfer(metadata: &[(&str, &str)], source: &str) -> BuildTransfer {
@@ -1838,6 +1888,111 @@ mod tests {
                 .iter()
                 .any(|(_, p)| p.complete && !p.metadata.contains_key("error")),
             "a mismatched transfer must never be completed"
+        );
+    }
+
+    // ---- the build stream is bidirectional, so a send that cannot be
+    // delivered has to fail the way a receive that never arrives does ----
+
+    /// A packet that the builder never accepts must fail with the idle budget,
+    /// not park forever. This is the both-sides-blocked shape: the shim stops
+    /// draining because it is itself blocked handing us a packet the receive
+    /// loop is not reading while this send is outstanding, so neither side ever
+    /// moves and `BUILDER_IDLE_TIMEOUT` is the only thing that can break it.
+    #[test]
+    fn a_send_the_builder_never_accepts_fails_on_the_idle_budget() {
+        let outcome = run_paused(async {
+            // Capacity one, already full and never drained: the next send can
+            // only complete once the builder consumes, which it never does.
+            let (tx, _rx) = tokio::sync::mpsc::channel::<ClientStream>(1);
+            tx.send(ClientStream {
+                build_id: REPLY_ID.to_string(),
+                packet_type: None,
+            })
+            .await
+            .expect("the first packet fits");
+
+            must_bound_itself(send_to_builder(
+                &tx,
+                ClientStream {
+                    build_id: REPLY_ID.to_string(),
+                    packet_type: None,
+                },
+                "an fssync reply",
+            ))
+            .await
+        });
+
+        let message = outcome
+            .expect_err("a send that cannot be delivered must not wait forever")
+            .to_string();
+        assert!(
+            message.contains("stopped accepting packets"),
+            "the error must name the stall, got: {message}"
+        );
+        assert!(
+            message.contains("an fssync reply"),
+            "the error must name what could not be sent, got: {message}"
+        );
+    }
+
+    /// The receiving half going away is fatal too: the builder is waiting on
+    /// this packet and has no deadline of its own, so a swallowed error hangs
+    /// the build with nothing to report.
+    #[test]
+    fn a_send_to_a_closed_stream_is_reported_rather_than_swallowed() {
+        let outcome = run(async {
+            let (tx, rx) = tokio::sync::mpsc::channel::<ClientStream>(1);
+            drop(rx);
+            send_to_builder(
+                &tx,
+                ClientStream {
+                    build_id: REPLY_ID.to_string(),
+                    packet_type: None,
+                },
+                "the resolver reply",
+            )
+            .await
+        });
+
+        let message = outcome
+            .expect_err("a closed stream must surface as an error")
+            .to_string();
+        assert!(
+            message.contains("the resolver reply"),
+            "the error must name what could not be sent, got: {message}"
+        );
+    }
+
+    /// The walk streams the archive through the same bounded send, so a shim
+    /// that stops reading fails the transfer instead of pinning the receive
+    /// loop and a blocking-pool thread for the rest of the build.
+    #[test]
+    fn a_walk_whose_packets_are_never_drained_fails_on_the_idle_budget() {
+        let payload = "0123456789abcdef".repeat(fssync::CONTEXT_CHUNK_SIZE / 8);
+        let dir = context_with(&[("big.bin", payload.as_str())]);
+        let request = build_transfer(&[("method", "Walk"), ("mode", "tar")], ".");
+
+        let outcome = run_paused(async {
+            let (tx, _rx) = tokio::sync::mpsc::channel::<ClientStream>(1);
+            let entries = fssync::collect_context(dir.path(), &fssync::ContextFilter::default())
+                .expect("context walk");
+            must_bound_itself(stream_walk_archive(
+                entries,
+                &"0".repeat(64),
+                &tx,
+                REPLY_ID,
+                &request,
+            ))
+            .await
+        });
+
+        let message = outcome
+            .expect_err("an undrained walk must not hang the build")
+            .to_string();
+        assert!(
+            message.contains("stopped accepting packets"),
+            "the error must name the stall, got: {message}"
         );
     }
 
