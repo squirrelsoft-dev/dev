@@ -1695,7 +1695,7 @@ mod tests {
         assert!(
             replies
                 .iter()
-                .all(|(_, p)| p.metadata.get("mode").is_none()),
+                .all(|(_, p)| !p.metadata.contains_key("mode")),
             "no reply may advertise a transfer mode the shim does not implement"
         );
         assert!(
