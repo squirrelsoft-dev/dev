@@ -680,6 +680,56 @@ impl ExecDaemon for AppleContainerClient {
     }
 }
 
+/// The daemon call a container stop drives, behind a seam.
+///
+/// Separate from [`ExecDaemon`] because it is a container-level call, and
+/// behind a trait for the same reason that one is: the retry in
+/// [`stop_past_stale_process_records`] is only observable if a test can make
+/// the first attempt fail and the next one succeed.
+trait StopDaemon: Send + Sync {
+    fn stop<'a>(&'a self, container_id: &'a str) -> DaemonFut<'a, ()>;
+}
+
+impl StopDaemon for AppleContainerClient {
+    fn stop<'a>(&'a self, container_id: &'a str) -> DaemonFut<'a, ()> {
+        Box::pin(AppleContainerClient::stop(self, container_id))
+    }
+}
+
+/// Stop a container, retrying once past the daemon's stale process records.
+///
+/// `containerCreateProcess` registers a process with the daemon before the
+/// guest has accepted it, and that record survives a guest-side refusal — an
+/// image with no passwd entry for the requested user, say. The daemon's stop
+/// handler then tries to delete a process the guest has never heard of, fails
+/// with `invalidState`, and fails the whole stop with it, so one refused
+/// `dev exec` — or one refused readiness probe — leaves a container that can
+/// be neither stopped nor removed.
+///
+/// Nothing here can release such a record directly. `containerCreateProcess`,
+/// `containerStartProcess`, `containerWait`, `containerResize` and
+/// `containerKill` are the whole of the daemon's process surface (its
+/// `DeleteProcess` is an internal guest RPC, not an XPC route), and a kill
+/// deletes nothing for a process that never ran. The failed stop is what
+/// discards the records, though, so the attempt behind it is the one that gets
+/// through. Retrying is safe for every other failure too: a stop is
+/// idempotent, and a container that stopped on the first attempt loses only
+/// the second call.
+async fn stop_past_stale_process_records(
+    daemon: &dyn StopDaemon,
+    id: &str,
+) -> Result<(), DevError> {
+    let refused = match daemon.stop(id).await {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    daemon.stop(id).await.map_err(|again| {
+        DevError::Runtime(format!(
+            "Failed to stop container: {again} (an earlier attempt failed with: {refused})"
+        ))
+    })
+}
+
 /// Put a process's exit wait on the wire before its start request.
 ///
 /// `create_process` only registers a process; only `start_process` runs it.
@@ -1263,12 +1313,7 @@ impl ContainerRuntime for AppleRuntime {
 
     fn stop_container(&self, id: &str) -> BoxFut<'_, ()> {
         let id = id.to_string();
-        Box::pin(async move {
-            self.client
-                .stop(&id)
-                .await
-                .map_err(|e| DevError::Runtime(format!("Failed to stop container: {e}")))
-        })
+        Box::pin(async move { stop_past_stale_process_records(&self.client, &id).await })
     }
 
     fn remove_container(&self, id: &str) -> BoxFut<'_, ()> {
@@ -1423,7 +1468,7 @@ mod tests {
     use std::collections::HashMap;
     use std::os::fd::{FromRawFd, OwnedFd, RawFd};
     use std::sync::Mutex;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use tempfile::TempDir;
 
     // ---- issue #4 regression coverage: the exec create → start → wait
@@ -1926,6 +1971,99 @@ mod tests {
             "a failed wait must release its output readers, not leave them on \
              the pipes of a process nothing has closed"
         );
+    }
+
+    /// A daemon whose stop fails until its stale process records are gone.
+    ///
+    /// Models what one refused exec leaves behind: `containerCreateProcess`
+    /// registered a process the guest never accepted, so the stop handler's
+    /// delete of it fails with `invalidState` — and the failed stop is what
+    /// discards the record, so the next attempt gets through.
+    struct FakeStopDaemon {
+        refusals_left: std::sync::Mutex<usize>,
+        attempts: AtomicUsize,
+    }
+
+    impl FakeStopDaemon {
+        fn refusing(refusals: usize) -> Self {
+            Self {
+                refusals_left: std::sync::Mutex::new(refusals),
+                attempts: AtomicUsize::new(0),
+            }
+        }
+
+        fn attempts(&self) -> usize {
+            self.attempts.load(Ordering::SeqCst)
+        }
+    }
+
+    impl StopDaemon for FakeStopDaemon {
+        fn stop<'a>(&'a self, _container_id: &'a str) -> DaemonFut<'a, ()> {
+            Box::pin(async move {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                let mut left = self.refusals_left.lock().unwrap();
+                if *left == 0 {
+                    return Ok(());
+                }
+                *left -= 1;
+                Err(AppleContainerError::XpcError(
+                    "failed to delete process (cause: deleteProcess: invalidState: \
+                     'exec exec-4040-9 does not exist in container')"
+                        .to_string(),
+                ))
+            })
+        }
+    }
+
+    /// One refused `dev exec` — or one refused readiness probe — leaves a
+    /// process record the daemon's stop handler then chokes on, so `dev down
+    /// --remove` reported the container as still running and refused to remove
+    /// it. The failed stop clears the record, so the stop behind it must be
+    /// made rather than the failure reported.
+    #[tokio::test]
+    async fn a_stop_refused_over_a_stale_process_record_is_retried() {
+        let daemon = FakeStopDaemon::refusing(1);
+
+        stop_past_stale_process_records(&daemon, "vsc-workspace")
+            .await
+            .expect("the stop behind the one that cleared the record must be made");
+
+        assert_eq!(
+            daemon.attempts(),
+            2,
+            "the refusal must be retried exactly once"
+        );
+    }
+
+    /// The retry is not a way to swallow a stop that genuinely cannot happen:
+    /// a daemon refusing both attempts still fails, and both refusals are
+    /// reported so the real cause is not replaced by the retry's.
+    #[tokio::test]
+    async fn a_stop_refused_twice_reports_both_refusals() {
+        let daemon = FakeStopDaemon::refusing(2);
+
+        let err = stop_past_stale_process_records(&daemon, "vsc-workspace")
+            .await
+            .expect_err("a stop that never succeeds must surface as an error");
+
+        assert_eq!(daemon.attempts(), 2, "the retry must be bounded to one");
+        assert!(
+            format!("{err}").contains("an earlier attempt failed with"),
+            "the first refusal must survive as context, got: {err}"
+        );
+    }
+
+    /// A stop the daemon accepts costs nothing extra — the retry is only for
+    /// the refusal.
+    #[tokio::test]
+    async fn an_accepted_stop_is_made_once() {
+        let daemon = FakeStopDaemon::refusing(0);
+
+        stop_past_stale_process_records(&daemon, "vsc-workspace")
+            .await
+            .expect("an accepted stop must succeed");
+
+        assert_eq!(daemon.attempts(), 1, "a stop that worked must not be redone");
     }
 
     // ---- issue #4 regression coverage: an undecodable containerList entry

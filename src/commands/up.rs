@@ -141,6 +141,17 @@ pub(crate) async fn run_with_runtime(
     if let Some(container) = existing.first() {
         match container.state {
             ContainerState::Running if !rebuild && !has_port_overrides => {
+                // Gated like every other exit that claims readiness. "Already
+                // running" is a readiness claim, and the container this arm
+                // reuses may be exactly the one a previous `dev up` refused:
+                // the runtime leaves a container it started but cannot exec
+                // into in the running state, so without the gate the first
+                // `dev up` fails honestly and every later one hands the user a
+                // green light for a container no command can run in.
+                let user =
+                    resolve_remote_user(runtime, &container.image, config.remote_user.as_deref())
+                        .await?;
+                verify_container_usable(runtime, &container.id, workspace, user.as_deref()).await?;
                 println!("Container '{}' is already running.", container.name);
                 return Ok(());
             }
@@ -1883,6 +1894,22 @@ mod tests {
             }
         }
 
+        /// Seed the daemon with a container this workspace already has
+        /// running, the way an earlier `dev up` left it — including one the
+        /// readiness gate refused, which the runtime leaves running.
+        fn already_running(self, workspace: &Path, config_path: &Path) -> Self {
+            self.containers.lock().unwrap().push(ContainerInfo {
+                id: "already-running-id".to_string(),
+                name: "already-running".to_string(),
+                state: ContainerState::Running,
+                labels: workspace_labels(workspace, Some(config_path))
+                    .into_iter()
+                    .collect(),
+                image: "ubuntu:24.04".to_string(),
+            });
+            self
+        }
+
         fn created_config(&self) -> ContainerConfig {
             self.created_config
                 .lock()
@@ -2531,6 +2558,48 @@ mod tests {
         assert!(
             msg.contains("no command can be run in it"),
             "error should explain the exec failure, got: {msg}"
+        );
+    }
+
+    /// The reported gap in the first fix: a container the gate has already
+    /// refused is left running, so the next `dev up` takes the already-running
+    /// arm. That arm must apply the same gate — otherwise the first `dev up`
+    /// fails honestly and every later one reports readiness for a container
+    /// `dev exec` still cannot run anything in.
+    #[tokio::test(start_paused = true)]
+    async fn up_refuses_an_already_running_container_no_command_can_run_in() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let rt = UpFakeRuntime::cannot_exec().already_running(workspace.path(), &config_path);
+        let err = run_up_with_fake(&rt, &workspace)
+            .await
+            .expect_err("readiness must not be reported for a reused container that cannot exec");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no command can be run in it"),
+            "error should explain the exec failure, got: {msg}"
+        );
+    }
+
+    /// The same arm must still be the fast path for a healthy container: the
+    /// gate proves it, nothing is recreated, and `dev up` reports it as
+    /// already running.
+    #[tokio::test(start_paused = true)]
+    async fn up_reuses_an_already_running_container_it_can_run_a_command_in() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let rt = UpFakeRuntime::ok().already_running(workspace.path(), &config_path);
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("a running container that runs commands must be reused");
+        assert_eq!(
+            rt.execs().len(),
+            1,
+            "the reused container must be probed exactly once"
+        );
+        assert!(
+            rt.created_config.lock().unwrap().is_none(),
+            "a usable running container must not be recreated"
         );
     }
 
