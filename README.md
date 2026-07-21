@@ -220,7 +220,7 @@ brew install caddy
 
 `dev` creates `~/.dev/caddy/Caddyfile` on the first `dev up` (with `forwardPorts`) or `dev forward` — you don't need to create it yourself, and the file does not exist before then. From there `dev` reloads Caddy on every change and starts it against that config if it isn't already running. On macOS that auto-start needs no `sudo`: Caddy listens on the wildcard address, which macOS exempts from the reserved-port restriction, so it binds :80/:443 as your own user.
 
-Caddy doesn't survive a reboot, but you don't have to restart it by hand: the next `dev up`/`dev forward` prints `Caddy not running, starting...` and brings it back up unprivileged against `~/.dev/caddy/Caddyfile`. Don't use `brew services start caddy`: that service runs `caddy run --config "$(brew --prefix)/etc/Caddyfile"`, a different file a stock install doesn't create, so it crash-loops under `KeepAlive` and never serves `dev`'s site fragments. If you want Caddy up before the first `dev` command of a session, install a per-user `launchd` agent in `~/Library/LaunchAgents/` that runs `caddy run --config /Users/<you>/.dev/caddy/Caddyfile`. Spell that path out in full — `launchd` does not expand `~` in `ProgramArguments` — and keep the agent unprivileged so it shares the same `tls internal` CA your browser already trusts from `dev`'s own auto-start.
+Caddy doesn't survive a reboot, but you don't have to restart it by hand: the next `dev up`/`dev forward` prints `Caddy not running, starting...` and brings it back up unprivileged against `~/.dev/caddy/Caddyfile`. Don't use `brew services start caddy`: that service runs `caddy run --config "$(brew --prefix)/etc/Caddyfile"`, a different file a stock install doesn't create, so it crash-loops under `KeepAlive` and never serves `dev`'s site fragments. If you want Caddy up before the first `dev` command of a session, wait until a `dev up`/`dev forward` has created `~/.dev/caddy/Caddyfile` — an agent pointed at a config that doesn't exist yet fails the same way `brew services` does — then install a per-user `launchd` agent in `~/Library/LaunchAgents/` that runs `caddy run --config /Users/<you>/.dev/caddy/Caddyfile`. Spell that path out in full — `launchd` does not expand `~` in `ProgramArguments` — and keep the agent unprivileged so it shares the same `tls internal` CA your browser already trusts from `dev`'s own auto-start.
 
 After first-time DNS setup, flush your browser/system DNS cache or `.test` may not resolve immediately:
 
@@ -251,14 +251,16 @@ For ad-hoc forwarding (a port not in `forwardPorts`, or a custom subdomain like 
 dev forward 3000                            # forward 3000 → 3000
 dev forward 8080:3000                       # host 8080 → container 3000
 dev forward 3000 --name admin.appname.test  # custom .test subdomain
+dev forward 3000 -d                         # run in the background
 dev forward 3000 --keepalive 30s
 dev forward 3000 --stop                     # stop a forwarder
 dev forward 3000 --list                     # list this workspace's forwarders
 ```
 
 `--name` is used verbatim as the Caddy site hostname, so include the `.test` suffix — a name
-without it won't resolve through the dnsmasq `.test` resolver. `--list` reports every forwarder
-for the workspace, but the port argument is still required by the CLI (it is ignored).
+without it won't resolve through the dnsmasq `.test` resolver. `--list` reports the workspace's
+daemonized (`-d`) forwarders — those are the only ones that record a PID file — but the port
+argument is still required by the CLI (it is ignored).
 
 Without `-d`, `dev forward <port>` runs in the foreground and blocks until you `Ctrl-C`, which is
 the only way to stop it — only `-d` forwarders record a PID file, so `--stop` can't target a
