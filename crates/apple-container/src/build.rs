@@ -196,7 +196,7 @@ pub async fn build_image(
     // Process the bidirectional stream.
     process_build_stream(
         &mut server_stream,
-        client_tx,
+        BuilderSink::new(client_tx),
         &build_id,
         &abs_context,
         verbose,
@@ -316,7 +316,7 @@ pub async fn tag_image(reference: &str, new_reference: &str) -> Result<(), Apple
 /// and build output (IO with stdout/stderr). We respond with file data.
 async fn process_build_stream(
     server_stream: &mut tonic::Streaming<ServerStream>,
-    client_tx: tokio::sync::mpsc::Sender<ClientStream>,
+    builder: BuilderSink,
     _build_id: &str,
     context: &Path,
     verbose: bool,
@@ -354,7 +354,7 @@ async fn process_build_stream(
                 // The Go StdioProxy.Write() calls Request() which blocks until
                 // the client sends an ack response. Without this, the entire
                 // build pipeline stalls (clog() never returns, resolver never runs).
-                send_io_ack(&client_tx, reply_id).await?;
+                send_io_ack(&builder, reply_id).await?;
             }
             Some(server_stream::PacketType::BuildError(err)) => {
                 return Err(AppleContainerError::XpcError(format!(
@@ -364,7 +364,7 @@ async fn process_build_stream(
             }
             Some(server_stream::PacketType::CommandComplete(ref _cmd)) => {}
             Some(server_stream::PacketType::BuildTransfer(transfer)) => {
-                handle_build_transfer(&transfer, &client_tx, reply_id, session.context).await?;
+                handle_build_transfer(&transfer, &builder, reply_id, session.context).await?;
             }
             Some(server_stream::PacketType::ImageTransfer(ref transfer)) => {
                 let stage = transfer
@@ -378,9 +378,9 @@ async fn process_build_stream(
                     .map(|s| s.as_str())
                     .unwrap_or("");
                 if stage == "resolver" && method == "/resolve" {
-                    handle_image_resolve(transfer, &client_tx, reply_id, &mut session).await?;
+                    handle_image_resolve(transfer, &builder, reply_id, &mut session).await?;
                 } else if stage == "content-store" {
-                    handle_content_store(transfer, method, &client_tx, reply_id, &mut session)
+                    handle_content_store(transfer, method, &builder, reply_id, &mut session)
                         .await?;
                 }
             }
@@ -424,29 +424,43 @@ fn handle_io(io: &proto::Io, verbose: bool) {
     }
 }
 
-/// Hand one packet to the builder, or fail once the stream has stalled.
+/// The outbound half of the build stream: where replies go, and how long one
+/// may stall before the build gives up on it.
 ///
-/// Every reply leaves through here so the deadline and the fatality rule are
-/// applied once rather than restated at each call site.
-///
-/// A failure to enqueue is fatal in either form: the builder is waiting for
-/// this packet and has no deadline of its own, so a swallowed error — or an
-/// unbounded wait — hangs the build with nothing to report.
-async fn send_to_builder(
-    client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
-    message: ClientStream,
-    what: &str,
-) -> Result<(), AppleContainerError> {
-    match tokio::time::timeout(BUILDER_IDLE_TIMEOUT, client_tx.send(message)).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(AppleContainerError::XpcError(format!(
-            "failed to send {what}: {e}"
-        ))),
-        Err(_) => Err(AppleContainerError::XpcError(format!(
-            "builder stopped accepting packets for {}s while sending {what}; \
-             giving up on the build",
-            BUILDER_IDLE_TIMEOUT.as_secs()
-        ))),
+/// Pairing the deadline with the channel it governs keeps the two from
+/// drifting, and every reply leaves through [`BuilderSink::send`] so the bound
+/// is applied once rather than restated at each call site.
+struct BuilderSink {
+    packets: tokio::sync::mpsc::Sender<ClientStream>,
+    /// How long a single send may make no progress. Only tests set this to
+    /// anything but [`BUILDER_IDLE_TIMEOUT`].
+    idle: std::time::Duration,
+}
+
+impl BuilderSink {
+    fn new(packets: tokio::sync::mpsc::Sender<ClientStream>) -> Self {
+        Self {
+            packets,
+            idle: BUILDER_IDLE_TIMEOUT,
+        }
+    }
+
+    /// Hand one packet to the builder, or fail once the stream has stalled.
+    ///
+    /// A failure to enqueue is fatal in either form: the builder is waiting for
+    /// this packet and has no deadline of its own, so a swallowed error — or an
+    /// unbounded wait — hangs the build with nothing to report.
+    async fn send(&self, message: ClientStream, what: &str) -> Result<(), AppleContainerError> {
+        match tokio::time::timeout(self.idle, self.packets.send(message)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(AppleContainerError::XpcError(format!(
+                "failed to send {what}: {e}"
+            ))),
+            Err(_) => Err(AppleContainerError::XpcError(format!(
+                "builder stopped accepting packets while sending {what}; \
+                 giving up on the build"
+            ))),
+        }
     }
 }
 
@@ -455,10 +469,7 @@ async fn send_to_builder(
 /// The Go builder shim's StdioProxy.Write() blocks until the client sends a
 /// `Run` command containing a base64-encoded `{"command_type":"terminal","code":"ack"}`
 /// JSON payload.  Without this ack the entire build pipeline deadlocks.
-async fn send_io_ack(
-    client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
-    build_id: &str,
-) -> Result<(), AppleContainerError> {
+async fn send_io_ack(builder: &BuilderSink, build_id: &str) -> Result<(), AppleContainerError> {
     const ACK_JSON: &str = r#"{"command_type":"terminal","code":"ack","rows":0,"cols":0}"#;
     let ack_b64 = base64_encode(ACK_JSON.as_bytes())
         .trim_end_matches('=')
@@ -472,7 +483,7 @@ async fn send_io_ack(
         })),
     };
 
-    send_to_builder(client_tx, response, "the IO ack").await
+    builder.send(response, "the IO ack").await
 }
 
 /// Handle BuildTransfer packets — the server asking for file data (fssync).
@@ -484,7 +495,7 @@ async fn send_io_ack(
 /// We respond with BuildTransfer packets containing the requested data.
 async fn handle_build_transfer(
     transfer: &BuildTransfer,
-    client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
+    builder: &BuilderSink,
     build_id: &str,
     context: &Path,
 ) -> Result<(), AppleContainerError> {
@@ -505,9 +516,9 @@ async fn handle_build_transfer(
 
     // The builder shim sends capitalized method names (Walk, Read, Info).
     match method {
-        "walk" | "Walk" => handle_walk(transfer, client_tx, build_id, context).await,
-        "read" | "Read" => handle_read(transfer, client_tx, build_id, context).await,
-        "info" | "Info" => handle_info(transfer, client_tx, build_id, context).await,
+        "walk" | "Walk" => handle_walk(transfer, builder, build_id, context).await,
+        "read" | "Read" => handle_read(transfer, builder, build_id, context).await,
+        "info" | "Info" => handle_info(transfer, builder, build_id, context).await,
         _ => Ok(()),
     }
 }
@@ -523,7 +534,7 @@ fn fssync_metadata(method: &str) -> HashMap<String, String> {
 
 /// Send one `BuildTransfer` reply on the request's id.
 async fn send_build_transfer(
-    client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
+    builder: &BuilderSink,
     build_id: &str,
     transfer: &BuildTransfer,
     metadata: HashMap<String, String>,
@@ -545,7 +556,7 @@ async fn send_build_transfer(
         })),
     };
 
-    send_to_builder(client_tx, response, "an fssync reply").await
+    builder.send(response, "an fssync reply").await
 }
 
 /// Tell the builder a request failed instead of leaving it waiting.
@@ -553,7 +564,7 @@ async fn send_build_transfer(
 /// Every shim receiver checks `metadata["error"]` first, so this turns what
 /// would otherwise be an unbounded wait into a reported build failure.
 async fn send_fssync_error(
-    client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
+    builder: &BuilderSink,
     build_id: &str,
     transfer: &BuildTransfer,
     method: &str,
@@ -562,7 +573,7 @@ async fn send_fssync_error(
     let mut metadata = fssync_metadata(method);
     metadata.insert("error".to_string(), message.to_string());
     send_build_transfer(
-        client_tx,
+        builder,
         build_id,
         transfer,
         metadata,
@@ -583,7 +594,7 @@ async fn send_fssync_error(
 /// allocation.
 async fn handle_walk(
     transfer: &BuildTransfer,
-    client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
+    builder: &BuilderSink,
     build_id: &str,
     context: &Path,
 ) -> Result<(), AppleContainerError> {
@@ -591,7 +602,7 @@ async fn handle_walk(
     let prepared = match prepare_walk(context, &filter, &transfer.metadata).await {
         Ok(prepared) => prepared,
         Err(e) => {
-            send_fssync_error(client_tx, build_id, transfer, "Walk", &e.to_string()).await?;
+            send_fssync_error(builder, build_id, transfer, "Walk", &e.to_string()).await?;
             return Err(e);
         }
     };
@@ -600,7 +611,7 @@ async fn handle_walk(
     let mut hash_metadata = fssync_metadata("Walk");
     hash_metadata.insert("hash".to_string(), checksum.clone());
     send_build_transfer(
-        client_tx,
+        builder,
         build_id,
         transfer,
         hash_metadata,
@@ -610,7 +621,7 @@ async fn handle_walk(
     )
     .await?;
 
-    stream_walk_archive(entries, &checksum, client_tx, build_id, transfer).await
+    stream_walk_archive(entries, &checksum, builder, build_id, transfer).await
 }
 
 /// Collect the context and hash the archive it will produce.
@@ -654,7 +665,7 @@ async fn prepare_walk(
 async fn stream_walk_archive(
     entries: Vec<fssync::ContextEntry>,
     announced: &str,
-    client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
+    builder: &BuilderSink,
     build_id: &str,
     transfer: &BuildTransfer,
 ) -> Result<(), AppleContainerError> {
@@ -679,7 +690,7 @@ async fn stream_walk_archive(
     while let Some(chunk) = chunk_rx.recv().await {
         if let Some(previous) = pending.replace(chunk) {
             send_build_transfer(
-                client_tx,
+                builder,
                 build_id,
                 transfer,
                 fssync_metadata("Walk"),
@@ -696,7 +707,7 @@ async fn stream_walk_archive(
     let streamed = match join_blocking(writer).await {
         Ok(streamed) => streamed,
         Err(e) => {
-            send_fssync_error(client_tx, build_id, transfer, "Walk", &e.to_string()).await?;
+            send_fssync_error(builder, build_id, transfer, "Walk", &e.to_string()).await?;
             return Err(e);
         }
     };
@@ -704,14 +715,14 @@ async fn stream_walk_archive(
         let e = AppleContainerError::XpcError(format!(
             "build context changed while it was being sent: announced {announced}, sent {streamed}"
         ));
-        send_fssync_error(client_tx, build_id, transfer, "Walk", &e.to_string()).await?;
+        send_fssync_error(builder, build_id, transfer, "Walk", &e.to_string()).await?;
         return Err(e);
     }
 
     // `readTarHeader` blocks until at least one data packet arrives, so an
     // empty context still has to send its end-of-archive marker.
     send_build_transfer(
-        client_tx,
+        builder,
         build_id,
         transfer,
         fssync_metadata("Walk"),
@@ -748,7 +759,7 @@ async fn join_blocking<T>(
 /// would otherwise silently build an image whose files are all empty.
 async fn handle_read(
     transfer: &BuildTransfer,
-    client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
+    builder: &BuilderSink,
     build_id: &str,
     context: &Path,
 ) -> Result<(), AppleContainerError> {
@@ -762,14 +773,14 @@ async fn handle_read(
         Ok(data) => data,
         Err(e) => {
             let message = format!("cannot read {source}: {e}");
-            return send_fssync_error(client_tx, build_id, transfer, "Read", &message).await;
+            return send_fssync_error(builder, build_id, transfer, "Read", &message).await;
         }
     };
 
     let mut metadata = fssync_metadata("Read");
     metadata.insert("offset".to_string(), offset.to_string());
     metadata.insert("length".to_string(), data.len().to_string());
-    send_build_transfer(client_tx, build_id, transfer, metadata, data, true, false).await
+    send_build_transfer(builder, build_id, transfer, metadata, data, true, false).await
 }
 
 /// Answer an fssync `Info` with a context path's metadata.
@@ -779,7 +790,7 @@ async fn handle_read(
 /// becomes a zero, so a JSON body in `data` reads as an empty file.
 async fn handle_info(
     transfer: &BuildTransfer,
-    client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
+    builder: &BuilderSink,
     build_id: &str,
     context: &Path,
 ) -> Result<(), AppleContainerError> {
@@ -796,7 +807,7 @@ async fn handle_info(
             // A missing path is routine — BuildKit probes for `.dockerignore`
             // on every build — so report it and let the builder decide.
             let message = format!("cannot stat {source}: {e}");
-            return send_fssync_error(client_tx, build_id, transfer, "Info", &message).await;
+            return send_fssync_error(builder, build_id, transfer, "Info", &message).await;
         }
     };
 
@@ -816,7 +827,7 @@ async fn handle_info(
     }
 
     send_build_transfer(
-        client_tx,
+        builder,
         build_id,
         transfer,
         metadata,
@@ -905,7 +916,7 @@ fn platform_resolver(
 /// builder doesn't have to pull through the slow vsock network.
 async fn handle_image_resolve(
     transfer: &ImageTransfer,
-    client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
+    builder: &BuilderSink,
     build_id: &str,
     session: &mut BuildSession<'_>,
 ) -> Result<(), AppleContainerError> {
@@ -979,7 +990,7 @@ async fn handle_image_resolve(
             metadata,
         })),
     };
-    send_to_builder(client_tx, response, "the resolver reply").await
+    builder.send(response, "the resolver reply").await
 }
 
 /// Handle content-store requests from the builder (BuildRemoteContentProxy).
@@ -994,7 +1005,7 @@ async fn handle_image_resolve(
 async fn handle_content_store(
     transfer: &ImageTransfer,
     method: &str,
-    client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
+    builder: &BuilderSink,
     build_id: &str,
     session: &mut BuildSession<'_>,
 ) -> Result<(), AppleContainerError> {
@@ -1004,7 +1015,7 @@ async fn handle_content_store(
 
     let Some(digest) = content_digest(transfer) else {
         return send_content_error(
-            client_tx,
+            builder,
             build_id,
             transfer,
             method,
@@ -1017,7 +1028,7 @@ async fn handle_content_store(
         Some(size) => size,
         None => {
             let message = format!("blob {digest} is not in the local content store");
-            return send_content_error(client_tx, build_id, transfer, method, &message).await;
+            return send_content_error(builder, build_id, transfer, method, &message).await;
         }
     };
 
@@ -1030,7 +1041,7 @@ async fn handle_content_store(
             Ok(data) => data,
             Err(e) => {
                 let message = format!("cannot read blob {digest}: {e}");
-                return send_content_error(client_tx, build_id, transfer, method, &message).await;
+                return send_content_error(builder, build_id, transfer, method, &message).await;
             }
         }
     } else {
@@ -1047,7 +1058,7 @@ async fn handle_content_store(
     metadata.insert("created_at".to_string(), stored_at.clone());
     metadata.insert("updated_at".to_string(), stored_at);
 
-    send_image_transfer(client_tx, build_id, transfer, &digest, metadata, data).await
+    send_image_transfer(builder, build_id, transfer, &digest, metadata, data).await
 }
 
 /// Metadata every content-store reply carries.
@@ -1114,7 +1125,7 @@ fn blob_timestamp(digest: &str) -> String {
 
 /// Send one content-store reply.
 async fn send_image_transfer(
-    client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
+    builder: &BuilderSink,
     build_id: &str,
     transfer: &ImageTransfer,
     digest: &str,
@@ -1134,12 +1145,12 @@ async fn send_image_transfer(
         })),
     };
 
-    send_to_builder(client_tx, response, "a content-store reply").await
+    builder.send(response, "a content-store reply").await
 }
 
 /// Report a content-store failure rather than leaving the builder waiting.
 async fn send_content_error(
-    client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
+    builder: &BuilderSink,
     build_id: &str,
     transfer: &ImageTransfer,
     method: &str,
@@ -1148,7 +1159,7 @@ async fn send_content_error(
     let mut metadata = content_store_metadata(method);
     metadata.insert("error".to_string(), message.to_string());
     send_image_transfer(
-        client_tx,
+        builder,
         build_id,
         transfer,
         &transfer.tag.clone(),
@@ -1575,26 +1586,35 @@ mod tests {
             .block_on(future)
     }
 
-    /// Run on a clock that jumps ahead whenever the future is only waiting on a
-    /// timer, so a deadline can be reached without spending it.
-    fn run_paused<F: std::future::Future>(future: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .start_paused(true)
-            .build()
-            .expect("test runtime")
-            .block_on(future)
+    /// A sink whose sends are bounded the way production's are.
+    fn sink(packets: &tokio::sync::mpsc::Sender<ClientStream>) -> BuilderSink {
+        BuilderSink::new(packets.clone())
+    }
+
+    /// A sink that gives up on a stalled send almost immediately.
+    ///
+    /// The deadline tests need to reach the give-up path, and the real budget
+    /// is ten minutes. Shortening the budget rather than accelerating the clock
+    /// keeps them on a real timer: `stream_walk_archive` drives its archive on
+    /// the blocking pool, and a paused clock deliberately stops advancing while
+    /// blocking work is outstanding, so a test written against one would be
+    /// reasoning about the runtime's bookkeeping instead of the deadline.
+    fn impatient_sink(packets: &tokio::sync::mpsc::Sender<ClientStream>) -> BuilderSink {
+        BuilderSink {
+            packets: packets.clone(),
+            idle: std::time::Duration::from_millis(50),
+        }
     }
 
     /// Await something that must bound itself, failing rather than hanging if
     /// it does not.
     ///
-    /// The outer deadline is the backstop: on the paused clock it is only
-    /// reached when the work under test registered no deadline of its own, so
-    /// a regression that drops the bound is a failed assertion instead of a
+    /// The backstop is far above [`impatient_sink`]'s budget, so it is only
+    /// reached when the work under test registered no deadline at all — a
+    /// regression that drops the bound is then a failed assertion instead of a
     /// test run that never finishes.
     async fn must_bound_itself<F: std::future::Future>(future: F) -> F::Output {
-        tokio::time::timeout(BUILDER_IDLE_TIMEOUT * 2, future)
+        tokio::time::timeout(std::time::Duration::from_secs(30), future)
             .await
             .expect("the build stream must bound this itself rather than wait forever")
     }
@@ -1653,7 +1673,8 @@ mod tests {
             ".",
         );
 
-        run(handle_walk(&request, &tx, REPLY_ID, dir.path())).expect("a tar walk must succeed");
+        run(handle_walk(&request, &sink(&tx), REPLY_ID, dir.path()))
+            .expect("a tar walk must succeed");
         let replies = drain(&mut rx);
 
         assert!(replies.len() >= 2, "expected a hash packet and an archive");
@@ -1722,7 +1743,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let request = build_transfer(&[("method", "Walk"), ("mode", "tar")], ".");
 
-        run(handle_walk(&request, &tx, REPLY_ID, dir.path())).expect("walk");
+        run(handle_walk(&request, &sink(&tx), REPLY_ID, dir.path())).expect("walk");
 
         for (build_id, transfer) in drain(&mut rx) {
             assert_eq!(build_id, REPLY_ID);
@@ -1738,7 +1759,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let request = build_transfer(&[("method", "Walk"), ("mode", "json")], ".");
 
-        let outcome = run(handle_walk(&request, &tx, REPLY_ID, dir.path()));
+        let outcome = run(handle_walk(&request, &sink(&tx), REPLY_ID, dir.path()));
         assert!(
             outcome.is_err(),
             "an unsupported mode must not report success"
@@ -1763,7 +1784,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let request = build_transfer(&[("method", "Walk"), ("mode", "tar")], ".");
 
-        run(handle_walk(&request, &tx, REPLY_ID, dir.path())).expect("walk");
+        run(handle_walk(&request, &sink(&tx), REPLY_ID, dir.path())).expect("walk");
         let replies = drain(&mut rx);
 
         assert!(
@@ -1792,7 +1813,7 @@ mod tests {
             ".",
         );
 
-        run(handle_walk(&request, &tx, REPLY_ID, dir.path())).expect("walk");
+        run(handle_walk(&request, &sink(&tx), REPLY_ID, dir.path())).expect("walk");
         let replies = drain(&mut rx);
 
         let archive: Vec<u8> = replies[1..]
@@ -1822,7 +1843,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let request = build_transfer(&[("method", "Walk"), ("mode", "tar")], ".");
 
-        run(handle_walk(&request, &tx, REPLY_ID, dir.path())).expect("walk");
+        run(handle_walk(&request, &sink(&tx), REPLY_ID, dir.path())).expect("walk");
         let replies = drain(&mut rx);
 
         let data = &replies[1..];
@@ -1869,7 +1890,11 @@ mod tests {
         let stale = "0".repeat(64);
 
         let outcome = run(stream_walk_archive(
-            entries, &stale, &tx, REPLY_ID, &request,
+            entries,
+            &stale,
+            &sink(&tx),
+            REPLY_ID,
+            &request,
         ));
         assert!(
             outcome.is_err(),
@@ -1894,14 +1919,14 @@ mod tests {
     // ---- the build stream is bidirectional, so a send that cannot be
     // delivered has to fail the way a receive that never arrives does ----
 
-    /// A packet that the builder never accepts must fail with the idle budget,
+    /// A packet that the builder never accepts must fail on the idle budget,
     /// not park forever. This is the both-sides-blocked shape: the shim stops
     /// draining because it is itself blocked handing us a packet the receive
     /// loop is not reading while this send is outstanding, so neither side ever
-    /// moves and `BUILDER_IDLE_TIMEOUT` is the only thing that can break it.
+    /// moves and the sink's own deadline is the only thing that can break it.
     #[test]
     fn a_send_the_builder_never_accepts_fails_on_the_idle_budget() {
-        let outcome = run_paused(async {
+        let outcome = run(async {
             // Capacity one, already full and never drained: the next send can
             // only complete once the builder consumes, which it never does.
             let (tx, _rx) = tokio::sync::mpsc::channel::<ClientStream>(1);
@@ -1912,8 +1937,7 @@ mod tests {
             .await
             .expect("the first packet fits");
 
-            must_bound_itself(send_to_builder(
-                &tx,
+            must_bound_itself(impatient_sink(&tx).send(
                 ClientStream {
                     build_id: REPLY_ID.to_string(),
                     packet_type: None,
@@ -1944,15 +1968,15 @@ mod tests {
         let outcome = run(async {
             let (tx, rx) = tokio::sync::mpsc::channel::<ClientStream>(1);
             drop(rx);
-            send_to_builder(
-                &tx,
-                ClientStream {
-                    build_id: REPLY_ID.to_string(),
-                    packet_type: None,
-                },
-                "the resolver reply",
-            )
-            .await
+            sink(&tx)
+                .send(
+                    ClientStream {
+                        build_id: REPLY_ID.to_string(),
+                        packet_type: None,
+                    },
+                    "the resolver reply",
+                )
+                .await
         });
 
         let message = outcome
@@ -1967,20 +1991,24 @@ mod tests {
     /// The walk streams the archive through the same bounded send, so a shim
     /// that stops reading fails the transfer instead of pinning the receive
     /// loop and a blocking-pool thread for the rest of the build.
+    ///
+    /// The context is several chunks so the loop is genuinely mid-transfer when
+    /// the sink stops accepting, which is the case that holds the receive loop
+    /// longest.
     #[test]
     fn a_walk_whose_packets_are_never_drained_fails_on_the_idle_budget() {
-        let payload = "0123456789abcdef".repeat(fssync::CONTEXT_CHUNK_SIZE / 8);
+        let payload = "0123456789abcdef".repeat(fssync::CONTEXT_CHUNK_SIZE / 2);
         let dir = context_with(&[("big.bin", payload.as_str())]);
         let request = build_transfer(&[("method", "Walk"), ("mode", "tar")], ".");
 
-        let outcome = run_paused(async {
+        let outcome = run(async {
             let (tx, _rx) = tokio::sync::mpsc::channel::<ClientStream>(1);
             let entries = fssync::collect_context(dir.path(), &fssync::ContextFilter::default())
                 .expect("context walk");
             must_bound_itself(stream_walk_archive(
                 entries,
                 &"0".repeat(64),
-                &tx,
+                &impatient_sink(&tx),
                 REPLY_ID,
                 &request,
             ))
@@ -2005,7 +2033,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let request = build_transfer(&[("method", "Info")], "app.txt");
 
-        run(handle_info(&request, &tx, REPLY_ID, dir.path())).expect("info");
+        run(handle_info(&request, &sink(&tx), REPLY_ID, dir.path())).expect("info");
         let replies = drain(&mut rx);
 
         let (_, reply) = &replies[0];
@@ -2029,7 +2057,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let request = build_transfer(&[("method", "Info")], "src");
 
-        run(handle_info(&request, &tx, REPLY_ID, dir.path())).expect("info");
+        run(handle_info(&request, &sink(&tx), REPLY_ID, dir.path())).expect("info");
         assert!(drain(&mut rx)[0].1.is_directory);
     }
 
@@ -2041,7 +2069,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let request = build_transfer(&[("method", "Info")], ".dockerignore");
 
-        run(handle_info(&request, &tx, REPLY_ID, dir.path())).expect("info");
+        run(handle_info(&request, &sink(&tx), REPLY_ID, dir.path())).expect("info");
         assert!(drain(&mut rx)[0].1.metadata.contains_key("error"));
     }
 
@@ -2056,7 +2084,7 @@ mod tests {
             "app.txt",
         );
 
-        run(handle_read(&request, &tx, REPLY_ID, dir.path())).expect("read");
+        run(handle_read(&request, &sink(&tx), REPLY_ID, dir.path())).expect("read");
         assert_eq!(drain(&mut rx)[0].1.data, b"234");
     }
 
@@ -2069,7 +2097,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let request = build_transfer(&[("method", "Read"), ("offset", "4")], "app.txt");
 
-        run(handle_read(&request, &tx, REPLY_ID, dir.path())).expect("read");
+        run(handle_read(&request, &sink(&tx), REPLY_ID, dir.path())).expect("read");
         assert_eq!(
             drain(&mut rx)[0].1.data,
             b"456789",
@@ -2086,7 +2114,7 @@ mod tests {
             "app.txt",
         );
 
-        run(handle_read(&request, &tx, REPLY_ID, dir.path())).expect("read");
+        run(handle_read(&request, &sink(&tx), REPLY_ID, dir.path())).expect("read");
         assert!(
             drain(&mut rx)[0].1.data.is_empty(),
             "the shim reads an empty payload as EOF"
