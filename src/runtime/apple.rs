@@ -789,10 +789,9 @@ async fn run_captured_process(
     drop(stdout_write);
     drop(stderr_write);
 
-    // The readers drain on the blocking pool, so a process that fills a pipe
-    // buffer can still reach its exit.
-    let stdout_task = read_pipe(stdout_read);
-    let stderr_task = read_pipe(stderr_read);
+    // Drained from here on, so a process that fills a pipe buffer can still
+    // reach its exit.
+    let output = OutputReaders::draining(stdout_read, stderr_read)?;
 
     let (issued, on_the_wire) = tokio::sync::oneshot::channel();
     let exit_wait = daemon.wait_process(id, &process_id, issued);
@@ -801,31 +800,73 @@ async fn run_captured_process(
     if let Err(e) =
         start_with_registered_exit_wait("exec", &mut exit_wait, on_the_wire, start).await
     {
-        // The wait is already registered with the daemon and the readers only
-        // finish at EOF. Tear the process down so both are released, then
-        // report the failure instead of blocking on them.
-        let _ = daemon.kill_process(id, &process_id, libc::SIGKILL).await;
+        abandon_process(daemon, id, &process_id, output).await;
         return Err(e);
     }
 
     let exit_code = match exit_wait.await {
         Ok(code) => code,
         Err(e) => {
-            // Waiting failed while the process may still be running, and the
-            // readers only finish at EOF. Stop the process so they do, and
-            // report the wait failure instead of blocking on it.
-            let _ = daemon.kill_process(id, &process_id, libc::SIGKILL).await;
+            abandon_process(daemon, id, &process_id, output).await;
             return Err(DevError::Runtime(format!("exec wait failed: {e}")));
         }
     };
 
-    let (stdout_buf, stderr_buf) = tokio::join!(stdout_task, stderr_task);
-
+    let (stdout, stderr) = output.collected().await?;
     Ok(ExecResult {
         exit_code,
-        stdout: finish_read(stdout_buf, "stdout")?,
-        stderr: finish_read(stderr_buf, "stderr")?,
+        stdout,
+        stderr,
     })
+}
+
+/// Give up on a process whose exec failed, releasing what it still holds.
+///
+/// Both halves matter. The exit wait is already registered with the daemon, so
+/// the process is killed to have that wait answered rather than left
+/// outstanding. The output readers are then cancelled rather than waited out:
+/// a process the daemon refused to start has no exit to close the write ends
+/// it dup'd in `create_process`, and a kill closes nothing for a process that
+/// never ran, so those readers would never reach EOF.
+async fn abandon_process(
+    daemon: &dyn ExecDaemon,
+    id: &str,
+    process_id: &str,
+    output: OutputReaders,
+) {
+    let _ = daemon.kill_process(id, process_id, libc::SIGKILL).await;
+    output.released().await;
+}
+
+/// The pair of readers draining one captured exec's output.
+struct OutputReaders {
+    stdout: tokio::task::JoinHandle<std::io::Result<String>>,
+    stderr: tokio::task::JoinHandle<std::io::Result<String>>,
+}
+
+impl OutputReaders {
+    fn draining(
+        stdout: os_pipe::PipeReader,
+        stderr: os_pipe::PipeReader,
+    ) -> Result<Self, DevError> {
+        Ok(Self {
+            stdout: read_pipe(stdout, "stdout")?,
+            stderr: read_pipe(stderr, "stderr")?,
+        })
+    }
+
+    /// What both readers read, once each has reached EOF.
+    async fn collected(self) -> Result<(String, String), DevError> {
+        let (stdout, stderr) = tokio::join!(self.stdout, self.stderr);
+        Ok((finish_read(stdout, "stdout")?, finish_read(stderr, "stderr")?))
+    }
+
+    /// Cancel both readers and wait for them to let go of the pipes.
+    async fn released(self) {
+        self.stdout.abort();
+        self.stderr.abort();
+        let _ = tokio::join!(self.stdout, self.stderr);
+    }
 }
 
 /// Create a pipe, mapping the OS error into a runtime error.
@@ -833,13 +874,26 @@ fn exec_pipe() -> Result<(os_pipe::PipeReader, os_pipe::PipeWriter), DevError> {
     os_pipe::pipe().map_err(|e| DevError::Runtime(format!("pipe: {e}")))
 }
 
-/// Drain a pipe to a string on the blocking pool.
-fn read_pipe(mut reader: os_pipe::PipeReader) -> tokio::task::JoinHandle<std::io::Result<String>> {
-    tokio::task::spawn_blocking(move || {
-        use std::io::Read;
+/// Drain a pipe to a string in a task that can be cancelled.
+///
+/// Read through the reactor rather than by parking a thread on the descriptor,
+/// because only the former can be given up on. The daemon holds its own copy
+/// of the write end for a process it never started, so such a read never sees
+/// EOF; a blocking-pool thread stuck in it outlives the failed command, and
+/// the tokio runtime waits for that pool as it shuts down, so `dev exec` and
+/// `dev up` would exit only after printing nothing — the issue #4 hang, moved
+/// onto the failure path.
+fn read_pipe(
+    reader: os_pipe::PipeReader,
+    stream: &str,
+) -> Result<tokio::task::JoinHandle<std::io::Result<String>>, DevError> {
+    let mut reader = tokio::net::unix::pipe::Receiver::from_owned_fd(reader.into())
+        .map_err(|e| DevError::Runtime(format!("watch {stream}: {e}")))?;
+    Ok(tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
         let mut buf = String::new();
-        reader.read_to_string(&mut buf).map(|_| buf)
-    })
+        reader.read_to_string(&mut buf).await.map(|_| buf)
+    }))
 }
 
 /// Unwrap the two error layers a [`read_pipe`] task can fail with.
@@ -1399,10 +1453,16 @@ mod tests {
         exit_code: i32,
         start_fails: bool,
         wait_fails: bool,
+        /// Refuse the wait only once the process is running, so the failure
+        /// lands on the caller's exit wait instead of on its start. The
+        /// process is left running, as it is when a real wait breaks.
+        wait_fails_after_the_start: bool,
         /// Hold the wait's request back before it reaches the daemon, the way
         /// a contended blocking pool delays the thread carrying it.
         delay_wait_request: bool,
         stdin_reached_eof: AtomicBool,
+        /// Set once `start_process` has run the process.
+        started: AtomicBool,
         /// Set once `start_process` has run the process to completion.
         exited: AtomicBool,
     }
@@ -1462,6 +1522,15 @@ mod tests {
             }
         }
 
+        /// Runs the process, then refuses its exit wait while it is still
+        /// going — so nothing has closed the process's output pipes.
+        fn failing_wait_on_a_running_process() -> Self {
+            Self {
+                wait_fails_after_the_start: true,
+                ..Self::default()
+            }
+        }
+
         /// Produces output and exits, but its wait request is slow to reach
         /// the daemon.
         fn with_a_slow_wait_request(stdout: &str, exit_code: i32) -> Self {
@@ -1480,12 +1549,32 @@ mod tests {
         }
 
         /// Close the daemon's copies of the output pipes, as a process exiting
-        /// (or being killed) does.
+        /// does.
         fn close_output(&self) {
             if let Some(held) = self.held.lock().unwrap().as_mut() {
                 held.stdout.take();
                 held.stderr.take();
             }
+        }
+
+        /// Whether the caller still has the output pipes open.
+        ///
+        /// A write to a pipe whose read end is gone fails with `EPIPE` — Rust
+        /// ignores `SIGPIPE`, so it is an error and not a signal — which is
+        /// how the daemon's side of a released reader is visible from here.
+        fn output_readers_attached(&self) -> bool {
+            let held = self.held.lock().unwrap();
+            let held = held.as_ref().expect("probe without create");
+            [held.stdout.as_ref(), held.stderr.as_ref()]
+                .into_iter()
+                .flatten()
+                .any(|end| {
+                    let byte = 0u8;
+                    let written = unsafe {
+                        libc::write(end.as_raw_fd(), std::ptr::addr_of!(byte).cast(), 1)
+                    };
+                    written == 1
+                })
         }
     }
 
@@ -1527,6 +1616,12 @@ mod tests {
                     write_fd(held.stdout.as_ref().expect("stdout"), &self.stdout);
                     write_fd(held.stderr.as_ref().expect("stderr"), &self.stderr);
                 }
+                self.started.store(true, Ordering::SeqCst);
+                if self.wait_fails_after_the_start {
+                    // Still running: its pipes stay open, as they do for any
+                    // process that has not exited yet.
+                    return Ok(());
+                }
                 // The command runs to completion and exits, closing its pipes.
                 self.exited.store(true, Ordering::SeqCst);
                 self.close_output();
@@ -1565,6 +1660,20 @@ mod tests {
                 if self.wait_fails {
                     return Err(AppleContainerError::XpcError("wait refused".to_string()));
                 }
+                if self.wait_fails_after_the_start {
+                    // Answered only once the process is running, so the
+                    // caller is past its start step when this fails.
+                    return std::future::poll_fn(move |_| {
+                        if self.started.load(Ordering::SeqCst) {
+                            std::task::Poll::Ready(Err(AppleContainerError::XpcError(
+                                "wait refused".to_string(),
+                            )))
+                        } else {
+                            std::task::Poll::Pending
+                        }
+                    })
+                    .await;
+                }
                 if self.exited.load(Ordering::SeqCst) {
                     // The exit is already recorded, so this is a wait the
                     // daemon drops: it is never answered.
@@ -1590,9 +1699,11 @@ mod tests {
             _signal: i32,
         ) -> DaemonFut<'a, ()> {
             self.record("kill");
-            // A killed process closes its pipes, which is what lets the
-            // caller's readers finish instead of blocking at EOF.
-            self.close_output();
+            // Deliberately closes nothing. Only a process closes its own
+            // pipes, by exiting; the daemon holds the copies it dup'd in
+            // `create_process` whether or not the kill reaches anything, and
+            // for a process it refused to start there is nothing to kill at
+            // all. A caller that waits for EOF here waits forever.
             Box::pin(async { Ok(()) })
         }
     }
@@ -1753,6 +1864,67 @@ mod tests {
             daemon.calls().contains(&"kill"),
             "a failed start must stop the process, got: {:?}",
             daemon.calls()
+        );
+    }
+
+    /// What a released reader looks like from the daemon's side, with the
+    /// pipes closed afterwards so a regression fails this test instead of
+    /// wedging the whole suite on a reader still parked on them.
+    fn readers_released(daemon: &FakeExecDaemon) -> bool {
+        let attached = daemon.output_readers_attached();
+        daemon.close_output();
+        !attached
+    }
+
+    /// A daemon that refuses the start never runs the process, so nothing ever
+    /// closes the output pipes it dup'd: there is no process to exit, and a
+    /// kill closes nothing. Readers left on those pipes outlive the failed
+    /// command, and the tokio runtime waits for them as it shuts down — so
+    /// `dev exec -- /nonexistent-binary` printed nothing and never exited, and
+    /// `dev up`'s readiness diagnosis never reached the user.
+    #[tokio::test]
+    async fn a_refused_start_releases_the_output_readers() {
+        let daemon = FakeExecDaemon::failing_start();
+
+        let err = bounded_exec(&daemon)
+            .await
+            .expect_err("a failed start must surface as an error");
+
+        assert!(
+            format!("{err}").contains("exec start failed"),
+            "the real error must propagate, got: {err}"
+        );
+        assert!(
+            readers_released(&daemon),
+            "a refused start must release its output readers, not leave them \
+             on pipes the daemon still holds the write ends of"
+        );
+    }
+
+    /// The same for the other failure path: the process is running, its exit
+    /// wait breaks, and the kill that follows is no guarantee the daemon
+    /// closes anything. The readers have to be given up on either way.
+    #[tokio::test]
+    async fn a_refused_wait_releases_the_output_readers() {
+        let daemon = FakeExecDaemon::failing_wait_on_a_running_process();
+
+        let err = bounded_exec(&daemon)
+            .await
+            .expect_err("a failed wait must surface as an error");
+
+        assert!(
+            format!("{err}").contains("exec wait failed"),
+            "the real error must propagate, got: {err}"
+        );
+        assert!(
+            daemon.calls().contains(&"start"),
+            "this must fail on the exit wait of a started process, got: {:?}",
+            daemon.calls()
+        );
+        assert!(
+            readers_released(&daemon),
+            "a failed wait must release its output readers, not leave them on \
+             the pipes of a process nothing has closed"
         );
     }
 
