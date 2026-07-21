@@ -505,6 +505,13 @@ impl ReadinessPolls {
         self.next = (self.next * 2).min(READINESS_MAX_POLL);
         true
     }
+
+    /// What is left of the budget, for bounding an attempt rather than the gap
+    /// between two of them.
+    fn remaining(&self) -> std::time::Duration {
+        self.deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+    }
 }
 
 /// Confirm a just-started container is running, findable by the same
@@ -544,6 +551,12 @@ async fn verify_container_usable(
 /// The probe runs as the resolved `remoteUser`, since that is who lifecycle
 /// hooks, `dev exec` and `dev shell` run as — certifying root instead would
 /// pass for a config whose user does not exist in the image.
+///
+/// The call itself is bounded by what remains of the readiness budget, not just
+/// the gap between attempts. Issue #4's symptom was a `containerWait` the daemon
+/// dropped, which leaves the exec awaiting an exit that never comes — so a gate
+/// that only paced its retries would hang on the very failure it exists to
+/// catch, with `dev up` silent after "Starting container...".
 async fn verify_container_execs(
     runtime: &dyn ContainerRuntime,
     container_id: &str,
@@ -553,22 +566,32 @@ async fn verify_container_execs(
     let mut polls = ReadinessPolls::new();
 
     loop {
-        let failure = match runtime.exec(container_id, &probe, remote_user).await {
+        let attempt = tokio::time::timeout(
+            polls.remaining(),
+            runtime.exec(container_id, &probe, remote_user),
+        )
+        .await;
+
+        let failure = match attempt {
             // A process that ran to completion proves the create → start → wait
             // sequence works, whatever status it reported — and that sequence
             // is the whole of what this gate certifies. The status belongs to
             // the image, so it is passed on as it actually is.
-            Ok(result) => {
+            Ok(Ok(result)) => {
                 if result.exit_code != 0 {
                     warn_probe_exited_non_zero(container_id, remote_user, &result);
                 }
                 return Ok(());
             }
-            Err(e) if runtime.exec_reports_missing_command(&e) => {
+            Ok(Err(e)) if runtime.exec_reports_missing_command(&e) => {
                 warn_probe_command_missing(container_id, &e.to_string());
                 return Ok(());
             }
-            Err(e) => e,
+            Ok(Err(e)) => e.to_string(),
+            Err(_) => format!(
+                "the command was accepted but never reported an exit within {}s",
+                READINESS_BUDGET.as_secs()
+            ),
         };
 
         if !polls.wait().await {
@@ -1659,6 +1682,9 @@ mod tests {
         /// `exec` fails the way a runtime reports an image without the
         /// requested executable, rather than a broken exec path.
         exec_command_missing: bool,
+        /// `exec` never returns, standing in for the dropped `containerWait`
+        /// behind issue #4: the process runs but its exit is never reported.
+        exec_never_returns: bool,
         /// `exec` answers, but with a non-zero status for a command that
         /// cannot fail on its own.
         exec_exit_code: i32,
@@ -1685,6 +1711,7 @@ mod tests {
                 exec_fails: false,
                 exec_errors_before_success: Arc::new(AtomicUsize::new(0)),
                 exec_command_missing: false,
+                exec_never_returns: false,
                 exec_exit_code: 0,
                 execs: Arc::new(Mutex::new(Vec::new())),
                 created_id: "fake-id".to_string(),
@@ -1727,6 +1754,15 @@ mod tests {
         fn execs_after(calls: usize) -> Self {
             Self {
                 exec_errors_before_success: Arc::new(AtomicUsize::new(calls)),
+                ..Self::ok()
+            }
+        }
+
+        /// The command is accepted but its exit is never reported — the
+        /// dropped `containerWait` behind issue #4.
+        fn execs_never_return() -> Self {
+            Self {
+                exec_never_returns: true,
                 ..Self::ok()
             }
         }
@@ -1889,9 +1925,13 @@ mod tests {
             let command_missing = self.exec_command_missing;
             let exit_code = self.exec_exit_code;
             let settling = self.exec_errors_before_success.clone();
+            let never_returns = self.exec_never_returns;
             let execs = self.execs.clone();
             Box::pin(async move {
                 execs.lock().unwrap().push((cmd, user));
+                if never_returns {
+                    std::future::pending::<()>().await;
+                }
                 let still_settling = settling
                     .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
                     .is_ok();
@@ -2307,6 +2347,31 @@ mod tests {
         run_up_with_fake(&rt, &workspace)
             .await
             .expect("a settling exec endpoint must not abort a healthy `dev up`");
+    }
+
+    /// Issue #4's actual symptom: the daemon drops the exit wait, so the exec
+    /// never returns at all. Pacing the gaps between failures does not catch
+    /// that — nothing ever fails — so the gate has to bound the call itself or
+    /// `dev up` hangs silently after "Starting container..." forever.
+    #[tokio::test(start_paused = true)]
+    async fn up_fails_when_the_probe_never_reports_an_exit() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let rt = UpFakeRuntime::execs_never_return();
+
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(600),
+            run_up_with_fake(&rt, &workspace),
+        )
+        .await
+        .expect("the readiness gate must bound the probe rather than wait forever")
+        .expect_err("readiness must not be reported for a container whose exec never returns");
+
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("never reported an exit"),
+            "the error must name the hang, got: {msg}"
+        );
     }
 
     /// The other half of issue #4: the container is created, started and

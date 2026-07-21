@@ -330,7 +330,7 @@ pub async fn load_image_archive(
         if !rejected.is_empty() {
             return Err(AppleContainerError::XpcError(format!(
                 "image archive contained files the daemon refused: {}",
-                rejected.join(", ")
+                rejected.describe()
             )));
         }
     }
@@ -341,34 +341,71 @@ pub async fn load_image_archive(
     Ok(serde_json::from_slice(&data)?)
 }
 
+/// What a `rejectedMembers` reply says the daemon refused.
+///
+/// Kept apart from the names because the two carry different weight: a member
+/// this version cannot name is still a member it must not report as loaded.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RejectedMembers {
+    named: Vec<String>,
+    /// Entries in a shape this version cannot read a filename out of.
+    unnamed: usize,
+}
+
+impl RejectedMembers {
+    fn is_empty(&self) -> bool {
+        self.named.is_empty() && self.unnamed == 0
+    }
+
+    fn describe(&self) -> String {
+        let mut parts = self.named.clone();
+        if self.unnamed > 0 {
+            parts.push(format!("{} more this version cannot name", self.unnamed));
+        }
+        parts.join(", ")
+    }
+}
+
 /// The archive members the daemon refused, read for what they plainly name.
 ///
 /// This key's encoding is reverse-engineered from the daemon, so the rule is
 /// the conservative one: report only what unambiguously names refused members,
 /// and read anything else as nothing refused. Guessing the other way turns a
-/// load that actually succeeded into a failed build — a whole shape of daemon
-/// reply (`{"rejected":[]}`, `""`, a future wrapper) would be reported as the
-/// very files it says were accepted.
+/// load that actually succeeded into a failed build.
 ///
-/// The list is found wherever it is: at the top level, or as the sole array
-/// inside a wrapper object. Only a member that is a plain string is named, so
-/// an entry shape this version cannot read cannot invent a filename.
-fn rejected_members(raw: &[u8]) -> Vec<String> {
+/// The list is taken from a top-level array, or from the field of a wrapper
+/// object that the reply key itself names — never from whichever key happens to
+/// sort first, or `{"accepted":[...],"rejected":[]}` would report the accepted
+/// files as the refused ones. A member that is a plain string is named; one in
+/// a shape this version cannot read is counted instead, so a partial refusal is
+/// still reported even when it cannot be spelled out.
+fn rejected_members(raw: &[u8]) -> RejectedMembers {
     let Ok(payload) = serde_json::from_slice::<serde_json::Value>(raw) else {
-        return Vec::new();
+        return RejectedMembers::default();
     };
     let members = match &payload {
         serde_json::Value::Array(members) => members.as_slice(),
-        serde_json::Value::Object(fields) => match fields.values().find_map(|v| v.as_array()) {
-            Some(members) => members.as_slice(),
-            None => return Vec::new(),
-        },
-        _ => return Vec::new(),
+        serde_json::Value::Object(fields) => {
+            match [XpcKey::REJECTED_MEMBERS, "rejected"]
+                .iter()
+                .find_map(|key| fields.get(*key))
+                .and_then(serde_json::Value::as_array)
+            {
+                Some(members) => members.as_slice(),
+                None => return RejectedMembers::default(),
+            }
+        }
+        _ => return RejectedMembers::default(),
     };
-    members
+
+    let named: Vec<String> = members
         .iter()
         .filter_map(|member| member.as_str().map(str::to_string))
-        .collect()
+        .collect();
+    RejectedMembers {
+        unnamed: members.len() - named.len(),
+        named,
+    }
 }
 
 /// Point a new reference at an image already in the store.
@@ -444,7 +481,7 @@ async fn process_build_stream(
             Some(server_stream::PacketType::ImageTransfer(ref transfer)) => {
                 let stage = metadata_field(&transfer.metadata, "stage");
                 let method = metadata_field(&transfer.metadata, "method");
-                if !is_image_request(transfer, stage, method) {
+                if !is_request(stage, method) {
                     note_unanswered_packet(&mut session.unanswered, "ImageTransfer", stage, method);
                     continue;
                 }
@@ -591,7 +628,7 @@ async fn handle_build_transfer(
     let method = metadata_field(&transfer.metadata, "method");
     let context = session.context;
 
-    if !is_request(transfer, stage, method) {
+    if !is_request(stage, method) {
         note_unanswered_packet(&mut session.unanswered, "BuildTransfer", stage, method);
         return Ok(());
     }
@@ -617,27 +654,22 @@ fn metadata_field<'a>(metadata: &'a HashMap<String, String>, key: &str) -> &'a s
     metadata.get(key).map(String::as_str).unwrap_or("")
 }
 
-/// Whether a packet is a request this client is being asked to answer.
+/// Whether a packet names a request this client can answer.
 ///
-/// An error reply is addressed by the stage and method it echoes, so one built
-/// from a packet that names neither would be routed nowhere — and injecting a
-/// `complete` packet carrying an error into a transfer that was never a request
-/// (an ack, a keepalive, a `complete` echo) would abort a build that was
-/// running fine.
+/// A reply — including an error reply — is addressed by the stage and method it
+/// echoes, so a packet naming neither can be routed nowhere and is left alone.
 ///
-/// `complete` is what separates the two. `direction` cannot: it describes which
-/// way the data flows, and a request for us to send data carries the same
-/// `OUTOF` our replies do. A request is a transfer that has not been completed;
-/// every reply this client sends sets `complete` on its final packet, so an
-/// echo of one is recognisable by it.
-fn is_request(transfer: &BuildTransfer, stage: &str, method: &str) -> bool {
-    !transfer.complete && !stage.is_empty() && !method.is_empty()
-}
-
-/// [`is_request`] for the image half of the stream, which carries the same
-/// `complete` marker on a different message.
-fn is_image_request(transfer: &ImageTransfer, stage: &str, method: &str) -> bool {
-    !transfer.complete && !stage.is_empty() && !method.is_empty()
+/// Naming both is the whole test, and deliberately so. Neither of the other
+/// fields separates a request from an echo of one of our own replies: nothing
+/// in this crate establishes what the shim sets `complete` to on a request, and
+/// a one-shot request that carries all its parameters at once is a natural
+/// `complete: true`; `direction` describes which way the data flows, so a
+/// request for us to send data carries the same `OUTOF` our replies do. Between
+/// answering a packet that did not need it and staying silent on one that did,
+/// silence is the worse failure: the shim's receivers have no deadline, so it
+/// costs the whole 600s idle budget and the build dies with the wrong reason.
+fn is_request(stage: &str, method: &str) -> bool {
+    !stage.is_empty() && !method.is_empty()
 }
 
 /// Record a packet that was not a request, since nothing is sent in reply.
@@ -1004,8 +1036,7 @@ async fn handle_read(
             .map_err(AppleContainerError::Io)?
             .len()
             .saturating_sub(offset);
-        let length = readable_span(requested, available, "this read")?;
-        content::read_range(&path, offset, length)
+        content::read_range(&path, offset, readable_span(requested, available))
     }) {
         Ok(data) => data,
         Err(e) => {
@@ -1104,24 +1135,16 @@ fn requested_read_length(metadata: &HashMap<String, String>) -> u64 {
     numeric_metadata(metadata, "length").unwrap_or(MAX_REPLY_PAYLOAD)
 }
 
-/// How much of a requested range one reply may carry, or why it cannot.
+/// How much of a requested range one fssync `Read` reply carries.
 ///
-/// A read that stops because the file stopped is complete however short it is.
-/// A read that stops before the bytes the caller asked for is not: the reply
-/// carries its own length, but `io.ReaderAt`'s contract lets a caller treat a
-/// short read with no error as a filled buffer, so quietly cutting one would
-/// leave the tail of a base-image layer zero-filled and its digest wrong. A
-/// range that cannot be represented in one gRPC message is therefore refused
-/// with what it would have taken, rather than silently truncated.
-fn readable_span(requested: u64, available: u64, what: &str) -> Result<usize, AppleContainerError> {
-    let wanted = requested.min(available);
-    if wanted > MAX_REPLY_PAYLOAD {
-        return Err(AppleContainerError::XpcError(format!(
-            "{what} asked for {wanted} bytes, more than the {MAX_REPLY_PAYLOAD} a single reply \
-             can carry; answering it short would leave the rest zero-filled"
-        )));
-    }
-    Ok(wanted as usize)
+/// `Read` is an offset protocol that loops: the reply states the offset and the
+/// length it carries and the shim reads on from there, so as much as fits is a
+/// complete answer to this request and a shorter one costs a second round trip
+/// at most. The content store's `ReaderAt` is not that shape — it asks for a
+/// whole layer at once — so that side spreads one answer over several packets
+/// instead of clamping; see [`send_blob_range`].
+fn readable_span(requested: u64, available: u64) -> usize {
+    requested.min(available).min(MAX_REPLY_PAYLOAD) as usize
 }
 
 /// Why a builder-supplied path was refused.
@@ -1323,33 +1346,122 @@ async fn handle_content_store(
     // `ReaderAt` probes with offset 0 and length 0 purely to learn the size,
     // and reads an empty payload as EOF thereafter.
     let offset = numeric_metadata(&transfer.metadata, "offset").unwrap_or(0);
-    let requested = requested_read_length(&transfer.metadata);
-    let data = if method == CONTENT_READER_AT_METHOD && requested > 0 {
-        let available = size.saturating_sub(offset);
-        match readable_span(requested, available, &format!("this read of blob {digest}"))
-            .and_then(|length| content::read_blob_range(&digest, offset, length))
-        {
+    if method == CONTENT_READER_AT_METHOD {
+        let Some(path) = content::blob_path(&digest) else {
+            let message = format!("content store: malformed digest {digest:?}");
+            return send_content_error(builder, build_id, transfer, method, &message).await;
+        };
+        let range = BlobRange {
+            digest: &digest,
+            path: &path,
+            method,
+            size,
+            offset,
+            requested: requested_read_length(&transfer.metadata),
+        };
+        return send_blob_range(builder, build_id, transfer, &range).await;
+    }
+
+    // `Info` answers out of the metadata map alone.
+    let metadata = blob_reply_metadata(method, &digest, size, offset, 0);
+    send_image_transfer(
+        builder,
+        build_id,
+        transfer,
+        &digest,
+        metadata,
+        Vec::new(),
+        true,
+    )
+    .await
+}
+
+/// The slice of a stored blob one `ReaderAt` asked for.
+struct BlobRange<'a> {
+    digest: &'a str,
+    path: &'a Path,
+    method: &'a str,
+    /// The blob's whole size, which every reply reports.
+    size: u64,
+    offset: u64,
+    requested: u64,
+}
+
+/// Answer a `ReaderAt` with the range it asked for, across as many packets as
+/// that takes.
+///
+/// A reply is one gRPC message and the shim asks for a whole layer in one call,
+/// so a 50 MiB layer cannot be a single packet. `complete` is what the protocol
+/// provides for exactly that: every packet but the last carries `false`, the
+/// same way the fssync walk hands over its archive. Truncating the answer would
+/// leave the tail of the layer zero-filled for a caller that does not loop, and
+/// refusing it would fail every build with a real base image — chunking is the
+/// only form that actually serves the request.
+///
+/// The blob is read a packet at a time rather than buffered whole, so a layer
+/// costs one packet of memory rather than its own size.
+async fn send_blob_range(
+    builder: &BuilderSink,
+    build_id: &str,
+    transfer: &ImageTransfer,
+    range: &BlobRange<'_>,
+) -> Result<(), AppleContainerError> {
+    let total = range.requested.min(range.size.saturating_sub(range.offset));
+    let mut sent = 0u64;
+
+    loop {
+        let at = range.offset + sent;
+        let wanted = (total - sent).min(MAX_REPLY_PAYLOAD) as usize;
+        let data = match content::read_range(range.path, at, wanted) {
             Ok(data) => data,
             Err(e) => {
-                let message = format!("cannot read blob {digest}: {e}");
-                return send_content_error(builder, build_id, transfer, method, &message).await;
+                let message = format!("cannot read blob {}: {e}", range.digest);
+                return send_content_error(builder, build_id, transfer, range.method, &message)
+                    .await;
             }
-        }
-    } else {
-        Vec::new()
-    };
+        };
 
+        // A read that came back short means the blob ended before the store
+        // said it would; either way there is nothing further to carry.
+        let carried = data.len() as u64;
+        let complete = carried == 0 || sent + carried >= total;
+        let metadata = blob_reply_metadata(range.method, range.digest, range.size, at, carried);
+        send_image_transfer(
+            builder,
+            build_id,
+            transfer,
+            range.digest,
+            metadata,
+            data,
+            complete,
+        )
+        .await?;
+
+        sent += carried;
+        if complete {
+            return Ok(());
+        }
+    }
+}
+
+/// Metadata one content-store reply carries.
+fn blob_reply_metadata(
+    method: &str,
+    digest: &str,
+    size: u64,
+    offset: u64,
+    length: u64,
+) -> HashMap<String, String> {
     let mut metadata = content_store_metadata(method);
     metadata.insert("size".to_string(), size.to_string());
     metadata.insert("offset".to_string(), offset.to_string());
-    metadata.insert("length".to_string(), data.len().to_string());
+    metadata.insert("length".to_string(), length.to_string());
     // Both timestamps are parsed as RFC 3339; the store keeps no creation
     // time of its own, so report the blob's mtime for both.
-    let stored_at = blob_timestamp(&digest);
+    let stored_at = blob_timestamp(digest);
     metadata.insert("created_at".to_string(), stored_at.clone());
     metadata.insert("updated_at".to_string(), stored_at);
-
-    send_image_transfer(builder, build_id, transfer, &digest, metadata, data).await
+    metadata
 }
 
 /// Metadata every content-store reply carries.
@@ -1440,6 +1552,7 @@ async fn send_image_transfer(
     digest: &str,
     metadata: HashMap<String, String>,
     data: Vec<u8>,
+    complete: bool,
 ) -> Result<(), AppleContainerError> {
     let response = ClientStream {
         build_id: build_id.to_string(),
@@ -1449,7 +1562,7 @@ async fn send_image_transfer(
             tag: digest.to_string(),
             descriptor: transfer.descriptor.clone(),
             data,
-            complete: true,
+            complete,
             metadata,
         })),
     };
@@ -1494,6 +1607,7 @@ async fn send_image_error(
         &transfer.tag.clone(),
         metadata,
         Vec::new(),
+        true,
     )
     .await
 }
@@ -2010,6 +2124,44 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
         }
+    }
+
+    /// A content-store request, whose fields the blob path stands in for.
+    fn image_transfer() -> ImageTransfer {
+        ImageTransfer {
+            id: "request-1".to_string(),
+            direction: TransferDirection::Outof as i32,
+            tag: String::new(),
+            descriptor: None,
+            data: Vec::new(),
+            complete: false,
+            metadata: HashMap::new(),
+        }
+    }
+
+    /// A blob served straight out of a file, so the chunking can be exercised
+    /// without a populated content store.
+    fn blob_range<'a>(path: &'a Path, size: u64, offset: u64, requested: u64) -> BlobRange<'a> {
+        BlobRange {
+            digest: "sha256:layer",
+            path,
+            method: CONTENT_READER_AT_METHOD,
+            size,
+            offset,
+            requested,
+        }
+    }
+
+    /// Collect the `ImageTransfer` replies a handler queued.
+    fn drain_image(rx: &mut tokio::sync::mpsc::Receiver<ClientStream>) -> Vec<ImageTransfer> {
+        rx.close();
+        let mut replies = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let Some(client_stream::PacketType::ImageTransfer(transfer)) = msg.packet_type {
+                replies.push(transfer);
+            }
+        }
+        replies
     }
 
     /// Collect the `BuildTransfer` replies a handler queued.
@@ -2570,37 +2722,45 @@ mod tests {
         );
     }
 
-    /// A completed transfer is an ack or an echo of a reply this client already
-    /// sent, not a request. Serving it again on the same id, or injecting an
-    /// error into it, aborts a build that was running fine — and `direction`
-    /// cannot tell the two apart, since a request to send data carries the same
-    /// `OUTOF` every reply does.
+    /// Nothing establishes what the shim sets `complete` to on a request, and a
+    /// one-shot request that carries all its parameters at once is a natural
+    /// `complete: true`. Staying silent on one would cost the whole 600s idle
+    /// budget and kill the build with the wrong reason, so a packet that names
+    /// a request is answered whatever `complete` and `direction` say.
     #[test]
-    fn a_completed_transfer_is_not_served_or_answered() {
-        let dir = context_with(&[("app.txt", "payload")]);
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    fn a_request_is_answered_whatever_its_completion_flag_says() {
+        let dir = context_with(&[("app.txt", "0123456789")]);
 
-        for metadata in [
-            [("stage", "fssync"), ("method", "Read")],
-            [("stage", "fssync"), ("method", "Truncate")],
-        ] {
-            let mut echo = build_transfer(&metadata, "app.txt");
-            echo.complete = true;
-            echo.direction = TransferDirection::Outof as i32;
+        for complete in [false, true] {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let mut request = build_transfer(
+                &[
+                    ("stage", "fssync"),
+                    ("method", "Read"),
+                    ("offset", "0"),
+                    ("length", "4"),
+                ],
+                "app.txt",
+            );
+            request.complete = complete;
+            request.direction = TransferDirection::Outof as i32;
 
             run(handle_build_transfer(
-                &echo,
+                &request,
                 &sink(&tx),
                 REPLY_ID,
                 &mut session_at(dir.path()),
             ))
-            .expect("an acked transfer must not fail the build");
-        }
+            .expect("a request must be answered");
 
-        assert!(
-            drain(&mut rx).is_empty(),
-            "a transfer that is already complete must be left alone"
-        );
+            let replies = drain(&mut rx);
+            assert_eq!(
+                replies.len(),
+                1,
+                "a request with complete={complete} must be answered"
+            );
+            assert_eq!(replies[0].1.data, b"0123");
+        }
     }
 
     /// One line per stage and method, however many packets arrive: this shares
@@ -2622,10 +2782,17 @@ mod tests {
     #[test]
     fn rejected_members_are_read_only_when_they_plainly_name_members() {
         assert_eq!(
-            rejected_members(br#"["a.tar","b.tar"]"#),
+            rejected_members(br#"["a.tar","b.tar"]"#).named,
             ["a.tar", "b.tar"]
         );
-        assert_eq!(rejected_members(br#"{"rejected":["a.tar"]}"#), ["a.tar"]);
+        assert_eq!(
+            rejected_members(br#"{"rejected":["a.tar"]}"#).named,
+            ["a.tar"]
+        );
+        assert_eq!(
+            rejected_members(br#"{"rejectedMembers":["a.tar"]}"#).named,
+            ["a.tar"]
+        );
 
         for benign in [
             &b"null"[..],
@@ -2641,6 +2808,51 @@ mod tests {
                 String::from_utf8_lossy(benign)
             );
         }
+    }
+
+    /// The list is taken by name. `serde_json`'s map is a `BTreeMap` here, so
+    /// picking whichever array sorted first would report the *accepted* files
+    /// as the refused ones and fail a load that fully succeeded.
+    #[test]
+    fn rejected_members_are_taken_by_key_not_by_sort_order() {
+        let reply = br#"{"accepted":["app.tar"],"rejected":[]}"#;
+        assert!(
+            rejected_members(reply).is_empty(),
+            "a load that refused nothing must not be read out of the accepted list"
+        );
+
+        let reply = br#"{"accepted":["app.tar"],"rejected":["bad.tar"]}"#;
+        assert_eq!(rejected_members(reply).named, ["bad.tar"]);
+    }
+
+    /// An entry this version cannot read a filename out of is still a refused
+    /// member: counting it keeps a partial refusal detectable, where dropping
+    /// it would tag an image the daemon did not fully load.
+    #[test]
+    fn rejected_members_this_version_cannot_name_are_still_counted() {
+        let reply = br#"{"rejected":[{"path":"app.tar","reason":"unsupported"}]}"#;
+        let rejected = rejected_members(reply);
+
+        assert!(rejected.named.is_empty());
+        assert_eq!(rejected.unnamed, 1);
+        assert!(
+            !rejected.is_empty(),
+            "a refusal must not read as a clean load"
+        );
+        assert!(
+            rejected.describe().contains("1 more"),
+            "{}",
+            rejected.describe()
+        );
+
+        let mixed = rejected_members(br#"{"rejected":["a.tar",{"path":"b.tar"}]}"#);
+        assert_eq!(mixed.named, ["a.tar"]);
+        assert_eq!(mixed.unnamed, 1);
+        assert!(
+            mixed.describe().starts_with("a.tar, "),
+            "{}",
+            mixed.describe()
+        );
     }
 
     #[test]
@@ -2819,36 +3031,143 @@ mod tests {
         assert_eq!(requested_read_length(&metadata(&[("length", "0")])), 0);
     }
 
-    /// A read that stops because the file stopped is complete. A read that
-    /// stops before the bytes the caller asked for is not: `io.ReaderAt` lets a
-    /// caller treat a short read with no error as a filled buffer, so cutting
-    /// one quietly would leave the tail of a base-image layer zero-filled and
-    /// its digest wrong. The shim asks for a whole layer in one `ReaderAt`, so
-    /// this is the case that decides whether the answer is honest.
+    /// `Read` loops on its own offset, so as much as one reply holds is a
+    /// complete answer to it: the reply states what it carries and the shim
+    /// reads on from there. Refusing an 8 MiB asset because it exceeds one
+    /// message would fail a build the protocol can serve perfectly well.
     #[test]
-    fn a_read_that_cannot_be_answered_whole_is_refused_rather_than_cut() {
+    fn an_fssync_read_is_clamped_to_one_reply_rather_than_refused() {
         // A reply must still fit inside gRPC's default message limit.
         const { assert!(MAX_REPLY_PAYLOAD < 4 * 1024 * 1024) };
 
         // Short of the end of the file: complete however small.
-        assert_eq!(readable_span(512, 4096, "a read").expect("in range"), 512);
+        assert_eq!(readable_span(512, 4096), 512);
         // Clamped by the file's end, which is EOF rather than truncation.
-        assert_eq!(readable_span(4096, 512, "a read").expect("clamped"), 512);
-        // Exactly what one reply holds is still answerable.
+        assert_eq!(readable_span(4096, 512), 512);
         assert_eq!(
-            readable_span(MAX_REPLY_PAYLOAD, MAX_REPLY_PAYLOAD, "a read").expect("at the limit"),
+            readable_span(MAX_REPLY_PAYLOAD, MAX_REPLY_PAYLOAD),
             MAX_REPLY_PAYLOAD as usize
         );
-        // A whole layer: more than a reply can carry, and the bytes are really
-        // there, so it must be refused rather than silently short-answered.
-        let layer = 30 * 1024 * 1024;
-        let error = readable_span(layer, layer, "this read of blob sha256:abc")
-            .expect_err("a range that cannot be represented must not be cut silently");
-        let message = error.to_string();
-        assert!(message.contains("sha256:abc"), "{message}");
-        assert!(message.contains("zero-filled"), "{message}");
-        // Asking for more than a reply holds is fine when the file ends first.
-        assert_eq!(readable_span(layer, 4096, "a read").expect("clamped"), 4096);
+        // An asset larger than one reply: answered with what fits, not refused.
+        let asset = 8 * 1024 * 1024;
+        assert_eq!(readable_span(asset, asset), MAX_REPLY_PAYLOAD as usize);
+    }
+
+    /// A blob larger than one gRPC message is the ordinary case — the shim asks
+    /// for a whole base-image layer in one `ReaderAt` — so it has to be served
+    /// across packets, with `complete` only on the last. Truncating would leave
+    /// the layer's tail zero-filled for a caller that does not loop; refusing
+    /// would fail every build with a real base image.
+    #[test]
+    fn an_oversized_blob_read_is_served_across_packets() {
+        let layer = (MAX_REPLY_PAYLOAD as usize) * 2 + 1024;
+        let content: Vec<u8> = (0..layer).map(|i| (i % 251) as u8).collect();
+        let store = tempfile::tempdir().expect("temp store");
+        let blob = store.path().join("layer");
+        std::fs::write(&blob, &content).expect("blob");
+
+        let request = image_transfer();
+        let replies = run(async {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<ClientStream>(64);
+            send_blob_range(
+                &sink(&tx),
+                REPLY_ID,
+                &request,
+                &blob_range(&blob, layer as u64, 0, layer as u64),
+            )
+            .await
+            .expect("a whole layer must be servable");
+            drain_image(&mut rx)
+        });
+
+        assert!(
+            replies.len() > 1,
+            "a layer larger than one message must span packets, got {}",
+            replies.len()
+        );
+        assert!(
+            replies
+                .iter()
+                .all(|p| p.data.len() <= MAX_REPLY_PAYLOAD as usize),
+            "no packet may exceed what one gRPC message can carry"
+        );
+        assert_eq!(
+            replies.iter().filter(|p| p.complete).count(),
+            1,
+            "`complete` ends the transfer, so exactly one packet may set it"
+        );
+        assert!(replies.last().expect("last").complete);
+
+        let served: Vec<u8> = replies.iter().flat_map(|p| p.data.clone()).collect();
+        assert_eq!(served, content, "the packets must reassemble the layer");
+
+        // Each packet states where its own slice began, so a caller that does
+        // not concatenate blindly can still place them.
+        let mut expected_offset = 0usize;
+        for packet in &replies {
+            assert_eq!(
+                packet.metadata.get("offset").map(String::as_str),
+                Some(expected_offset.to_string().as_str())
+            );
+            assert_eq!(
+                packet.metadata.get("length").map(String::as_str),
+                Some(packet.data.len().to_string().as_str())
+            );
+            expected_offset += packet.data.len();
+        }
+    }
+
+    /// `ReaderAt::init` probes with length 0 purely to learn the size, and
+    /// reads an empty payload as EOF — so the probe must still get exactly one
+    /// completed reply rather than nothing.
+    #[test]
+    fn a_zero_length_blob_read_answers_once_with_no_payload() {
+        let store = tempfile::tempdir().expect("temp store");
+        let blob = store.path().join("layer");
+        std::fs::write(&blob, b"0123456789").expect("blob");
+        let request = image_transfer();
+
+        let replies = run(async {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<ClientStream>(8);
+            send_blob_range(&sink(&tx), REPLY_ID, &request, &blob_range(&blob, 10, 0, 0))
+                .await
+                .expect("a size probe must be answered");
+            drain_image(&mut rx)
+        });
+
+        assert_eq!(replies.len(), 1);
+        assert!(replies[0].data.is_empty());
+        assert!(replies[0].complete);
+        assert_eq!(
+            replies[0].metadata.get("size").map(String::as_str),
+            Some("10")
+        );
+    }
+
+    /// A read that starts past the end of the blob is EOF, not an error.
+    #[test]
+    fn a_blob_read_past_the_end_completes_empty() {
+        let store = tempfile::tempdir().expect("temp store");
+        let blob = store.path().join("layer");
+        std::fs::write(&blob, b"0123456789").expect("blob");
+        let request = image_transfer();
+
+        let replies = run(async {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<ClientStream>(8);
+            send_blob_range(
+                &sink(&tx),
+                REPLY_ID,
+                &request,
+                &blob_range(&blob, 10, 64, 4096),
+            )
+            .await
+            .expect("a read past the end must be answered");
+            drain_image(&mut rx)
+        });
+
+        assert_eq!(replies.len(), 1);
+        assert!(replies[0].data.is_empty());
+        assert!(replies[0].complete);
     }
 
     /// `pkg/fileutils/file_info.go` reads these out of the metadata map and

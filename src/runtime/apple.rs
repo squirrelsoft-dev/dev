@@ -732,21 +732,28 @@ const START_FAILED: &str = "start failed";
 /// Whether an exec failure is the daemon refusing to run a command the image
 /// does not have.
 ///
-/// Deliberately narrow. Only the *start* step can carry that meaning: the
-/// daemon has accepted the process configuration by then and is trying to
-/// execute it, so a not-found reported there is about the executable. A create
-/// failure, a wait failure and every XPC transport error are the runtime
-/// failing to run anything at all, and must stay fatal to readiness — so the
-/// step is checked before the wording, and an unrecognised start failure is
-/// treated as the runtime's, not the image's.
+/// Deliberately narrow, on two axes. Only the *start* step can carry that
+/// meaning: the daemon has accepted the process configuration by then and is
+/// trying to execute it, so a not-found reported there is about the executable.
+/// A create failure, a wait failure and every XPC transport error are the
+/// runtime failing to run anything at all and must stay fatal to readiness, so
+/// the step is checked before the wording.
+///
+/// The wording is the one thing here not established from this crate's own
+/// code. What is: the guest runs Linux, a missing executable fails `execve`
+/// with `ENOENT`, and its `strerror` text is "No such file or directory" —
+/// so that is the phrase matched, rather than a container-runtime phrasing
+/// this daemon has not been observed to use. An unrecognised start failure
+/// stays the runtime's problem, not the image's, which is the safe way for
+/// this to be wrong: it fails readiness loudly instead of passing a broken
+/// container.
 fn is_missing_command_failure(message: &str) -> bool {
     let Some((_, detail)) = message.split_once(START_FAILED) else {
         return false;
     };
-    let detail = detail.to_ascii_lowercase();
-    ["no such file or directory", "executable file not found"]
-        .iter()
-        .any(|phrase| detail.contains(phrase))
+    detail
+        .to_ascii_lowercase()
+        .contains("no such file or directory")
 }
 
 /// Create, start, and wait for one process, capturing its output.
@@ -1873,11 +1880,9 @@ mod tests {
     /// use, which is the whole of issue #4.
     #[test]
     fn only_a_start_step_not_found_reads_as_a_missing_command() {
+        // The `strerror` text a failed `execve` produces in the Linux guest.
         assert!(is_missing_command_failure(
-            "exec start failed: internalError: no such file or directory"
-        ));
-        assert!(is_missing_command_failure(
-            "exec start failed: executable file not found"
+            "exec start failed: internalError: No such file or directory"
         ));
 
         // The same words on a step that never got as far as the executable.
