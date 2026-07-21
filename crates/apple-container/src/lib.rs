@@ -1,5 +1,7 @@
 pub mod build;
+pub mod content;
 pub mod error;
+pub mod fssync;
 pub mod models;
 pub mod routes;
 pub mod xpc;

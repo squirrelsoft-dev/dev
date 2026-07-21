@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::Path;
 
@@ -6,6 +7,19 @@ use crate::models::{ContainerSnapshot, RuntimeStatus};
 use crate::routes::{IMAGE_SERVICE_NAME, ImageRoute, XpcKey, XpcRoute};
 use crate::xpc::connection::XpcConnection;
 use crate::xpc::message::XpcMessage;
+use crate::{content, fssync};
+
+/// Content-store methods the builder proxies to the host.
+const CONTENT_INFO_METHOD: &str = "/containerd.services.content.v1.Content/Info";
+const CONTENT_READER_AT_METHOD: &str = "/containerd.services.content.v1.Content/ReaderAt";
+
+/// How long to wait for the builder to send anything before giving up.
+///
+/// Every stall in this protocol is silent on both sides — the shim's receivers
+/// have no deadline — so without this a protocol mismatch presents as an
+/// indefinite hang rather than an error. The window is wide enough that a long
+/// silent `RUN` step cannot trip it.
+const BUILDER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Include the generated protobuf/gRPC code.
 pub mod proto {
@@ -107,6 +121,11 @@ pub async fn build_image(
     let build_id = uuid::Uuid::new_v4().to_string();
     let context_str = abs_context.to_string_lossy().to_string();
 
+    // The shim writes `<exports>/<build-id>/out.tar` but only creates that
+    // directory itself for a `local` export (`pkg/build/build.go`), so an
+    // `oci` export fails at the very last step unless the host creates it.
+    let export = ExportDir::create(&build_id)?;
+
     // Dial a fresh connection for PerformBuild. The info() call completes
     // the HTTP/2 handshake — every successful test had this warmup.
     let dockerfile_b64 = base64_encode(dockerfile.as_bytes());
@@ -135,7 +154,14 @@ pub async fn build_image(
     // The Go server panics with "assignment to entry in nil map" if no outputs
     // header is sent — the default ExportEntry has a nil Attrs map. Sending
     // this forces the parseOutputCSV path which initialises the map properly.
-    md.insert("outputs", "type=oci".parse().unwrap());
+    // `name` makes BuildKit annotate the exported layout with the tag, which
+    // is what `imageLoad` registers the image under.
+    md.insert(
+        "outputs",
+        format!("type=oci,name={tag}").parse().map_err(|_| {
+            AppleContainerError::XpcError(format!("tag {tag:?} is not a valid header value"))
+        })?,
+    );
     if no_cache {
         md.insert("no-cache", "".parse().unwrap());
     }
@@ -169,7 +195,113 @@ pub async fn build_image(
         &abs_context,
         verbose,
     )
-    .await
+    .await?;
+
+    // A finished stream only means BuildKit wrote its OCI layout; the image
+    // does not exist to the daemon until it is loaded from that archive.
+    register_built_image(&export.archive(), tag).await
+}
+
+/// The per-build directory the builder writes its export into.
+///
+/// Removed when the build ends so a failed or abandoned build cannot leave a
+/// multi-megabyte archive behind.
+struct ExportDir {
+    path: std::path::PathBuf,
+}
+
+impl ExportDir {
+    fn create(build_id: &str) -> Result<Self, AppleContainerError> {
+        let path = builder_exports_root().join(build_id);
+        std::fs::create_dir_all(&path).map_err(AppleContainerError::Io)?;
+        Ok(Self { path })
+    }
+
+    fn archive(&self) -> std::path::PathBuf {
+        self.path.join("out.tar")
+    }
+}
+
+impl Drop for ExportDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Host directory mapped into the builder VM as its export target.
+fn builder_exports_root() -> std::path::PathBuf {
+    content::application_support_root().join("builder")
+}
+
+/// Import a finished build into the daemon's image store under `tag`.
+///
+/// Without this the build would report success for a tag that does not exist,
+/// and creating a container from it would then fail.
+async fn register_built_image(archive: &Path, tag: &str) -> Result<(), AppleContainerError> {
+    if !archive.is_file() {
+        return Err(AppleContainerError::XpcError(format!(
+            "builder finished without writing an image archive to {}",
+            archive.display()
+        )));
+    }
+
+    let loaded = load_image_archive(archive).await?;
+    if loaded.iter().any(|image| image.reference == tag) {
+        return Ok(());
+    }
+
+    // The daemon names an image from its layout annotations and falls back to
+    // `untagged@<digest>`, so an archive BuildKit did not annotate still needs
+    // the tag applied.
+    let source = loaded.first().ok_or_else(|| {
+        AppleContainerError::XpcError(format!(
+            "{} contained no image to register",
+            archive.display()
+        ))
+    })?;
+    tag_image(&source.reference, tag).await
+}
+
+/// Load an OCI layout archive into the daemon's image store.
+pub async fn load_image_archive(
+    archive: &Path,
+) -> Result<Vec<crate::models::ImageDescription>, AppleContainerError> {
+    let img_conn = XpcConnection::connect(IMAGE_SERVICE_NAME)?;
+
+    let msg = XpcMessage::with_route(ImageRoute::ImageLoad.as_str());
+    msg.set_string(XpcKey::FILE_PATH, &archive.to_string_lossy());
+    msg.set_bool(XpcKey::FORCE_LOAD, false);
+
+    let reply = img_conn.send_async(&msg).await?;
+    reply.check_error()?;
+
+    if let Some(raw) = reply.get_data(XpcKey::REJECTED_MEMBERS) {
+        let rejected: Vec<String> = serde_json::from_slice(&raw).unwrap_or_default();
+        if !rejected.is_empty() {
+            return Err(AppleContainerError::XpcError(format!(
+                "image archive contained files the daemon refused: {}",
+                rejected.join(", ")
+            )));
+        }
+    }
+
+    let data = reply.get_data(XpcKey::IMAGE_DESCRIPTIONS).ok_or_else(|| {
+        AppleContainerError::XpcError("imageLoad reply missing imageDescriptions".to_string())
+    })?;
+    Ok(serde_json::from_slice(&data)?)
+}
+
+/// Point a new reference at an image already in the store.
+pub async fn tag_image(reference: &str, new_reference: &str) -> Result<(), AppleContainerError> {
+    let img_conn = XpcConnection::connect(IMAGE_SERVICE_NAME)?;
+
+    let msg = XpcMessage::with_route(ImageRoute::ImageTag.as_str());
+    msg.set_string(XpcKey::IMAGE_REFERENCE, reference);
+    msg.set_string(XpcKey::IMAGE_NEW_REFERENCE, new_reference);
+
+    let reply = img_conn.send_async(&msg).await?;
+    reply.check_error()?;
+    Ok(())
 }
 
 /// Process the PerformBuild bidirectional stream.
@@ -185,7 +317,22 @@ async fn process_build_stream(
 ) -> Result<(), AppleContainerError> {
     use tokio_stream::StreamExt;
 
-    while let Some(msg) = server_stream.next().await {
+    let mut session = BuildSession {
+        context,
+        resolved: None,
+        pulled: Vec::new(),
+    };
+
+    loop {
+        let next = tokio::time::timeout(BUILDER_IDLE_TIMEOUT, server_stream.next())
+            .await
+            .map_err(|_| {
+                AppleContainerError::XpcError(format!(
+                    "builder sent nothing for {}s; giving up on the build",
+                    BUILDER_IDLE_TIMEOUT.as_secs()
+                ))
+            })?;
+        let Some(msg) = next else { break };
         let msg =
             msg.map_err(|e| AppleContainerError::XpcError(format!("build stream error: {e}")))?;
 
@@ -211,7 +358,7 @@ async fn process_build_stream(
             }
             Some(server_stream::PacketType::CommandComplete(ref _cmd)) => {}
             Some(server_stream::PacketType::BuildTransfer(transfer)) => {
-                handle_build_transfer(&transfer, &client_tx, reply_id, context, verbose).await?;
+                handle_build_transfer(&transfer, &client_tx, reply_id, session.context).await?;
             }
             Some(server_stream::PacketType::ImageTransfer(ref transfer)) => {
                 let stage = transfer
@@ -225,10 +372,10 @@ async fn process_build_stream(
                     .map(|s| s.as_str())
                     .unwrap_or("");
                 if stage == "resolver" && method == "/resolve" {
-                    handle_image_resolve(transfer, &client_tx, reply_id).await?;
+                    handle_image_resolve(transfer, &client_tx, reply_id, &mut session).await?;
                 } else if stage == "content-store" {
-                    handle_content_store(transfer, method, &client_tx, reply_id).await?;
-                } else {
+                    handle_content_store(transfer, method, &client_tx, reply_id, &mut session)
+                        .await?;
                 }
             }
             None => {}
@@ -236,6 +383,23 @@ async fn process_build_stream(
     }
 
     Ok(())
+}
+
+/// State carried across one `PerformBuild` stream.
+struct BuildSession<'a> {
+    context: &'a Path,
+    /// The base image most recently resolved, used to populate the local
+    /// content store when the builder asks for a blob we do not have yet.
+    resolved: Option<ResolvedImage>,
+    /// References already pulled for this build, so a blob that is genuinely
+    /// missing cannot send us pulling the same image over and over.
+    pulled: Vec<String>,
+}
+
+/// A base image the builder asked us to resolve.
+struct ResolvedImage {
+    reference: String,
+    platform: String,
 }
 
 /// Handle IO packets (stdout/stderr from the build).
@@ -294,7 +458,6 @@ async fn handle_build_transfer(
     client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
     build_id: &str,
     context: &Path,
-    _verbose: bool,
 ) -> Result<(), AppleContainerError> {
     let stage = transfer
         .metadata
@@ -313,85 +476,144 @@ async fn handle_build_transfer(
 
     // The builder shim sends capitalized method names (Walk, Read, Info).
     match method {
-        "walk" | "Walk" => {
-            handle_walk(transfer, client_tx, build_id, context).await?;
-        }
-        "read" | "Read" => {
-            handle_read(transfer, client_tx, build_id, context).await?;
-        }
-        "info" | "Info" => {
-            handle_info(transfer, client_tx, build_id, context).await?;
-        }
-        _ => {}
+        "walk" | "Walk" => handle_walk(transfer, client_tx, build_id, context).await,
+        "read" | "Read" => handle_read(transfer, client_tx, build_id, context).await,
+        "info" | "Info" => handle_info(transfer, client_tx, build_id, context).await,
+        _ => Ok(()),
     }
-
-    Ok(())
 }
 
-/// Handle a "walk" request — list files in the context directory.
-/// Responds with file metadata as JSON, then a completion packet.
+/// Metadata every fssync reply carries.
+fn fssync_metadata(method: &str) -> HashMap<String, String> {
+    HashMap::from([
+        ("os".to_string(), "linux".to_string()),
+        ("stage".to_string(), "fssync".to_string()),
+        ("method".to_string(), method.to_string()),
+    ])
+}
+
+/// Send one `BuildTransfer` reply on the request's id.
+///
+/// A failure to enqueue is fatal: the builder is waiting for this packet and
+/// has no deadline of its own, so swallowing the error would hang the build.
+async fn send_build_transfer(
+    client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
+    build_id: &str,
+    transfer: &BuildTransfer,
+    metadata: HashMap<String, String>,
+    data: Vec<u8>,
+    complete: bool,
+    is_directory: bool,
+) -> Result<(), AppleContainerError> {
+    let response = ClientStream {
+        build_id: build_id.to_string(),
+        packet_type: Some(client_stream::PacketType::BuildTransfer(BuildTransfer {
+            id: transfer.id.clone(),
+            direction: TransferDirection::Outof as i32,
+            source: transfer.source.clone(),
+            destination: None,
+            data,
+            complete,
+            is_directory,
+            metadata,
+        })),
+    };
+
+    client_tx
+        .send(response)
+        .await
+        .map_err(|e| AppleContainerError::XpcError(format!("failed to send fssync reply: {e}")))
+}
+
+/// Tell the builder a request failed instead of leaving it waiting.
+///
+/// Every shim receiver checks `metadata["error"]` first, so this turns what
+/// would otherwise be an unbounded wait into a reported build failure.
+async fn send_fssync_error(
+    client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
+    build_id: &str,
+    transfer: &BuildTransfer,
+    method: &str,
+    message: &str,
+) -> Result<(), AppleContainerError> {
+    let mut metadata = fssync_metadata(method);
+    metadata.insert("error".to_string(), message.to_string());
+    send_build_transfer(
+        client_tx,
+        build_id,
+        transfer,
+        metadata,
+        Vec::new(),
+        true,
+        false,
+    )
+    .await
+}
+
+/// Answer an fssync `Walk` by sending the build context as a tar archive.
+///
+/// The shim blocks in `readTarHash` until a packet carrying `hash` arrives and
+/// only then starts draining the archive bytes, so the checksum goes first and
+/// the tar follows in chunks (`pkg/fileutils/tarxfer.go`).
 async fn handle_walk(
     transfer: &BuildTransfer,
     client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
     build_id: &str,
     context: &Path,
 ) -> Result<(), AppleContainerError> {
-    let include_patterns: Vec<String> = transfer
-        .metadata
-        .get("includePatterns")
-        .map(|s| serde_json::from_str(s).unwrap_or_default())
-        .unwrap_or_default();
+    let filter = fssync::ContextFilter::from_metadata(&transfer.metadata);
+    let built = fssync::require_tar_walk_mode(&transfer.metadata)
+        .and_then(|()| fssync::build_context_tar(context, &filter));
 
-    let mut entries = Vec::new();
-    walk_dir(context, context, &include_patterns, &mut entries)?;
-
-    let data = serde_json::to_vec(&entries).map_err(AppleContainerError::Serialization)?;
-
-    let mut metadata = std::collections::HashMap::new();
-    metadata.insert("stage".to_string(), "fssync".to_string());
-    metadata.insert("method".to_string(), "walk".to_string());
-    metadata.insert("mode".to_string(), "json".to_string());
-
-    // Send file list.
-    let response = ClientStream {
-        build_id: build_id.to_string(),
-        packet_type: Some(client_stream::PacketType::BuildTransfer(BuildTransfer {
-            id: transfer.id.clone(),
-            direction: TransferDirection::Outof as i32,
-            source: None,
-            destination: None,
-            data,
-            complete: false,
-            is_directory: false,
-            metadata,
-        })),
+    let (checksum, archive) = match built {
+        Ok(built) => built,
+        Err(e) => {
+            send_fssync_error(client_tx, build_id, transfer, "Walk", &e.to_string()).await?;
+            return Err(e);
+        }
     };
-    let _ = client_tx.send(response).await;
 
-    // Send completion.
-    let mut complete_meta = std::collections::HashMap::new();
-    complete_meta.insert("stage".to_string(), "fssync".to_string());
-    complete_meta.insert("method".to_string(), "walk".to_string());
+    let mut hash_metadata = fssync_metadata("Walk");
+    hash_metadata.insert("hash".to_string(), checksum);
+    send_build_transfer(
+        client_tx,
+        build_id,
+        transfer,
+        hash_metadata,
+        Vec::new(),
+        false,
+        false,
+    )
+    .await?;
 
-    let complete = ClientStream {
-        build_id: build_id.to_string(),
-        packet_type: Some(client_stream::PacketType::BuildTransfer(BuildTransfer {
-            id: transfer.id.clone(),
-            direction: TransferDirection::Outof as i32,
-            source: None,
-            destination: None,
-            data: Vec::new(),
-            complete: true,
-            is_directory: false,
-            metadata: complete_meta,
-        })),
+    // `readTarHeader` blocks until at least one data packet arrives, so an
+    // empty context still has to send its end-of-archive marker.
+    let chunks: Vec<&[u8]> = if archive.is_empty() {
+        vec![&[]]
+    } else {
+        archive.chunks(fssync::CONTEXT_CHUNK_SIZE).collect()
     };
-    let _ = client_tx.send(complete).await;
+    let last = chunks.len() - 1;
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        send_build_transfer(
+            client_tx,
+            build_id,
+            transfer,
+            fssync_metadata("Walk"),
+            chunk.to_vec(),
+            index == last,
+            false,
+        )
+        .await?;
+    }
 
     Ok(())
 }
 
-/// Handle a "read" request — send file content.
+/// Answer an fssync `Read` with a slice of a context file.
+///
+/// The shim sends the caller's buffer size as `length` (`pkg/fssync/file.go`)
+/// and reads an empty reply as EOF.
 async fn handle_read(
     transfer: &BuildTransfer,
     client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
@@ -400,93 +622,81 @@ async fn handle_read(
 ) -> Result<(), AppleContainerError> {
     let source = transfer.source.as_deref().unwrap_or("");
     let path = resolve_path(context, source);
+    let offset = numeric_metadata(&transfer.metadata, "offset").unwrap_or(0);
+    let length = numeric_metadata(&transfer.metadata, "length").unwrap_or(0) as usize;
 
-    let data = if path.is_file() {
-        let offset = transfer
-            .metadata
-            .get("offset")
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-        let len = transfer
-            .metadata
-            .get("len")
-            .and_then(|s| s.parse::<u64>().ok());
-
-        let full = std::fs::read(&path).map_err(AppleContainerError::Io)?;
-
-        let start = offset as usize;
-        if start >= full.len() {
-            Vec::new()
-        } else if let Some(l) = len {
-            let end = std::cmp::min(start + l as usize, full.len());
-            full[start..end].to_vec()
-        } else {
-            full[start..].to_vec()
+    let data = match content::read_range(&path, offset, length) {
+        Ok(data) => data,
+        Err(e) => {
+            let message = format!("cannot read {source}: {e}");
+            return send_fssync_error(client_tx, build_id, transfer, "Read", &message).await;
         }
-    } else {
-        Vec::new()
     };
 
-    let mut metadata = std::collections::HashMap::new();
-    metadata.insert("stage".to_string(), "fssync".to_string());
-    metadata.insert("method".to_string(), "read".to_string());
-
-    let response = ClientStream {
-        build_id: build_id.to_string(),
-        packet_type: Some(client_stream::PacketType::BuildTransfer(BuildTransfer {
-            id: transfer.id.clone(),
-            direction: TransferDirection::Outof as i32,
-            source: transfer.source.clone(),
-            destination: None,
-            data,
-            complete: true,
-            is_directory: false,
-            metadata,
-        })),
-    };
-    let _ = client_tx.send(response).await;
-
-    Ok(())
+    let mut metadata = fssync_metadata("Read");
+    metadata.insert("offset".to_string(), offset.to_string());
+    metadata.insert("length".to_string(), data.len().to_string());
+    send_build_transfer(client_tx, build_id, transfer, metadata, data, true, false).await
 }
 
-/// Handle an "info" request — send file metadata.
+/// Answer an fssync `Info` with a context path's metadata.
+///
+/// The shim reads size, mode, timestamp and ownership out of the reply's
+/// *metadata* map (`pkg/fileutils/file_info.go`); anything left out silently
+/// becomes a zero, so a JSON body in `data` reads as an empty file.
 async fn handle_info(
     transfer: &BuildTransfer,
     client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
     build_id: &str,
     context: &Path,
 ) -> Result<(), AppleContainerError> {
+    use std::os::unix::fs::MetadataExt;
+
     let source = transfer.source.as_deref().unwrap_or("");
     let path = resolve_path(context, source);
 
-    let data = if path.exists() {
-        let meta = std::fs::metadata(&path).map_err(AppleContainerError::Io)?;
-        let info = FileInfo::from_metadata(source, &meta);
-        serde_json::to_vec(&info).map_err(AppleContainerError::Serialization)?
-    } else {
-        Vec::new()
+    // `symlink_metadata` describes the link itself; BuildKit resolves links
+    // on its own side and expects to be told the target.
+    let file = match std::fs::symlink_metadata(&path) {
+        Ok(file) => file,
+        Err(e) => {
+            // A missing path is routine — BuildKit probes for `.dockerignore`
+            // on every build — so report it and let the builder decide.
+            let message = format!("cannot stat {source}: {e}");
+            return send_fssync_error(client_tx, build_id, transfer, "Info", &message).await;
+        }
     };
 
-    let mut metadata = std::collections::HashMap::new();
-    metadata.insert("stage".to_string(), "fssync".to_string());
-    metadata.insert("method".to_string(), "info".to_string());
+    let mut metadata = fssync_metadata("Info");
+    metadata.insert("size".to_string(), file.len().to_string());
+    metadata.insert("mode".to_string(), fssync::go_file_mode(&file).to_string());
+    metadata.insert(
+        "modified_at".to_string(),
+        fssync::rfc3339_utc(fssync::mtime_secs(&file)),
+    );
+    metadata.insert("uid".to_string(), file.uid().to_string());
+    metadata.insert("gid".to_string(), file.gid().to_string());
+    if file.is_symlink() {
+        if let Ok(target) = std::fs::read_link(&path) {
+            metadata.insert("target".to_string(), target.to_string_lossy().into_owned());
+        }
+    }
 
-    let response = ClientStream {
-        build_id: build_id.to_string(),
-        packet_type: Some(client_stream::PacketType::BuildTransfer(BuildTransfer {
-            id: transfer.id.clone(),
-            direction: TransferDirection::Outof as i32,
-            source: transfer.source.clone(),
-            destination: None,
-            data,
-            complete: true,
-            is_directory: false,
-            metadata,
-        })),
-    };
-    let _ = client_tx.send(response).await;
+    send_build_transfer(
+        client_tx,
+        build_id,
+        transfer,
+        metadata,
+        Vec::new(),
+        true,
+        file.is_dir(),
+    )
+    .await
+}
 
-    Ok(())
+/// Read a numeric metadata field the builder sent.
+fn numeric_metadata(metadata: &HashMap<String, String>, key: &str) -> Option<u64> {
+    metadata.get(key)?.trim().parse().ok()
 }
 
 /// Map the host's Rust architecture name to its OCI/Go equivalent.
@@ -564,6 +774,7 @@ async fn handle_image_resolve(
     transfer: &ImageTransfer,
     client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
     build_id: &str,
+    session: &mut BuildSession<'_>,
 ) -> Result<(), AppleContainerError> {
     // The image reference is in metadata "ref" or the tag field.
     let reference = transfer
@@ -609,6 +820,13 @@ async fn handle_image_resolve(
             AppleContainerError::XpcError(format!("failed to pull config for {reference}: {e}"))
         })?;
 
+    // Remember what this build is based on: if the builder later asks for a
+    // blob the host does not have, this is the image that supplies it.
+    session.resolved = Some(ResolvedImage {
+        reference: reference.clone(),
+        platform: platform_str.clone(),
+    });
+
     let mut metadata = std::collections::HashMap::new();
     metadata.insert("os".to_string(), "linux".to_string());
     metadata.insert("stage".to_string(), "resolver".to_string());
@@ -646,56 +864,168 @@ async fn handle_content_store(
     method: &str,
     client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
     build_id: &str,
+    session: &mut BuildSession<'_>,
 ) -> Result<(), AppleContainerError> {
-    let digest = if !transfer.tag.is_empty() {
-        &transfer.tag
-    } else if transfer
-        .descriptor
-        .as_ref()
-        .map_or(true, |d| d.digest.is_empty())
-    {
+    if !matches!(method, CONTENT_INFO_METHOD | CONTENT_READER_AT_METHOD) {
         return Ok(());
-    } else {
-        &transfer.descriptor.as_ref().unwrap().digest
-    };
-
-    let _offset = transfer
-        .metadata
-        .get("offset")
-        .map(|s| s.as_str())
-        .unwrap_or("0");
-    let _length = transfer
-        .metadata
-        .get("length")
-        .map(|s| s.as_str())
-        .unwrap_or("0");
-
-    match method {
-        "/containerd.services.content.v1.Content/Info" => {
-            let mut metadata = std::collections::HashMap::new();
-            metadata.insert("os".to_string(), "linux".to_string());
-            metadata.insert("stage".to_string(), "content-store".to_string());
-            metadata.insert("method".to_string(), method.to_string());
-
-            let response = ClientStream {
-                build_id: build_id.to_string(),
-                packet_type: Some(client_stream::PacketType::ImageTransfer(ImageTransfer {
-                    id: transfer.id.clone(),
-                    direction: TransferDirection::Into as i32,
-                    tag: digest.to_string(),
-                    descriptor: None,
-                    data: Vec::new(),
-                    complete: true,
-                    metadata,
-                })),
-            };
-            let _ = client_tx.send(response).await;
-        }
-        "/containerd.services.content.v1.Content/ReaderAt" => {}
-        _ => {}
     }
 
-    Ok(())
+    let Some(digest) = content_digest(transfer) else {
+        return send_content_error(
+            client_tx,
+            build_id,
+            transfer,
+            method,
+            "content-store request named no digest",
+        )
+        .await;
+    };
+
+    let size = match ensure_blob(&digest, session).await {
+        Some(size) => size,
+        None => {
+            let message = format!("blob {digest} is not in the local content store");
+            return send_content_error(client_tx, build_id, transfer, method, &message).await;
+        }
+    };
+
+    // `ReaderAt` probes with offset 0 and length 0 purely to learn the size,
+    // and reads an empty payload as EOF thereafter.
+    let offset = numeric_metadata(&transfer.metadata, "offset").unwrap_or(0);
+    let length = numeric_metadata(&transfer.metadata, "length").unwrap_or(0) as usize;
+    let data = if method == CONTENT_READER_AT_METHOD && length > 0 {
+        match content::read_blob_range(&digest, offset, length) {
+            Ok(data) => data,
+            Err(e) => {
+                let message = format!("cannot read blob {digest}: {e}");
+                return send_content_error(client_tx, build_id, transfer, method, &message).await;
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    let mut metadata = content_store_metadata(method);
+    metadata.insert("size".to_string(), size.to_string());
+    metadata.insert("offset".to_string(), offset.to_string());
+    metadata.insert("length".to_string(), data.len().to_string());
+    // Both timestamps are parsed as RFC 3339; the store keeps no creation
+    // time of its own, so report the blob's mtime for both.
+    let stored_at = blob_timestamp(&digest);
+    metadata.insert("created_at".to_string(), stored_at.clone());
+    metadata.insert("updated_at".to_string(), stored_at);
+
+    send_image_transfer(client_tx, build_id, transfer, &digest, metadata, data).await
+}
+
+/// Metadata every content-store reply carries.
+fn content_store_metadata(method: &str) -> HashMap<String, String> {
+    HashMap::from([
+        ("os".to_string(), "linux".to_string()),
+        ("stage".to_string(), "content-store".to_string()),
+        ("method".to_string(), method.to_string()),
+    ])
+}
+
+/// The digest a content-store request refers to.
+///
+/// `Info` puts it in `tag`; `ReaderAt` sends a descriptor instead.
+fn content_digest(transfer: &ImageTransfer) -> Option<String> {
+    if !transfer.tag.is_empty() {
+        return Some(transfer.tag.clone());
+    }
+    transfer
+        .descriptor
+        .as_ref()
+        .map(|d| d.digest.clone())
+        .filter(|digest| !digest.is_empty())
+}
+
+/// Size of a blob, pulling the build's base image first if it is missing.
+///
+/// The builder only asks the host for content it cannot find in its own cache,
+/// which happens for a base image the daemon has never unpacked. Pulling the
+/// resolved reference populates the daemon's content store, and the pull is
+/// attempted once per reference so a genuinely absent blob fails instead of
+/// looping.
+async fn ensure_blob(digest: &str, session: &mut BuildSession<'_>) -> Option<u64> {
+    if let Some(size) = content::blob_size(digest) {
+        return Some(size);
+    }
+
+    let resolved = session.resolved.as_ref()?;
+    if session.pulled.iter().any(|r| r == &resolved.reference) {
+        return None;
+    }
+    let (reference, platform) = (resolved.reference.clone(), resolved.platform.clone());
+    session.pulled.push(reference.clone());
+
+    let (os, architecture) = split_platform(&platform);
+    let platform_json = serde_json::to_vec(&serde_json::json!({
+        "os": os,
+        "architecture": architecture,
+    }))
+    .ok()?;
+    pull_image(&reference, &platform_json).await.ok()?;
+
+    content::blob_size(digest)
+}
+
+/// When a blob was last written, formatted the way the shim parses it.
+fn blob_timestamp(digest: &str) -> String {
+    let stored = content::blob_path(digest)
+        .and_then(|path| std::fs::metadata(path).ok())
+        .map(|meta| fssync::mtime_secs(&meta))
+        .unwrap_or(0);
+    fssync::rfc3339_utc(stored)
+}
+
+/// Send one content-store reply.
+async fn send_image_transfer(
+    client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
+    build_id: &str,
+    transfer: &ImageTransfer,
+    digest: &str,
+    metadata: HashMap<String, String>,
+    data: Vec<u8>,
+) -> Result<(), AppleContainerError> {
+    let response = ClientStream {
+        build_id: build_id.to_string(),
+        packet_type: Some(client_stream::PacketType::ImageTransfer(ImageTransfer {
+            id: transfer.id.clone(),
+            direction: TransferDirection::Into as i32,
+            tag: digest.to_string(),
+            descriptor: transfer.descriptor.clone(),
+            data,
+            complete: true,
+            metadata,
+        })),
+    };
+
+    client_tx.send(response).await.map_err(|e| {
+        AppleContainerError::XpcError(format!("failed to send content-store reply: {e}"))
+    })
+}
+
+/// Report a content-store failure rather than leaving the builder waiting.
+async fn send_content_error(
+    client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
+    build_id: &str,
+    transfer: &ImageTransfer,
+    method: &str,
+    message: &str,
+) -> Result<(), AppleContainerError> {
+    let mut metadata = content_store_metadata(method);
+    metadata.insert("error".to_string(), message.to_string());
+    send_image_transfer(
+        client_tx,
+        build_id,
+        transfer,
+        &transfer.tag.clone(),
+        metadata,
+        Vec::new(),
+    )
+    .await
 }
 
 /// Resolve a source path relative to the context directory.
@@ -704,86 +1034,6 @@ fn resolve_path(context: &Path, source: &str) -> std::path::PathBuf {
         std::path::PathBuf::from(source)
     } else {
         context.join(source)
-    }
-}
-
-/// Walk a directory and collect file info entries.
-fn walk_dir(
-    root: &Path,
-    dir: &Path,
-    _include_patterns: &[String],
-    entries: &mut Vec<FileInfo>,
-) -> Result<(), AppleContainerError> {
-    let read_dir = std::fs::read_dir(dir).map_err(AppleContainerError::Io)?;
-
-    let mut items: Vec<_> = read_dir.filter_map(|e| e.ok()).collect();
-    items.sort_by_key(|e| e.file_name());
-
-    for entry in items {
-        let path = entry.path();
-        let name = path
-            .strip_prefix(root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .to_string();
-
-        // Skip hidden files and common build artifacts.
-        if name.starts_with('.') {
-            continue;
-        }
-
-        let meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-
-        entries.push(FileInfo::from_metadata(&name, &meta));
-
-        if meta.is_dir() {
-            walk_dir(root, &path, _include_patterns, entries)?;
-        }
-    }
-
-    Ok(())
-}
-
-/// File metadata matching the Swift `FileInfo` struct.
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct FileInfo {
-    name: String,
-    size: u64,
-    mode: u32,
-    mod_time: i64,
-    is_dir: bool,
-    uid: u32,
-    gid: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    link_target: Option<String>,
-}
-
-impl FileInfo {
-    fn from_metadata(name: &str, meta: &std::fs::Metadata) -> Self {
-        use std::os::unix::fs::MetadataExt;
-        use std::time::UNIX_EPOCH;
-
-        let mod_time = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-
-        Self {
-            name: name.to_string(),
-            size: meta.len(),
-            mode: meta.mode(),
-            mod_time,
-            is_dir: meta.is_dir(),
-            uid: meta.uid(),
-            gid: meta.gid(),
-            link_target: None,
-        }
     }
 }
 
@@ -1045,12 +1295,10 @@ pub async fn ensure_builder(conn: &XpcConnection) -> Result<(), AppleContainerEr
 
     let kernel_bytes = get_default_kernel(conn).await?;
 
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let exports_dir = std::path::PathBuf::from(&home)
-        .join("Library/Application Support/com.apple.container/builder");
     // Ensure the exports directory exists (the builder shim writes build
     // outputs here via virtiofs).
-    let _ = std::fs::create_dir_all(&exports_dir);
+    let exports_dir = builder_exports_root();
+    std::fs::create_dir_all(&exports_dir).map_err(AppleContainerError::Io)?;
 
     // Build the full config as raw JSON — the builder needs fields
     // (networks, mount types, rosetta) that our ContainerConfiguration
@@ -1187,6 +1435,241 @@ async fn wait_for_running(conn: &XpcConnection, id: &str) -> Result<(), AppleCon
 mod tests {
     use super::*;
     use oci_client::manifest::ImageIndexEntry;
+
+    /// Run one handler to completion on a throwaway runtime.
+    fn run<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(future)
+    }
+
+    const REPLY_ID: &str = "per-request-demux-id";
+
+    fn build_transfer(metadata: &[(&str, &str)], source: &str) -> BuildTransfer {
+        BuildTransfer {
+            id: "request-1".to_string(),
+            direction: TransferDirection::Outof as i32,
+            source: Some(source.to_string()),
+            destination: None,
+            data: Vec::new(),
+            complete: false,
+            is_directory: false,
+            metadata: metadata
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    /// Collect the `BuildTransfer` replies a handler queued.
+    fn drain(rx: &mut tokio::sync::mpsc::Receiver<ClientStream>) -> Vec<(String, BuildTransfer)> {
+        rx.close();
+        let mut replies = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let Some(client_stream::PacketType::BuildTransfer(transfer)) = msg.packet_type {
+                replies.push((msg.build_id, transfer));
+            }
+        }
+        replies
+    }
+
+    fn context_with(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("temp context");
+        for (name, contents) in files {
+            let path = dir.path().join(name);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("context subdirectory");
+            }
+            std::fs::write(path, contents).expect("context file");
+        }
+        dir
+    }
+
+    /// The exact shape issue #4's hang came down to: the shim blocks in
+    /// `readTarHash` until a packet carrying `hash` arrives, and only then
+    /// drains the archive. Answering in `json` mode sent neither.
+    #[test]
+    fn walk_replies_with_a_checksum_packet_and_then_the_archive() {
+        let dir = context_with(&[("app.txt", "payload")]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let request = build_transfer(&[("stage", "fssync"), ("method", "Walk"), ("mode", "tar")], ".");
+
+        run(handle_walk(&request, &tx, REPLY_ID, dir.path())).expect("a tar walk must succeed");
+        let replies = drain(&mut rx);
+
+        assert!(replies.len() >= 2, "expected a hash packet and an archive");
+        let (_, hash_packet) = &replies[0];
+        assert!(
+            hash_packet.metadata.contains_key("hash"),
+            "the first packet must carry the checksum: {:?}",
+            hash_packet.metadata
+        );
+        assert!(hash_packet.data.is_empty(), "the hash packet carries no data");
+        assert!(!hash_packet.complete);
+
+        assert!(
+            replies.iter().all(|(_, p)| p.metadata.get("mode").is_none()),
+            "no reply may advertise a transfer mode the shim does not implement"
+        );
+        assert!(
+            replies[1..].iter().all(|(_, p)| !p.metadata.contains_key("hash")),
+            "only the first packet may carry a hash, or the rest are read as more hashes"
+        );
+
+        let (_, last) = replies.last().expect("at least one packet");
+        assert!(last.complete, "the final archive packet must set `complete`");
+        assert_eq!(
+            replies[..replies.len() - 1]
+                .iter()
+                .filter(|(_, p)| p.complete)
+                .count(),
+            0,
+            "`complete` ends the transfer, so only the last packet may set it"
+        );
+
+        // The archive packets concatenate into the tar the shim unpacks.
+        let archive: Vec<u8> = replies[1..]
+            .iter()
+            .flat_map(|(_, p)| p.data.clone())
+            .collect();
+        let names: Vec<String> = tar::Archive::new(archive.as_slice())
+            .entries()
+            .expect("entries")
+            .map(|e| e.expect("entry").path().expect("path").to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["app.txt".to_string()]);
+    }
+
+    /// Replies are demultiplexed by the per-request id, not the build's own.
+    #[test]
+    fn walk_replies_echo_the_requests_routing_ids() {
+        let dir = context_with(&[("app.txt", "payload")]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let request = build_transfer(&[("method", "Walk"), ("mode", "tar")], ".");
+
+        run(handle_walk(&request, &tx, REPLY_ID, dir.path())).expect("walk");
+
+        for (build_id, transfer) in drain(&mut rx) {
+            assert_eq!(build_id, REPLY_ID);
+            assert_eq!(transfer.id, request.id);
+        }
+    }
+
+    /// An unimplementable mode must fail loudly. Previously every request was
+    /// answered in `json`, which deadlocked both sides silently.
+    #[test]
+    fn walk_reports_an_error_for_a_mode_the_shim_cannot_receive() {
+        let dir = context_with(&[("app.txt", "payload")]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let request = build_transfer(&[("method", "Walk"), ("mode", "json")], ".");
+
+        let outcome = run(handle_walk(&request, &tx, REPLY_ID, dir.path()));
+        assert!(outcome.is_err(), "an unsupported mode must not report success");
+
+        let replies = drain(&mut rx);
+        assert_eq!(replies.len(), 1, "exactly one error packet");
+        let (_, error) = &replies[0];
+        assert!(
+            error.metadata.contains_key("error"),
+            "the shim only stops waiting when it sees an `error` key: {:?}",
+            error.metadata
+        );
+        assert!(error.complete);
+    }
+
+    /// An empty context still has to send a data packet: `readTarHeader`
+    /// blocks until one arrives.
+    #[test]
+    fn walk_sends_an_archive_even_for_an_empty_context() {
+        let dir = tempfile::tempdir().expect("temp context");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let request = build_transfer(&[("method", "Walk"), ("mode", "tar")], ".");
+
+        run(handle_walk(&request, &tx, REPLY_ID, dir.path())).expect("walk");
+        let replies = drain(&mut rx);
+
+        assert!(replies.len() >= 2, "a hash packet and at least one data packet");
+        assert!(replies.last().expect("last").1.complete);
+    }
+
+    /// `pkg/fileutils/file_info.go` reads these out of the metadata map and
+    /// silently substitutes zero for anything absent, so a JSON body in `data`
+    /// made every file look empty.
+    #[test]
+    fn info_answers_in_metadata_rather_than_a_json_body() {
+        let dir = context_with(&[("app.txt", "payload")]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let request = build_transfer(&[("method", "Info")], "app.txt");
+
+        run(handle_info(&request, &tx, REPLY_ID, dir.path())).expect("info");
+        let replies = drain(&mut rx);
+
+        let (_, reply) = &replies[0];
+        assert!(reply.data.is_empty(), "the payload belongs in metadata");
+        assert_eq!(reply.metadata.get("size").map(String::as_str), Some("7"));
+        assert!(!reply.is_directory);
+        for key in ["mode", "uid", "gid", "modified_at"] {
+            assert!(reply.metadata.contains_key(key), "missing {key}");
+        }
+        // Parsed with `time.Parse(time.RFC3339, ...)`, which rejects an integer.
+        let modified = reply.metadata.get("modified_at").expect("modified_at");
+        assert!(modified.ends_with('Z') && modified.contains('T'), "{modified}");
+    }
+
+    #[test]
+    fn info_flags_directories_so_the_walk_can_recurse() {
+        let dir = context_with(&[("src/app.txt", "payload")]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let request = build_transfer(&[("method", "Info")], "src");
+
+        run(handle_info(&request, &tx, REPLY_ID, dir.path())).expect("info");
+        assert!(drain(&mut rx)[0].1.is_directory);
+    }
+
+    /// BuildKit probes for `.dockerignore` on every build; a missing path has
+    /// to come back as an error rather than silently as an empty file.
+    #[test]
+    fn info_reports_a_missing_path_instead_of_pretending_it_is_empty() {
+        let dir = tempfile::tempdir().expect("temp context");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let request = build_transfer(&[("method", "Info")], ".dockerignore");
+
+        run(handle_info(&request, &tx, REPLY_ID, dir.path())).expect("info");
+        assert!(drain(&mut rx)[0].1.metadata.contains_key("error"));
+    }
+
+    /// The shim sends the caller's buffer size as `length`; reading `len`
+    /// meant every read returned the whole file from the offset.
+    #[test]
+    fn read_honours_the_length_the_shim_asked_for() {
+        let dir = context_with(&[("app.txt", "0123456789")]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let request = build_transfer(
+            &[("method", "Read"), ("offset", "2"), ("length", "3")],
+            "app.txt",
+        );
+
+        run(handle_read(&request, &tx, REPLY_ID, dir.path())).expect("read");
+        assert_eq!(drain(&mut rx)[0].1.data, b"234");
+    }
+
+    #[test]
+    fn read_past_the_end_of_a_file_comes_back_empty() {
+        let dir = context_with(&[("app.txt", "0123456789")]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let request = build_transfer(
+            &[("method", "Read"), ("offset", "99"), ("length", "8")],
+            "app.txt",
+        );
+
+        run(handle_read(&request, &tx, REPLY_ID, dir.path())).expect("read");
+        assert!(
+            drain(&mut rx)[0].1.data.is_empty(),
+            "the shim reads an empty payload as EOF"
+        );
+    }
 
     /// A multi-arch index shaped like `docker.io/library/alpine:latest`:
     /// several Linux architectures plus an attestation entry carrying the

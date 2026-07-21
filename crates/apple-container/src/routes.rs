@@ -97,6 +97,17 @@ impl XpcKey {
     pub const INSECURE_FLAG: &str = "insecureFlag";
     pub const MAX_CONCURRENT_DOWNLOADS: &str = "maxConcurrentDownloads";
     pub const FILESYSTEM: &str = "filesystem";
+
+    /// Host path of the OCI archive passed to `imageLoad`.
+    pub const FILE_PATH: &str = "filePath";
+    /// Whether `imageLoad` accepts an archive containing rejected members.
+    pub const FORCE_LOAD: &str = "forceLoad";
+    /// JSON `[ImageDescription]` returned by `imageLoad`.
+    pub const IMAGE_DESCRIPTIONS: &str = "imageDescriptions";
+    /// JSON `[String]` of archive members `imageLoad` refused.
+    pub const REJECTED_MEMBERS: &str = "rejectedMembers";
+    /// Target reference for `imageTag`.
+    pub const IMAGE_NEW_REFERENCE: &str = "imageNewReference";
 }
 
 /// Routes supported by the Apple Container Image Service XPC API.
@@ -104,6 +115,8 @@ pub enum ImageRoute {
     ImagePull,
     ImageList,
     ImageUnpack,
+    ImageLoad,
+    ImageTag,
     SnapshotGet,
 }
 
@@ -113,6 +126,8 @@ impl ImageRoute {
             Self::ImagePull => "imagePull",
             Self::ImageList => "imageList",
             Self::ImageUnpack => "imageUnpack",
+            Self::ImageLoad => "imageLoad",
+            Self::ImageTag => "imageTag",
             Self::SnapshotGet => "snapshotGet",
         }
     }

@@ -380,38 +380,52 @@ async fn fetch_and_cache_oci_config(reference: &str) -> Result<CachedImageConfig
     let config_json: serde_json::Value = serde_json::from_slice(&config_data)
         .map_err(|e| DevError::Runtime(format!("parse image config JSON: {e}")))?;
 
-    let env = config_json
-        .get("config")
-        .and_then(|c| c.get("Env"))
-        .and_then(|e| e.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    let user = config_json
-        .get("config")
-        .and_then(|c| c.get("User"))
-        .and_then(|u| u.as_str())
-        .map(|s| s.to_string());
-
-    let working_dir = config_json
-        .get("config")
-        .and_then(|c| c.get("WorkingDir"))
-        .and_then(|w| w.as_str())
-        .map(|s| s.to_string());
-
-    let cached = CachedImageConfig {
-        env,
-        user,
-        working_dir,
-    };
+    let cached = CachedImageConfig::from_oci_config(&config_json);
     if let Err(e) = write_cached_config(reference, &cached) {
         eprintln!("Warning: failed to cache OCI config: {e}");
     }
     Ok(cached)
+}
+
+impl CachedImageConfig {
+    /// Read the runtime fields out of an OCI image config document.
+    fn from_oci_config(config_json: &serde_json::Value) -> Self {
+        let section = config_json.get("config");
+        let string_field = |name: &str| {
+            section
+                .and_then(|c| c.get(name))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
+
+        Self {
+            env: section
+                .and_then(|c| c.get("Env"))
+                .and_then(|e| e.as_array())
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            user: string_field("User"),
+            working_dir: string_field("WorkingDir"),
+        }
+    }
+}
+
+/// Read an image's config from the daemon's own content store.
+///
+/// An image `dev` just built has no registry to query, and for a pulled image
+/// the local blob is the exact config the container will run with, so this is
+/// both the only source in one case and the more accurate one in the other.
+fn read_local_image_config(image: &ImageDescription) -> Option<CachedImageConfig> {
+    // Apple Containers runs Linux guests on Apple silicon only, matching the
+    // platform every other request in this runtime asks for.
+    let config_json =
+        apple_container::content::read_image_config(&image.descriptor.digest, "linux", "arm64")?;
+    Some(CachedImageConfig::from_oci_config(&config_json))
 }
 
 /// RAII guard that puts the terminal into raw mode and restores it on drop.
@@ -799,8 +813,11 @@ impl ContainerRuntime for AppleRuntime {
             // Fetch the OCI image config (cached or from registry) so the init
             // process inherits the image's expected environment and working
             // directory.
-            let cached = read_cached_config(&config.image);
-            let image_config = if let Some(c) = cached {
+            let image_config = if let Some(c) = read_cached_config(&config.image) {
+                c
+            } else if let Some(c) = read_local_image_config(&image) {
+                // The image is already unpacked here, so its config is on disk.
+                // An image `dev` built has no registry to fall back to.
                 c
             } else if config.image.starts_with("localhost/") {
                 // Local images have no registry to query; daemon handles env vars.
@@ -1236,6 +1253,39 @@ mod tests {
         let name = format!("vsc-my-project-{}", "a".repeat(64));
         let id = truncate_container_id(&name);
         assert_eq!(id.len(), MAX_CONTAINER_ID_LEN);
+    }
+
+    /// A locally built image has no registry to ask, so its environment and
+    /// working directory can only come from the config blob on disk. Losing
+    /// them silently drops whatever the devcontainer features put on `PATH`.
+    #[test]
+    fn image_config_is_read_from_an_oci_config_document() {
+        let document = serde_json::json!({
+            "config": {
+                "Env": ["PATH=/usr/local/bin:/usr/bin", "NODE_VERSION=22"],
+                "User": "node",
+                "WorkingDir": "/workspaces"
+            }
+        });
+
+        let config = CachedImageConfig::from_oci_config(&document);
+        assert_eq!(
+            config.env,
+            vec![
+                "PATH=/usr/local/bin:/usr/bin".to_string(),
+                "NODE_VERSION=22".to_string()
+            ]
+        );
+        assert_eq!(config.user.as_deref(), Some("node"));
+        assert_eq!(config.working_dir.as_deref(), Some("/workspaces"));
+    }
+
+    #[test]
+    fn an_image_config_without_a_config_section_yields_defaults() {
+        let config = CachedImageConfig::from_oci_config(&serde_json::json!({}));
+        assert!(config.env.is_empty());
+        assert_eq!(config.user, None);
+        assert_eq!(config.working_dir, None);
     }
 
     /// Two workspaces whose names share a long prefix must not collide. The retained
