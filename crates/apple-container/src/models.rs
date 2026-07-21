@@ -124,17 +124,45 @@ pub struct Filesystem {
 
 /// Filesystem attachment type, matching Apple's `FSType` enum.
 ///
-/// Swift's Codable encodes each case as `{"<caseName>": {}}`.
+/// Swift's Codable encodes each case as `{"<caseName>": {}}` (for empty
+/// cases) or `{"<caseName>": {…associated values…}}`.
+///
+/// `Volume` covers named volumes created by `container volume`/`container
+/// run --volume`, which the daemon attaches as a block-backed filesystem.
+/// `list`/`inspect` must deserialize these or `dev status`/`dev exec`/`dev up`
+/// discovery fails whenever any container in the daemon uses a named volume
+/// (issue #4).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FSType {
     Virtiofs(Empty),
     Tmpfs(Empty),
+    Volume(VolumeFilesystem),
 }
 
 /// Empty unit struct used for Swift-compatible enum case encoding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Empty {}
+
+/// Associated values for the `Volume` case of [`FSType`].
+///
+/// `cache` and `sync` are themselves Swift enums encoded as single-key
+/// objects (e.g. `{"on":{}}`, `{"fsync":{}}`). They are captured opaquely so
+/// new modes the daemon adds do not break deserialization of `list`/`inspect`
+/// output. Unknown fields are likewise tolerated (serde ignores them by
+/// default), so adding fields here is forward-compatible.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VolumeFilesystem {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub format: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<serde_json::Value>,
+}
 
 /// A published port mapping.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -303,4 +331,79 @@ pub struct ContainerStats {
     pub memory_usage: u64,
     #[serde(default)]
     pub disk_usage: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `list`/`inspect` reply must deserialize even when a container in the
+    /// daemon uses a named volume filesystem. Before the `Volume` variant was
+    /// added, `FSType` rejected `"volume"` and `container ls`/`container inspect`
+    /// — and therefore `dev status`/`dev exec`/`dev up` discovery — failed for
+    /// every container whenever any one container had a volume mount (issue #4).
+    #[test]
+    fn filesystem_with_volume_mount_deserializes() {
+        let json = r#"{
+            "type": {"volume": {"name": "move-pg-data", "cache": {"on": {}}, "sync": {"fsync": {}}, "format": "ext4"}},
+            "source": "/Users/u/Library/Application Support/com.apple.container/volumes/move-pg-data/volume.img",
+            "destination": "/var/lib/postgresql/data",
+            "options": []
+        }"#;
+        let fs: Filesystem =
+            serde_json::from_str(json).expect("volume filesystem must deserialize");
+        match fs.fs_type {
+            FSType::Volume(v) => {
+                assert_eq!(v.name, "move-pg-data");
+                assert_eq!(v.format, "ext4");
+            }
+            other => panic!("expected Volume, got {other:?}"),
+        }
+    }
+
+    /// A complete `containerList` snapshot containing a volume mount and the
+    /// extra configuration fields the daemon emits (`rosetta`, `ssh`,
+    /// `useInit`, `publishedSockets`, `sysctls`, `readOnly`, `virtualization`)
+    /// must deserialize. This is the shape that broke `dev status` on a daemon
+    /// that also hosted a postgres container with a named volume.
+    #[test]
+    fn container_snapshot_with_volume_and_extra_fields_deserializes() {
+        let json = r#"{
+            "configuration": {
+                "id": "move-pg",
+                "image": {"reference": "docker.io/library/postgres:16"},
+                "mounts": [{
+                    "type": {"volume": {"name": "move-pg-data", "cache": {"on": {}}, "sync": {"fsync": {}}, "format": "ext4"}},
+                    "source": "/v.img",
+                    "destination": "/data",
+                    "options": []
+                }],
+                "publishedPorts": [],
+                "labels": {},
+                "initProcess": {"executable": "postgres", "arguments": [], "environment": [], "workingDirectory": "/", "terminal": false},
+                "resources": {"cpus": 4, "memoryInBytes": 1073741824},
+                "runtimeHandler": "container-runtime-linux",
+                "platform": {"architecture": "arm64", "os": "linux"},
+                "networks": [{"network": "default", "options": {"hostname": "move-pg"}}],
+                "rosetta": false,
+                "virtualization": false,
+                "readOnly": false,
+                "useInit": false,
+                "publishedSockets": [],
+                "ssh": false,
+                "sysctls": {}
+            },
+            "status": "running",
+            "networks": [],
+            "startedDate": 806283546.523321
+        }"#;
+        let snap: ContainerSnapshot =
+            serde_json::from_str(json).expect("snapshot with volume mount must deserialize");
+        assert_eq!(snap.configuration.id, "move-pg");
+        assert!(matches!(
+            snap.configuration.mounts[0].fs_type,
+            FSType::Volume(_)
+        ));
+        assert_eq!(snap.status, RuntimeStatus::Running);
+    }
 }

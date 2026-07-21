@@ -574,25 +574,49 @@ impl ContainerRuntime for AppleRuntime {
                 .await
                 .map_err(|e| DevError::Runtime(format!("exec failed: {e}")))?;
 
-            // Close write ends so reads will see EOF.
+            // `create_process` only registers the process with the daemon; it does
+            // not run it. Without `start_process` the process never executes, the
+            // stdout/stderr pipe write ends are never closed, and `read_to_string`
+            // below blocks forever — so `dev exec` hangs (issue #4). Mirrors
+            // Apple's CLI, which calls `process.start()` after `createProcess`.
+            self.client
+                .start_process(&id, &process_id)
+                .await
+                .map_err(|e| DevError::Runtime(format!("exec start failed: {e}")))?;
+
+            // Close our write ends so reads see EOF once the process exits and
+            // the daemon closes its copies.
             drop(stdout_write);
             drop(stderr_write);
 
-            // Read stdout and stderr.
-            use std::io::Read;
-            let mut stdout_buf = String::new();
-            let mut stderr_buf = String::new();
-
+            // Read stdout and stderr concurrently so a process that writes a lot
+            // to one stream does not deadlock against the other.
             let mut stdout_read = stdout_read;
             let mut stderr_read = stderr_read;
+            let stdout_handle = tokio::task::spawn_blocking(move || {
+                use std::io::Read;
+                let mut buf = String::new();
+                stdout_read.read_to_string(&mut buf).map(|_| buf)
+            });
+            let stderr_handle = tokio::task::spawn_blocking(move || {
+                use std::io::Read;
+                let mut buf = String::new();
+                stderr_read.read_to_string(&mut buf).map(|_| buf)
+            });
 
-            stdout_read
-                .read_to_string(&mut stdout_buf)
+            let stdout_buf = stdout_handle
+                .await
+                .map_err(|e| DevError::Runtime(format!("stdout reader join: {e}")))?
                 .map_err(|e| DevError::Runtime(format!("read stdout: {e}")))?;
-            stderr_read
-                .read_to_string(&mut stderr_buf)
+            let stderr_buf = stderr_handle
+                .await
+                .map_err(|e| DevError::Runtime(format!("stderr reader join: {e}")))?
                 .map_err(|e| DevError::Runtime(format!("read stderr: {e}")))?;
 
+            // The exit code is not surfaced by the current XPC reply set, so a
+            // non-zero exit is reported as 0. Output is still captured and
+            // returned, which is enough for `dev exec` to be usable; correct
+            // exit-code propagation is tracked separately.
             Ok(ExecResult {
                 exit_code: 0,
                 stdout: stdout_buf,
@@ -651,6 +675,13 @@ impl ContainerRuntime for AppleRuntime {
                 )
                 .await
                 .map_err(|e| DevError::Runtime(format!("exec_interactive failed: {e}")))?;
+
+            // `create_process` does not run the process; `start_process` does.
+            // Without it the interactive shell never starts (issue #4).
+            self.client
+                .start_process(&id, &process_id)
+                .await
+                .map_err(|e| DevError::Runtime(format!("exec_interactive start failed: {e}")))?;
 
             // _raw_guard is dropped here, restoring the terminal.
             Ok(())
@@ -817,6 +848,87 @@ mod tests {
             "names differing only in suffix must not collide"
         );
         assert!(id_a.ends_with(&a[a.len() - 18..]));
+    }
+
+    /// The Apple container config built from a `dev up`-style `ContainerConfig`
+    /// must (a) truncate the ID to Apple's limit and (b) carry the
+    /// `devcontainer.local_folder` label that `dev status`/`dev exec` filter on.
+    ///
+    /// This is the creation→discovery round-trip at the heart of issue #4: the
+    /// reported bug was that `dev up` reported readiness but the container was
+    /// not discoverable by `dev status`/`dev exec`. On the broken path the ID
+    /// was not truncated (so `container inspect` came back empty) and discovery
+    /// was ID-based rather than label-based. This test pins both halves: the ID
+    /// fits the daemon limit, and the label that `workspace_labels(workspace, None)`
+    /// produces matches a label actually set on the created container.
+    #[test]
+    fn to_apple_config_truncates_id_and_carries_discovery_label() {
+        use crate::runtime::WorkspaceMount;
+        use crate::util::{container_name, workspace_labels};
+
+        let workspace = std::path::Path::new("/tmp/test-apple-repro");
+        let config_file = workspace.join(".devcontainer/devcontainer.json");
+
+        // Build the ContainerConfig exactly as `commands::up::run` does: the
+        // name comes from `container_name(workspace)` and the labels from
+        // `workspace_labels(workspace, Some(config_file))`.
+        let name = container_name(workspace);
+        let labels: HashMap<String, String> = workspace_labels(workspace, Some(&config_file))
+            .into_iter()
+            .collect();
+        let local_folder = labels
+            .get("devcontainer.local_folder")
+            .expect("up config must set devcontainer.local_folder")
+            .clone();
+
+        let container_config = ContainerConfig {
+            image: "docker.io/library/alpine:latest".to_string(),
+            name: name.clone(),
+            labels,
+            env: HashMap::new(),
+            mounts: vec![],
+            volumes: vec![],
+            ports: vec![],
+            workspace_mount: Some(WorkspaceMount {
+                source: workspace.to_path_buf(),
+                target: "/workspaces/test-apple-repro".to_string(),
+            }),
+            extra_args: vec![],
+            entrypoint: None,
+            init: false,
+            privileged: false,
+            cap_add: vec![],
+            security_opt: vec![],
+        };
+
+        let image = ImageDescription::default();
+        let apple_config = to_apple_config(&container_config, image, &[]);
+
+        // (a) ID fits Apple's daemon limit.
+        assert_eq!(
+            apple_config.id.len(),
+            MAX_CONTAINER_ID_LEN,
+            "Apple container ID must be truncated to the daemon limit"
+        );
+        assert_ne!(apple_config.id, container_config.name);
+
+        // (b) The discovery label survives into the Apple config, and the label
+        // that `dev status`/`dev exec` query with (`workspace_labels(workspace, None)`,
+        // which is local_folder only) matches it — so a container created by
+        // `dev up` is findable by the same workspace label.
+        assert_eq!(
+            apple_config.labels.get("devcontainer.local_folder"),
+            Some(&local_folder),
+            "created container must carry the workspace local_folder label"
+        );
+        let discovery_labels = workspace_labels(workspace, None);
+        for (key, value) in &discovery_labels {
+            assert_eq!(
+                apple_config.labels.get(key),
+                Some(value),
+                "discovery label {key} must match the label set at create time"
+            );
+        }
     }
 
     /// Direct integration test: create + start a container using AppleRuntime,
@@ -1057,6 +1169,135 @@ mod tests {
         runtime
             .client
             .delete(&truncated_id, true)
+            .await
+            .expect("delete failed");
+    }
+
+    /// Integration test for the `dev exec` path: after create + start, a
+    /// short-lived command must actually run and return its output within a
+    /// bounded time. Before `start_process` was added after `create_process`,
+    /// the process was never started and `exec` hung forever (issue #4).
+    ///
+    /// Ignored by default: requires a running Apple Container daemon and pulls
+    /// an image over the network. Run with
+    /// `cargo test --features apple -- --ignored`.
+    #[tokio::test]
+    #[ignore = "requires a live Apple Container daemon and network access"]
+    #[cfg(target_os = "macos")]
+    async fn test_apple_runtime_exec_runs_and_returns() {
+        let runtime = AppleRuntime::connect().expect("connect failed");
+        let container_id = "apple-runtime-exec-test";
+        let image_ref = "docker.io/library/alpine:latest";
+
+        // Pull and unpack image.
+        let platform = serde_json::json!({"architecture": "arm64", "os": "linux"});
+        let platform_json = serde_json::to_vec(&platform).unwrap();
+        let image_desc_bytes = apple_container::build::pull_image(image_ref, &platform_json)
+            .await
+            .expect("pull_image failed");
+        apple_container::build::unpack_image(&image_desc_bytes, &platform_json)
+            .await
+            .expect("unpack_image failed");
+        let image: ImageDescription =
+            serde_json::from_slice(&image_desc_bytes).expect("parse image descriptor failed");
+        let kernel = runtime
+            .client
+            .get_default_kernel()
+            .await
+            .expect("get_default_kernel failed");
+
+        let config = ContainerConfiguration {
+            id: container_id.to_string(),
+            image,
+            mounts: vec![],
+            published_ports: vec![],
+            labels: HashMap::new(),
+            init_process: ProcessConfiguration {
+                executable: "sleep".to_string(),
+                arguments: vec!["3600".to_string()],
+                environment: vec![],
+                working_directory: "/".to_string(),
+                terminal: false,
+                user: User::Raw {
+                    raw: UserString {
+                        user_string: "root".to_string(),
+                    },
+                },
+                supplemental_groups: vec![],
+                rlimits: vec![],
+            },
+            resources: Resources {
+                cpus: 4,
+                memory_in_bytes: 1024 * 1024 * 1024,
+            },
+            runtime_handler: "container-runtime-linux".to_string(),
+            platform: Platform {
+                architecture: "arm64".to_string(),
+                os: "linux".to_string(),
+            },
+            networks: vec![NetworkInfo {
+                network: "default".to_string(),
+                options: NetworkOptions {
+                    hostname: Some(container_id.to_string()),
+                    mtu: Some(1280),
+                },
+            }],
+            dns: Some(DnsInfo {
+                nameservers: vec![],
+                search_domains: vec![],
+                options: vec![],
+            }),
+        };
+
+        // Clean up any previous test container.
+        let _ = runtime.client.stop(container_id).await;
+        let _ = runtime.client.delete(container_id, true).await;
+
+        runtime
+            .client
+            .create(&config, &kernel)
+            .await
+            .expect("create failed");
+        let devnull = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let fd = devnull.as_raw_fd();
+        runtime
+            .client
+            .bootstrap(container_id, fd, fd, fd)
+            .await
+            .expect("bootstrap failed");
+        runtime
+            .client
+            .start_process(container_id, container_id)
+            .await
+            .expect("start_process failed");
+
+        // The regression: before the fix, `exec` created the process but never
+        // started it, so this hung indefinitely. Wrap in a timeout so a
+        // regression fails fast instead of stalling CI.
+        let exec_fut = runtime.exec(
+            container_id,
+            &["echo".to_string(), "hello".to_string()],
+            None,
+        );
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), exec_fut)
+            .await
+            .expect("exec hung — start_process was not called after create_process")
+            .expect("exec failed");
+        assert_eq!(
+            result.stdout.trim(),
+            "hello",
+            "exec should return command output"
+        );
+
+        // Clean up.
+        runtime
+            .client
+            .stop(container_id)
+            .await
+            .expect("stop failed");
+        runtime
+            .client
+            .delete(container_id, true)
             .await
             .expect("delete failed");
     }

@@ -38,6 +38,39 @@ pub async fn run(
     no_base: bool,
 ) -> anyhow::Result<()> {
     let runtime = detect_runtime(runtime_override).await?;
+    run_with_runtime(
+        workspace,
+        runtime.as_ref(),
+        rebuild,
+        no_cache,
+        verbose,
+        frozen_lockfile,
+        update_remote_user_uid_default,
+        port_overrides,
+        no_base,
+    )
+    .await
+}
+
+/// `dev up` body once the runtime has been selected.
+///
+/// Split from [`run`] so the create/start/readiness flow can be driven with a
+/// stand-in [`ContainerRuntime`] in tests — the issue #4 regression boundary is
+/// that a failed create or start must propagate as an error before any
+/// "ready" message, and that the container config handed to the runtime
+/// carries the workspace label that `dev status`/`dev exec` later filter on.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_with_runtime(
+    workspace: &Path,
+    runtime: &dyn ContainerRuntime,
+    rebuild: bool,
+    no_cache: bool,
+    verbose: bool,
+    frozen_lockfile: bool,
+    update_remote_user_uid_default: &str,
+    port_overrides: &[String],
+    no_base: bool,
+) -> anyhow::Result<()> {
     let (config_path, recipe_config) = match find_config_source(workspace)? {
         ConfigSource::Direct(path) => (path, None),
         ConfigSource::Recipe(recipe_path) => {
@@ -67,7 +100,7 @@ pub async fn run(
             workspace,
             &config,
             &config_path,
-            runtime.as_ref(),
+            runtime,
             rebuild,
             no_cache,
             verbose,
@@ -116,19 +149,13 @@ pub async fn run(
                 runtime.start_container(&container.id).await?;
                 if config.post_start_command.is_some() {
                     let user = resolve_remote_user(
-                        runtime.as_ref(),
+                        runtime,
                         &container.image,
                         config.remote_user.as_deref(),
                     )
                     .await?;
-                    run_lifecycle_hooks(
-                        runtime.as_ref(),
-                        &container.id,
-                        &config,
-                        user.as_deref(),
-                        None,
-                    )
-                    .await?;
+                    run_lifecycle_hooks(runtime, &container.id, &config, user.as_deref(), None)
+                        .await?;
                 }
                 println!("Container '{}' started.", container.name);
                 return Ok(());
@@ -178,7 +205,7 @@ pub async fn run(
                 "devcontainer.json must specify 'image', 'build.dockerfile', or 'dockerComposeFile'"
             )
         })?;
-        ensure_image_present(runtime.as_ref(), image).await?;
+        ensure_image_present(runtime, image).await?;
         image.clone()
     } else if !rebuild && !no_cache && runtime.image_exists(&final_tag).await? {
         // Image already built (e.g. by `dev build`), skip rebuild.
@@ -187,7 +214,7 @@ pub async fn run(
     } else {
         // Determine base image
         let base_image = if let Some(ref image) = config.image {
-            ensure_image_present(runtime.as_ref(), image).await?;
+            ensure_image_present(runtime, image).await?;
             image.clone()
         } else if let Some(ref build) = config.build {
             let context_dir = config_path
@@ -266,8 +293,7 @@ pub async fn run(
             }
             let staging_dir = stage_feature_context(&ordered)?;
             let feature_user =
-                resolve_remote_user(runtime.as_ref(), &base_image, config.remote_user.as_deref())
-                    .await?;
+                resolve_remote_user(runtime, &base_image, config.remote_user.as_deref()).await?;
             let dockerfile = generate_feature_dockerfile_with_opts(
                 &base_image,
                 &ordered,
@@ -299,13 +325,9 @@ pub async fn run(
 
     // Resolve feature capabilities against the image the features produced, before the
     // UID-remap layer below shadows `final_image` with a derived tag.
-    let caps = resolve_container_capabilities(
-        runtime.as_ref(),
-        &final_image,
-        &ordered_features,
-        has_features,
-    )
-    .await?;
+    let caps =
+        resolve_container_capabilities(runtime, &final_image, &ordered_features, has_features)
+            .await?;
 
     // Build container config
     let name = container_name(workspace);
@@ -340,12 +362,8 @@ pub async fn run(
         .collect();
 
     // Resolve the effective remote user from config or image metadata.
-    let effective_user = resolve_remote_user(
-        runtime.as_ref(),
-        &final_image,
-        config.remote_user.as_deref(),
-    )
-    .await?;
+    let effective_user =
+        resolve_remote_user(runtime, &final_image, config.remote_user.as_deref()).await?;
     let remote_user = effective_user.as_deref();
 
     // Optionally build a UID-remapping layer to match host UID/GID.
@@ -354,7 +372,7 @@ pub async fn run(
         let image_meta = runtime.inspect_image_metadata(&final_image).await?;
         let image_user = image_meta.container_user.as_deref().unwrap_or("root");
         uid::build_uid_image(
-            runtime.as_ref(),
+            runtime,
             &final_image,
             &folder_image,
             remote_user.unwrap_or("root"),
@@ -430,18 +448,11 @@ pub async fn run(
     } else {
         Some(ordered_features.as_slice())
     };
-    run_lifecycle_hooks(
-        runtime.as_ref(),
-        &container_id,
-        &config,
-        remote_user,
-        feature_hooks,
-    )
-    .await?;
+    run_lifecycle_hooks(runtime, &container_id, &config, remote_user, feature_hooks).await?;
 
     // Clone dotfiles if configured (Gap 15).
     if let Some(ref dotfiles) = config.dotfiles {
-        install_dotfiles(runtime.as_ref(), &container_id, dotfiles, remote_user).await?;
+        install_dotfiles(runtime, &container_id, dotfiles, remote_user).await?;
     }
 
     println!("Container '{name}' is ready.");
@@ -1374,5 +1385,253 @@ mod tests {
         let mounts = parse_mounts(&strings);
         assert_eq!(mounts.len(), 1);
         assert_eq!(mounts[0].target, "/container");
+    }
+
+    // ---- issue #4 regression coverage: create/start error propagation and
+    // workspace-label discovery ----
+    //
+    // `run_with_runtime` is the seam `run` delegates to after runtime
+    // detection. These tests drive it with a stand-in runtime over a minimal
+    // image-based devcontainer.json so the create/start/readiness flow can be
+    // exercised deterministically in CI (no container daemon).
+
+    use crate::util::workspace_labels;
+    use std::sync::{Arc, Mutex};
+
+    /// Stand-in runtime for `run_with_runtime`. Captures the `ContainerConfig`
+    /// handed to `create_container` and the id handed to `start_container`, and
+    /// can be told to fail either step so error propagation can be asserted.
+    struct UpFakeRuntime {
+        image_exists: bool,
+        create_fails: bool,
+        start_fails: bool,
+        created_id: String,
+        created_config: Arc<Mutex<Option<ContainerConfig>>>,
+        started_id: Arc<Mutex<Option<String>>>,
+    }
+
+    impl UpFakeRuntime {
+        fn ok() -> Self {
+            Self {
+                image_exists: true,
+                create_fails: false,
+                start_fails: false,
+                created_id: "fake-id".to_string(),
+                created_config: Arc::new(Mutex::new(None)),
+                started_id: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        fn failing(create: bool, start: bool) -> Self {
+            Self {
+                image_exists: true,
+                create_fails: create,
+                start_fails: start,
+                created_id: "fake-id".to_string(),
+                created_config: Arc::new(Mutex::new(None)),
+                started_id: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        fn created_config(&self) -> ContainerConfig {
+            self.created_config
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("create_container was not called")
+        }
+    }
+
+    impl ContainerRuntime for UpFakeRuntime {
+        fn runtime_name(&self) -> &'static str {
+            "fake"
+        }
+
+        fn pull_image(&self, _image: &str) -> BoxFut<'_, ()> {
+            // image_exists returns true, so pull_image must never be reached.
+            unused()
+        }
+
+        fn build_image(
+            &self,
+            _dockerfile: &str,
+            _context: &Path,
+            _tag: &str,
+            _build_args: &HashMap<String, String>,
+            _no_cache: bool,
+            _verbose: bool,
+        ) -> BoxFut<'_, ()> {
+            unused()
+        }
+
+        fn create_container(&self, config: &ContainerConfig) -> BoxFut<'_, String> {
+            let config = config.clone();
+            let create_fails = self.create_fails;
+            let created_id = self.created_id.clone();
+            let capture = self.created_config.clone();
+            Box::pin(async move {
+                if create_fails {
+                    return Err(DevError::Runtime(
+                        "create_container failed (test-injected)".to_string(),
+                    ));
+                }
+                *capture.lock().unwrap() = Some(config);
+                Ok(created_id)
+            })
+        }
+
+        fn start_container(&self, id: &str) -> BoxFut<'_, ()> {
+            let id = id.to_string();
+            let start_fails = self.start_fails;
+            let capture = self.started_id.clone();
+            Box::pin(async move {
+                if start_fails {
+                    return Err(DevError::Runtime(
+                        "start_container failed (test-injected)".to_string(),
+                    ));
+                }
+                *capture.lock().unwrap() = Some(id);
+                Ok(())
+            })
+        }
+
+        fn stop_container(&self, _id: &str) -> BoxFut<'_, ()> {
+            unused()
+        }
+
+        fn remove_container(&self, _id: &str) -> BoxFut<'_, ()> {
+            unused()
+        }
+
+        fn exec(&self, _id: &str, _cmd: &[String], _user: Option<&str>) -> BoxFut<'_, ExecResult> {
+            unused()
+        }
+
+        fn exec_interactive(
+            &self,
+            _id: &str,
+            _cmd: &[String],
+            _user: Option<&str>,
+        ) -> BoxFut<'_, ()> {
+            unused()
+        }
+
+        fn inspect_container(&self, _id: &str) -> BoxFut<'_, ContainerInfo> {
+            unused()
+        }
+
+        fn list_containers(&self, _label_filters: &[String]) -> BoxFut<'_, Vec<ContainerInfo>> {
+            // No pre-existing container for a fresh temp workspace.
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn image_exists(&self, _image: &str) -> BoxFut<'_, bool> {
+            let exists = self.image_exists;
+            Box::pin(async move { Ok(exists) })
+        }
+
+        fn inspect_image_metadata(&self, _image: &str) -> BoxFut<'_, ImageMetadata> {
+            // No remote user, and update_remote_user_uid_default="never" skips
+            // UID remap, so the up flow never advances past create/start here.
+            Box::pin(async move { Ok(ImageMetadata::default()) })
+        }
+
+        fn exec_attached(
+            &self,
+            _id: &str,
+            _cmd: &[String],
+            _user: Option<&str>,
+        ) -> BoxFut<'_, AttachedExec> {
+            unused()
+        }
+    }
+
+    /// Drive `run_with_runtime` over a minimal image-based workspace.
+    async fn run_up_with_fake(rt: &UpFakeRuntime, workspace: &TempDir) -> anyhow::Result<()> {
+        super::run_with_runtime(
+            workspace.path(),
+            rt,
+            /* rebuild */ false,
+            /* no_cache */ false,
+            /* verbose */ false,
+            /* frozen_lockfile */ false,
+            /* update_remote_user_uid_default */ "never",
+            /* port_overrides */ &[],
+            /* no_base */ true,
+        )
+        .await
+    }
+
+    /// A failed `create_container` must propagate as an error from `dev up` —
+    /// no readiness may be reported when the container was not created. This
+    /// is the core of issue #4's "must not report readiness unless actually
+    /// created" acceptance.
+    #[tokio::test]
+    async fn up_propagates_create_container_error() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let rt = UpFakeRuntime::failing(true, false);
+        let err = run_up_with_fake(&rt, &workspace)
+            .await
+            .expect_err("create_container failure must surface as an error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("create_container failed"),
+            "error should mention create failure, got: {msg}"
+        );
+    }
+
+    /// A failed `start_container` must propagate as an error from `dev up` —
+    /// readiness must not survive a start failure (issue #4).
+    #[tokio::test]
+    async fn up_propagates_start_container_error() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let rt = UpFakeRuntime::failing(false, true);
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect_err("start_container failure must surface as an error");
+    }
+
+    /// The container config `dev up` hands to the runtime must carry the
+    /// `devcontainer.local_folder` workspace label, and that label must match
+    /// the one `dev status`/`dev exec` query with (`workspace_labels(workspace, None)`).
+    ///
+    /// On the issue #4 broken path, discovery was ID-based and the workspace
+    /// label was not the join key, so `dev status`/`dev exec` could not find a
+    /// container that `dev up` had just created. This pins the creation to
+    /// discovery contract at the `up` layer; the Apple-runtime half is pinned
+    /// in `runtime::apple::tests::to_apple_config_truncates_id_and_carries_discovery_label`.
+    #[tokio::test]
+    async fn up_labels_container_with_workspace_local_folder() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let rt = UpFakeRuntime::ok();
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("up should succeed with a cooperating fake runtime");
+
+        let created = rt.created_config();
+        let discovery_labels = workspace_labels(workspace.path(), None);
+        for (key, value) in &discovery_labels {
+            assert_eq!(
+                created.labels.get(key),
+                Some(value),
+                "dev up must set the {key} label used by dev status/dev exec"
+            );
+        }
+        let local_folder = created
+            .labels
+            .get("devcontainer.local_folder")
+            .expect("devcontainer.local_folder label must be set");
+        let abs_workspace = workspace
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.path().to_path_buf());
+        assert_eq!(
+            local_folder,
+            &abs_workspace.to_string_lossy().to_string(),
+            "local_folder label must be the absolute workspace path"
+        );
     }
 }
