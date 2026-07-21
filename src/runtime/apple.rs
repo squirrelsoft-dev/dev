@@ -18,13 +18,36 @@ use crate::runtime::{
 /// Apple Containers runtime using native XPC.
 pub struct AppleRuntime {
     client: AppleContainerClient,
+    /// Working directory per container id, so repeated execs do not each pay
+    /// for a daemon round trip. Populated directly when this process creates
+    /// the container, and by one lookup otherwise.
+    working_directories: std::sync::Mutex<HashMap<String, String>>,
 }
 
 impl AppleRuntime {
     pub fn connect() -> Result<Self, DevError> {
         let client = AppleContainerClient::connect()
             .map_err(|e| DevError::Runtime(format!("Apple Containers: {e}")))?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            working_directories: std::sync::Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn remembered_working_directory(&self, id: &str) -> Option<String> {
+        let cache = self
+            .working_directories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cache.get(id).cloned()
+    }
+
+    fn remember_working_directory(&self, id: &str, working_directory: &str) {
+        let mut cache = self
+            .working_directories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cache.insert(id.to_string(), working_directory.to_string());
     }
 
     pub async fn ping(&self) -> Result<(), DevError> {
@@ -110,14 +133,35 @@ impl AppleRuntime {
 
     /// The working directory the container's own processes use.
     ///
-    /// Falls back to `/` when the container cannot be inspected: an exec should
-    /// not fail merely because its starting directory could not be resolved.
+    /// Resolved at most once per container: `create_container` records what it
+    /// configured, and any other invocation (`dev exec`, `dev shell`) reads it
+    /// back from the daemon once. A lookup failure is reported and degrades to
+    /// `/` rather than failing the command, since an exec should still run when
+    /// only its starting directory is unknown.
     async fn container_working_directory(&self, id: &str) -> String {
-        let snapshot = self.client.get(id).await.ok();
-        let working_dir = snapshot
-            .as_ref()
-            .map(|s| s.configuration.init_process.working_directory.as_str());
-        absolute_or_root([working_dir])
+        if let Some(known) = self.remembered_working_directory(id) {
+            return known;
+        }
+
+        let working_directory = match self.client.get(id).await {
+            Ok(snapshot) => absolute_or_root([Some(
+                snapshot
+                    .configuration
+                    .init_process
+                    .working_directory
+                    .as_str(),
+            )]),
+            Err(e) => {
+                eprintln!(
+                    "Warning: could not read the working directory of container '{id}' \
+                     ({e}); running commands from /"
+                );
+                "/".to_string()
+            }
+        };
+
+        self.remember_working_directory(id, &working_directory);
+        working_directory
     }
 
     /// Run a command against the caller's terminal and wait for it to exit.
@@ -481,15 +525,21 @@ fn absolute_or_root<'a>(candidates: impl IntoIterator<Item = Option<&'a str>>) -
 ///
 /// Docker and Podman leave the exec working directory unset so it inherits the
 /// container's, which comes from the image's `WorkingDir`. Apple's daemon has
-/// no such inheritance, so the same directory is resolved here and applied to
-/// both the init process and every exec: the workspace folder if the container
-/// has one — that is where lifecycle hooks like `postCreateCommand: npm
-/// install` expect to run — otherwise the image's `WorkingDir`.
+/// no such inheritance, so the directory is resolved once here and applied to
+/// both the init process and every exec.
+///
+/// The resolved `workspaceFolder` comes first: that is where the devcontainer
+/// spec runs lifecycle commands, and it may be a subdirectory of the workspace
+/// mount (one project of a monorepo). The mount destination is the fallback for
+/// a container without a resolved folder, and the image's `WorkingDir` for one
+/// without a workspace at all.
 fn container_working_directory(
+    workspace_folder: Option<&str>,
     workspace_mount: Option<&WorkspaceMount>,
     image_working_dir: Option<&str>,
 ) -> String {
     absolute_or_root([
+        workspace_folder,
         workspace_mount.map(|ws| ws.target.as_str()),
         image_working_dir,
     ])
@@ -638,6 +688,7 @@ fn to_apple_config(
         },
         environment: init_env,
         working_directory: container_working_directory(
+            config.workspace_folder.as_deref(),
             config.workspace_mount.as_ref(),
             image_config.working_dir.as_deref(),
         ),
@@ -787,6 +838,8 @@ impl ContainerRuntime for AppleRuntime {
                 .create(&apple_config, &kernel)
                 .await
                 .map_err(|e| DevError::Runtime(format!("Failed to create container: {e}")))?;
+
+            self.remember_working_directory(&id, &apple_config.init_process.working_directory);
 
             Ok(id)
         })
@@ -1075,27 +1128,92 @@ mod tests {
         }
     }
 
-    /// The workspace folder is where a devcontainer's commands belong, so it
-    /// wins over the image's `WorkingDir`; the image value is the fallback for
-    /// containers without a workspace mount.
+    /// The resolved `workspaceFolder` is where a devcontainer's commands
+    /// belong, so it wins over both the mount root and the image's
+    /// `WorkingDir`; each of those is in turn the fallback for a container that
+    /// has no folder, and no workspace at all.
     #[test]
     fn container_working_directory_prefers_the_workspace_folder() {
-        let workspace = WorkspaceMount {
-            source: std::path::PathBuf::from("/host/project"),
-            target: "/workspaces/project".to_string(),
+        let mount = WorkspaceMount {
+            source: std::path::PathBuf::from("/host/monorepo"),
+            target: "/srv/app".to_string(),
         };
 
         assert_eq!(
-            container_working_directory(Some(&workspace), Some("/usr/src/app")),
-            "/workspaces/project"
+            container_working_directory(
+                Some("/srv/app/packages/api"),
+                Some(&mount),
+                Some("/usr/src/app")
+            ),
+            "/srv/app/packages/api",
+            "a workspaceFolder subdirectory must win over the mount root"
         );
         assert_eq!(
-            container_working_directory(None, Some("/usr/src/app")),
+            container_working_directory(None, Some(&mount), Some("/usr/src/app")),
+            "/srv/app"
+        );
+        assert_eq!(
+            container_working_directory(None, None, Some("/usr/src/app")),
             "/usr/src/app"
         );
-        assert_eq!(container_working_directory(None, None), "/");
-        assert_eq!(container_working_directory(None, Some("")), "/");
-        assert_eq!(container_working_directory(None, Some("app")), "/");
+        assert_eq!(container_working_directory(None, None, None), "/");
+        assert_eq!(container_working_directory(Some(""), None, Some("")), "/");
+        assert_eq!(
+            container_working_directory(Some("packages/api"), None, None),
+            "/"
+        );
+    }
+
+    /// The container config `dev up` produces for a monorepo must start its
+    /// processes in the configured project directory, which is what every exec
+    /// then inherits.
+    #[test]
+    fn to_apple_config_runs_in_the_resolved_workspace_folder() {
+        let mut container_config = minimal_container_config();
+        container_config.workspace_mount = Some(WorkspaceMount {
+            source: std::path::PathBuf::from("/host/monorepo"),
+            target: "/srv/app".to_string(),
+        });
+        container_config.workspace_folder = Some("/srv/app/packages/api".to_string());
+
+        let apple_config = to_apple_config(
+            &container_config,
+            ImageDescription::default(),
+            &CachedImageConfig {
+                working_dir: Some("/usr/src/app".to_string()),
+                ..CachedImageConfig::default()
+            },
+        );
+
+        assert_eq!(
+            apple_config.init_process.working_directory,
+            "/srv/app/packages/api"
+        );
+        assert_eq!(
+            apple_config.mounts.last().map(|m| m.destination.as_str()),
+            Some("/srv/app"),
+            "the source tree is still mounted at the mount target"
+        );
+    }
+
+    fn minimal_container_config() -> ContainerConfig {
+        ContainerConfig {
+            image: "docker.io/library/alpine:latest".to_string(),
+            name: "vsc-test".to_string(),
+            labels: HashMap::new(),
+            env: HashMap::new(),
+            mounts: vec![],
+            volumes: vec![],
+            ports: vec![],
+            workspace_mount: None,
+            workspace_folder: None,
+            extra_args: vec![],
+            entrypoint: None,
+            init: false,
+            privileged: false,
+            cap_add: vec![],
+            security_opt: vec![],
+        }
     }
 
     /// A name at or under the limit must pass through untouched.
@@ -1177,6 +1295,7 @@ mod tests {
                 source: workspace.to_path_buf(),
                 target: "/workspaces/test-apple-repro".to_string(),
             }),
+            workspace_folder: Some("/workspaces/test-apple-repro".to_string()),
             extra_args: vec![],
             entrypoint: None,
             init: false,
@@ -1421,6 +1540,7 @@ mod tests {
                 source: workspace_path.clone(),
                 target: "/workspaces/test-apple-workspace".to_string(),
             }),
+            workspace_folder: Some("/workspaces/test-apple-workspace".to_string()),
             extra_args: vec![],
             entrypoint: None,
             init: false,

@@ -422,6 +422,7 @@ pub(crate) async fn run_with_runtime(
             source: workspace.to_path_buf(),
             target: config.workspace_mount_target(workspace, remote_user)?,
         }),
+        workspace_folder: Some(config.workspace_folder_path(workspace, remote_user)?),
         extra_args,
         entrypoint: None,
         init: caps.init,
@@ -1824,6 +1825,60 @@ mod tests {
             msg.contains("not running"),
             "error should explain the container is not running, got: {msg}"
         );
+    }
+
+    /// A monorepo config: `workspaceMount` attaches the repository, and
+    /// `workspaceFolder` selects one project inside it. `dev up` must hand the
+    /// runtime both — the mount root for the bind, the subdirectory for where
+    /// commands run — or lifecycle hooks execute in the wrong directory.
+    #[tokio::test]
+    async fn up_carries_workspace_folder_subdirectory_to_the_runtime() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{
+                "image": "ubuntu:24.04",
+                "workspaceMount": "source=${localWorkspaceFolder},target=/srv/app,type=bind",
+                "workspaceFolder": "/srv/app/packages/api"
+            }"#,
+        );
+        let rt = UpFakeRuntime::ok();
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("up should succeed with a cooperating fake runtime");
+
+        let created = rt.created_config();
+        assert_eq!(
+            created.workspace_mount.as_ref().map(|m| m.target.as_str()),
+            Some("/srv/app"),
+            "the repository must still be mounted at the workspaceMount target"
+        );
+        assert_eq!(
+            created.workspace_folder.as_deref(),
+            Some("/srv/app/packages/api"),
+            "commands must run in the configured workspaceFolder subdirectory"
+        );
+    }
+
+    /// Without an explicit `workspaceFolder`, the folder handed to the runtime
+    /// is the mount destination, so commands still run in the source tree.
+    #[tokio::test]
+    async fn up_defaults_workspace_folder_to_the_mount_target() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{
+                "image": "ubuntu:24.04",
+                "workspaceMount": "source=${localWorkspaceFolder},target=/srv/app,type=bind"
+            }"#,
+        );
+        let rt = UpFakeRuntime::ok();
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("up should succeed with a cooperating fake runtime");
+
+        let created = rt.created_config();
+        assert_eq!(created.workspace_folder.as_deref(), Some("/srv/app"));
     }
 
     /// A healthy container whose runtime takes a while to report `Running` must

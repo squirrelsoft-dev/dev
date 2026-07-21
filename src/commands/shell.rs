@@ -1,7 +1,6 @@
 use std::path::Path;
 
 use crate::devcontainer::compose::load_workspace_config_or_warn;
-use crate::devcontainer::substitute_variables;
 use crate::runtime::{ContainerState, detect_runtime, resolve_remote_user};
 use crate::util::{workspace_folder_name, workspace_labels};
 
@@ -46,16 +45,12 @@ pub async fn run(
         found.unwrap_or_else(|| "/bin/sh".to_string())
     };
 
-    // Use workspaceFolder from config when available (e.g. compose configs),
-    // falling back to the default /workspaces/{folder_name}.
-    let folder_name = workspace_folder_name(workspace);
-    let workdir = substitute_variables(
-        config
-            .as_ref()
-            .and_then(|c| c.workspace_folder.as_deref())
-            .unwrap_or(&format!("/workspaces/{folder_name}")),
-        workspace,
-    );
+    // Resolve workspaceFolder the same way `dev up` does, so the shell starts
+    // where lifecycle hooks ran.
+    let workdir = match config.as_ref() {
+        Some(config) => config.workspace_folder_path(workspace, user.as_deref())?,
+        None => format!("/workspaces/{}", workspace_folder_name(workspace)),
+    };
 
     let cmd = vec![
         shell_cmd.clone(),

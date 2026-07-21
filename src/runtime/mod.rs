@@ -31,6 +31,10 @@ pub struct ContainerConfig {
     pub volumes: Vec<VolumeMount>,
     pub ports: Vec<PortMapping>,
     pub workspace_mount: Option<WorkspaceMount>,
+    /// Resolved `workspaceFolder`: where commands run inside the container.
+    /// Equal to the workspace mount target unless the config selects a
+    /// subdirectory of it.
+    pub workspace_folder: Option<String>,
     #[allow(dead_code)]
     pub extra_args: Vec<String>,
     pub entrypoint: Option<String>,
