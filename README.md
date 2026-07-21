@@ -220,7 +220,7 @@ brew install caddy
 
 `dev` creates `~/.dev/caddy/Caddyfile` on the first `dev up` (with `forwardPorts`) or `dev forward` — you don't need to create it yourself, and the file does not exist before then. From there `dev` reloads Caddy on every change and starts it against that config if it isn't already running. That auto-start runs without `sudo`, so it can't bind :80/:443; to serve `.test` on the standard ports, start Caddy once by hand after the first `dev up`/`dev forward` with `sudo caddy start --config ~/.dev/caddy/Caddyfile`.
 
-Neither path survives a reboot — re-run that command, or let the next `dev up`/`dev forward` restart it. Don't use `brew services start caddy`: that service runs `caddy run --config /opt/homebrew/etc/Caddyfile`, a different file a stock install doesn't create, so it crash-loops under `KeepAlive` and never serves `dev`'s site fragments. For always-on persistence, install your own root `launchd` service pointing at `~/.dev/caddy/Caddyfile`.
+Neither path survives a reboot — re-run `sudo caddy start --config ~/.dev/caddy/Caddyfile` by hand after each boot. The next `dev up`/`dev forward` won't recover it for you: it prints `Caddy not running, starting...` and retries unprivileged, which still can't bind :80/:443, and it doesn't report that failure. Don't use `brew services start caddy`: that service runs `caddy run --config /opt/homebrew/etc/Caddyfile`, a different file a stock install doesn't create, so it crash-loops under `KeepAlive` and never serves `dev`'s site fragments. For always-on persistence, install your own root `launchd` service pointing at `~/.dev/caddy/Caddyfile`.
 
 After first-time DNS setup, flush your browser/system DNS cache or `.test` may not resolve immediately:
 
