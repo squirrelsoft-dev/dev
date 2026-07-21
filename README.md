@@ -167,14 +167,14 @@ Command-line overrides such as `dev up --ports` are applied last, on top of the 
 
 ### Derived images and disk use
 
-When a config declares features, `dev up` and `dev build` layer them onto a derived image tagged `<folder>-features-<digest>`. The digest covers the effective config values that shape the image: the base image *selector* (`image`, or `build.dockerfile`/`context`/`args`), the declared `features`, `remoteUser`, `containerEnv`, and `remoteEnv`. Edit any of those and the next run builds a new image rather than reusing a stale one — which is what keeps a cached image from silently omitting base-config changes.
+When a config declares features, `dev up` and `dev build` layer them onto a derived image tagged `vsc-<folder>-<workspace-hash>-features-<digest>` — the base image name `dev` derives for the workspace, plus a `-features-` suffix. The digest covers the effective config values that shape the image: the base image *selector* (`image`, or `build.dockerfile`/`context`/`args`), the declared `features`, `remoteUser`, `containerEnv`, and `remoteEnv`. Edit any of those and the next run builds a new image rather than reusing a stale one — which is what keeps a cached image from silently omitting base-config changes.
 
 The digest covers selectors, not the files they point at. Editing a `Dockerfile` referenced by `build.dockerfile` leaves the digest unchanged, so the cached image is reused; pass `--rebuild` or `--no-cache` after changing Dockerfile contents.
 
 Superseded images are left behind rather than overwritten in place — `dev` does not delete them automatically, since it cannot tell which are still in use by stopped containers or other tooling. Reclaim space with your runtime's own tooling when it matters:
 
 ```sh
-docker image ls --filter 'reference=<folder>-features-*'
+docker image ls --filter 'reference=vsc-*-features-*'
 docker image prune
 ```
 
@@ -229,7 +229,7 @@ When you run `dev up` and `forwardPorts` is set in the merged config, `dev` writ
 ```sh
 dev up
 # Container 'appname' is ready.
-#   → https://appname.test → port 3000
+#   → https://appname.test → localhost:3000
 ```
 
 `dev down` removes the fragment and reloads Caddy. The hostname comes from the workspace folder name. Multiple `forwardPorts` get their own subdomains:
