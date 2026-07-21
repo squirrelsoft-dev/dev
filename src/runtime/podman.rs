@@ -94,6 +94,10 @@ impl ContainerRuntime for PodmanRuntime {
         self.0.exec(id, cmd, user)
     }
 
+    fn exec_reports_missing_command(&self, error: &DevError) -> bool {
+        self.0.exec_reports_missing_command(error)
+    }
+
     fn exec_interactive(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, i32> {
         // Podman's HTTP API doesn't reliably support interactive TTY exec via
         // bollard. Shell out to `podman exec -it` instead.

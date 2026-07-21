@@ -538,13 +538,15 @@ fn write_tar<W: std::io::Write>(
             builder
                 .append_data(&mut header, &entry.name, std::io::empty())
                 .map_err(AppleContainerError::Io)?;
-        } else if entry.metadata.is_file() {
-            // The size comes from the open file rather than from the metadata
-            // the walk captured: an editor or `cargo` rewriting a context file
-            // between the two would otherwise put a length in the header that
-            // does not describe what follows it.
-            let file = std::fs::File::open(&entry.path).map_err(AppleContainerError::Io)?;
-            let size = file.metadata().map_err(AppleContainerError::Io)?.len();
+        } else {
+            // Both the size and the type come from the open file rather than
+            // from the metadata the walk captured: an editor or `cargo`
+            // rewriting a context file between the two would otherwise put a
+            // length in the header that does not describe what follows it, and
+            // a path that stopped being a regular file has to be reported
+            // rather than dropped from the archive with nothing said.
+            let (file, opened) = open_regular(&entry.path, &entry.name)?;
+            let size = opened.len();
             header.set_entry_type(tar::EntryType::Regular);
             header.set_size(size);
             builder
@@ -555,6 +557,33 @@ fn write_tar<W: std::io::Write>(
 
     builder.into_inner().map_err(AppleContainerError::Io)?;
     Ok(())
+}
+
+/// Open a context file, refusing anything that is no longer a regular file.
+///
+/// The walk selects only regular files, but the transfer opens them later, and
+/// a path replaced by a FIFO in between would block this thread forever with no
+/// deadline above it. `O_NONBLOCK` makes the open return whatever the path has
+/// become so it can be reported, and is a no-op for the regular file this
+/// almost always is.
+fn open_regular(
+    path: &Path,
+    name: &str,
+) -> Result<(std::fs::File, std::fs::Metadata), AppleContainerError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(AppleContainerError::Io)?;
+    let opened = file.metadata().map_err(AppleContainerError::Io)?;
+    if !opened.is_file() {
+        return Err(AppleContainerError::XpcError(format!(
+            "{name} stopped being a regular file while the build context was being sent"
+        )));
+    }
+    Ok((file, opened))
 }
 
 /// A reader that yields exactly the number of bytes its entry's header declares.
@@ -1006,8 +1035,13 @@ mod tests {
     /// A file that cannot be stat'ed is a file that would be missing from the
     /// image with nothing said about it, so the walk has to fail instead.
     /// A path that merely vanished is not that: it cannot be sent either way.
+    ///
+    /// Mode 0o444 is the case that reaches the stat: the directory can be
+    /// listed, so `read_dir` succeeds and every child is named, but without the
+    /// execute bit none of them can be stat'ed. A directory that cannot be
+    /// listed at all fails one step earlier and proves nothing about this.
     #[test]
-    fn an_unreadable_directory_fails_the_walk_rather_than_dropping_files() {
+    fn a_child_that_cannot_be_stated_fails_the_walk_rather_than_being_dropped() {
         use std::os::unix::fs::PermissionsExt;
 
         // Permissions do not apply to root, so there is nothing to observe.
@@ -1018,15 +1052,39 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp context");
         write(dir.path(), "secret/app.txt", "payload");
         let secret = dir.path().join("secret");
-        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o444)).expect("chmod");
 
         let outcome = collect_context(dir.path(), &ContextFilter::default());
 
         // Restore before asserting so the temporary directory can be removed.
         std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let error = outcome
+            .expect_err("a context file that cannot be stat'ed must not be silently omitted");
         assert!(
-            outcome.is_err(),
-            "a context file that cannot be read must not be silently omitted"
+            matches!(error, AppleContainerError::Io(_)),
+            "the filesystem's own refusal must survive, got {error:?}"
+        );
+    }
+
+    /// A path replaced by a named pipe after the walk selected it must be
+    /// reported: opening it would otherwise block this thread forever, and
+    /// leaving it out would drop a file the image needs with nothing said.
+    #[test]
+    fn a_file_that_became_a_pipe_after_the_walk_is_reported() {
+        let dir = tempfile::tempdir().expect("temp context");
+        write(dir.path(), "app.txt", "payload");
+        let entries = collect_context(dir.path(), &ContextFilter::default()).expect("walk");
+
+        std::fs::remove_file(dir.path().join("app.txt")).expect("remove");
+        let fifo = std::ffi::CString::new(dir.path().join("app.txt").to_string_lossy().as_bytes())
+            .expect("fifo path");
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0, "mkfifo");
+
+        let error = stream_context_tar(&entries, &mut |_| Ok(()))
+            .expect_err("a path that stopped being a regular file must fail the walk");
+        assert!(
+            error.to_string().contains("stopped being a regular file"),
+            "the error must name the type change, got {error}"
         );
     }
 

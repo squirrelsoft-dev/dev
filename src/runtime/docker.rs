@@ -912,6 +912,16 @@ impl ContainerRuntime for BollardRuntime {
         Box::pin(async move { self.exec_impl(&id, &cmd, user.as_deref()).await })
     }
 
+    /// The daemon refuses to start an exec whose executable is not in the
+    /// image, so a missing shell arrives as an API error rather than as a
+    /// non-zero exit status. These are the phrasings it and the OCI runtime
+    /// use for that.
+    fn exec_reports_missing_command(&self, error: &DevError) -> bool {
+        let message = error.to_string().to_ascii_lowercase();
+        message.contains("executable file not found")
+            || message.contains("no such file or directory")
+    }
+
     fn exec_interactive(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, i32> {
         let id = id.to_string();
         let cmd = cmd.to_vec();

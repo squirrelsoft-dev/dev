@@ -326,13 +326,7 @@ pub async fn load_image_archive(
     reply.check_error()?;
 
     if let Some(raw) = reply.get_data(XpcKey::REJECTED_MEMBERS) {
-        // Reading an unparseable reply as "nothing was rejected" would report a
-        // partially refused archive as a successful load.
-        let rejected: Vec<String> = serde_json::from_slice(&raw).map_err(|e| {
-            AppleContainerError::XpcError(format!(
-                "imageLoad reported rejected members this version cannot read: {e}"
-            ))
-        })?;
+        let rejected = rejected_members(&raw);
         if !rejected.is_empty() {
             return Err(AppleContainerError::XpcError(format!(
                 "image archive contained files the daemon refused: {}",
@@ -345,6 +339,28 @@ pub async fn load_image_archive(
         AppleContainerError::XpcError("imageLoad reply missing imageDescriptions".to_string())
     })?;
     Ok(serde_json::from_slice(&data)?)
+}
+
+/// The archive members the daemon refused, read for what they plainly say.
+///
+/// This key's encoding is reverse-engineered from the daemon, so a version that
+/// spells an empty list `null`, `[]` or `{}` must not turn a successful load
+/// into a hard failure — but a payload that plainly carries content must not be
+/// dropped either, since that would report a partially refused archive as a
+/// clean load. A shape this version cannot read is reported verbatim rather
+/// than either way.
+fn rejected_members(raw: &[u8]) -> Vec<String> {
+    let describe = |value: &serde_json::Value| match value.as_str() {
+        Some(name) => name.to_string(),
+        None => value.to_string(),
+    };
+    match serde_json::from_slice::<serde_json::Value>(raw) {
+        Ok(serde_json::Value::Null) => Vec::new(),
+        Ok(serde_json::Value::Array(members)) => members.iter().map(describe).collect(),
+        Ok(serde_json::Value::Object(members)) if members.is_empty() => Vec::new(),
+        Ok(other) => vec![describe(&other)],
+        Err(_) => vec![String::from_utf8_lossy(raw).into_owned()],
+    }
 }
 
 /// Point a new reference at an image already in the store.
@@ -430,13 +446,14 @@ async fn process_build_stream(
                     // The shim's receivers have no deadline, so answering
                     // nothing leaves it waiting out the whole idle budget for
                     // a request we simply do not implement.
-                    _ => {
+                    _ if is_dispatchable(stage, method) => {
                         let message = format!(
                             "this client does not implement the {stage:?} stage's {method:?} method"
                         );
                         send_image_error(&builder, reply_id, transfer, stage, method, &message)
                             .await?;
                     }
+                    _ => note_unroutable_packet("ImageTransfer", stage, method),
                 }
             }
             None => {}
@@ -566,10 +583,14 @@ async fn handle_build_transfer(
         // The shim's receivers have no deadline, so a request answered with
         // silence leaves it blocked until the whole idle budget expires and the
         // user is told the builder went quiet, not that we ignored it.
-        _ => {
+        _ if is_dispatchable(stage, method) => {
             let message =
                 format!("this client does not implement the {stage:?} stage's {method:?} method");
             send_transfer_error(builder, build_id, transfer, stage, method, &message).await
+        }
+        _ => {
+            note_unroutable_packet("BuildTransfer", stage, method);
+            Ok(())
         }
     }
 }
@@ -577,6 +598,25 @@ async fn handle_build_transfer(
 /// Read one metadata field the builder sent, or the empty string.
 fn metadata_field<'a>(metadata: &'a HashMap<String, String>, key: &str) -> &'a str {
     metadata.get(key).map(String::as_str).unwrap_or("")
+}
+
+/// Whether a packet names a request this client could have been asked to serve.
+///
+/// An error reply is addressed by the stage and method it echoes, so one built
+/// from a packet that names neither would be routed nowhere — and injecting a
+/// `complete` packet carrying an error into a transfer that was never a request
+/// (an ack, a keepalive, a `complete` echo) would abort a build that was
+/// running fine. Only a packet that names both is answered.
+fn is_dispatchable(stage: &str, method: &str) -> bool {
+    !stage.is_empty() && !method.is_empty()
+}
+
+/// Record a packet that named no request, since nothing is sent in reply.
+fn note_unroutable_packet(kind: &str, stage: &str, method: &str) {
+    eprintln!(
+        "Warning: ignoring a builder {kind} packet that names no request \
+         (stage {stage:?}, method {method:?})."
+    );
 }
 
 /// Metadata every fssync reply carries.
@@ -732,11 +772,13 @@ async fn prepare_walk(
 ///
 /// The producing direction is bounded too. The writer's `blocking_send` needs
 /// no deadline of its own — it can only block while this loop is draining, and
-/// every exit from the loop drops the receiver, which fails the pending send
-/// rather than parking a pool thread for the rest of the process. But the
-/// filesystem underneath it can stall (a hung NFS or virtiofs mount, a device
-/// that never answers), and nothing else in this protocol would ever notice, so
-/// each wait for the next chunk carries the same idle budget every send does.
+/// every exit from the loop closes the receiver, which fails the pending send
+/// rather than leaving it parked. But the filesystem underneath it can stall (a
+/// hung NFS or virtiofs mount, a device that never answers), and nothing else
+/// in this protocol would ever notice, so each wait for the next chunk carries
+/// the same idle budget every send does. A thread already inside such a call
+/// cannot be reclaimed — `spawn_blocking` work is not cancellable — so the
+/// deadline frees the build, not the thread.
 async fn stream_walk_archive(
     entries: Vec<fssync::ContextEntry>,
     announced: &str,
@@ -785,11 +827,25 @@ async fn stream_walk_archive(
             )
             .await
         }
-        Err(e) => {
-            send_fssync_error(builder, build_id, transfer, "Walk", &e.to_string()).await?;
+        Err(WalkFailure::Reportable(e)) => {
+            // The failure to report is never more informative than the failure
+            // it was reporting, so the original cause is what comes back.
+            let _ = send_fssync_error(builder, build_id, transfer, "Walk", &e.to_string()).await;
             Err(e)
         }
+        Err(WalkFailure::SinkFailed(e)) => Err(e),
     }
+}
+
+/// Why a walk stopped, and whether the builder can still be told.
+enum WalkFailure {
+    /// The context could not be produced. The stream out is still usable, so
+    /// the builder gets an error packet rather than an unbounded wait.
+    Reportable(AppleContainerError),
+    /// The stream out is what failed. Sending an error packet on it would only
+    /// spend a second idle budget waiting on the same wedged channel, and would
+    /// bury the failure that actually happened.
+    SinkFailed(AppleContainerError),
 }
 
 /// Drain the archive into `BuildTransfer` packets, returning the last chunk.
@@ -804,19 +860,28 @@ async fn send_archive_chunks(
     builder: &BuilderSink,
     build_id: &str,
     transfer: &BuildTransfer,
-) -> Result<Option<Vec<u8>>, AppleContainerError> {
-    let stalled = || {
-        AppleContainerError::XpcError(format!(
-            "the build context produced nothing for {}s; giving up on the build",
-            builder.idle.as_secs()
-        ))
-    };
+) -> Result<Option<Vec<u8>>, WalkFailure> {
+    // Closing the receiver fails the writer's next `blocking_send` instead of
+    // leaving it parked, which is all that can be reclaimed: a thread already
+    // inside a filesystem call that never returns stays there either way.
+    let give_up =
+        |chunks: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+         writer: &tokio::task::JoinHandle<Result<String, AppleContainerError>>| {
+            chunks.close();
+            writer.abort();
+            WalkFailure::Reportable(AppleContainerError::XpcError(format!(
+                "the build context produced nothing for {}s; giving up on the build",
+                builder.idle.as_secs()
+            )))
+        };
 
     let mut pending: Option<Vec<u8>> = None;
-    while let Some(chunk) = tokio::time::timeout(builder.idle, chunks.recv())
-        .await
-        .map_err(|_| stalled())?
-    {
+    loop {
+        let next = match tokio::time::timeout(builder.idle, chunks.recv()).await {
+            Ok(next) => next,
+            Err(_) => return Err(give_up(chunks, &writer)),
+        };
+        let Some(chunk) = next else { break };
         if let Some(previous) = pending.replace(chunk) {
             send_build_transfer(
                 builder,
@@ -827,18 +892,31 @@ async fn send_archive_chunks(
                 false,
                 false,
             )
-            .await?;
+            .await
+            .map_err(WalkFailure::SinkFailed)?;
         }
     }
 
     // The sender is dropped when the writer finishes, so the loop above has
     // already ended by the time this resolves.
-    let streamed = tokio::time::timeout(builder.idle, join_blocking(writer))
-        .await
-        .map_err(|_| stalled())??;
+    let streamed = match tokio::time::timeout(builder.idle, join_blocking(writer)).await {
+        Ok(streamed) => streamed.map_err(WalkFailure::Reportable)?,
+        Err(_) => {
+            chunks.close();
+            return Err(WalkFailure::Reportable(AppleContainerError::XpcError(
+                format!(
+                    "the build context did not finish within {}s; giving up on the build",
+                    builder.idle.as_secs()
+                ),
+            )));
+        }
+    };
     if streamed != announced {
-        return Err(AppleContainerError::XpcError(format!(
-            "build context changed while it was being sent: announced {announced}, sent {streamed}"
+        return Err(WalkFailure::Reportable(AppleContainerError::XpcError(
+            format!(
+                "build context changed while it was being sent: \
+                 announced {announced}, sent {streamed}"
+            ),
         )));
     }
     Ok(pending)
@@ -875,14 +953,12 @@ async fn handle_read(
     context: &Path,
 ) -> Result<(), AppleContainerError> {
     let source = transfer.source.as_deref().unwrap_or("");
-    let Some(path) = resolve_path(context, source) else {
-        let message = unconfined_message(source);
-        return send_fssync_error(builder, build_id, transfer, "Read", &message).await;
-    };
     let offset = numeric_metadata(&transfer.metadata, "offset").unwrap_or(0);
     let length = requested_read_length(&transfer.metadata);
 
-    let data = match content::read_range(&path, offset, length) {
+    let data = match resolve_readable_path(context, source)
+        .and_then(|path| content::read_range(&path, offset, length))
+    {
         Ok(data) => data,
         Err(e) => {
             let message = format!("cannot read {source}: {e}");
@@ -911,7 +987,7 @@ async fn handle_info(
 
     let source = transfer.source.as_deref().unwrap_or("");
     let Some(path) = resolve_path(context, source) else {
-        let message = unconfined_message(source);
+        let message = format!("cannot stat {source}: {}", UNCONFINED);
         return send_fssync_error(builder, build_id, transfer, "Info", &message).await;
     };
 
@@ -959,7 +1035,16 @@ fn numeric_metadata(metadata: &HashMap<String, String>, key: &str) -> Option<u64
     metadata.get(key)?.trim().parse().ok()
 }
 
-/// How many bytes a read request asked for, bounded to one packet.
+/// The most payload one reply may carry.
+///
+/// gRPC's default message limit is 4 MiB and a reply carries its metadata map
+/// as well, so the payload stops a little under it. This is the only honest
+/// bound on a read: shortening a reply further would hand a caller that does
+/// not loop a zero-filled tail, and the shim asks for a whole layer in one
+/// `ReaderAt` — so the limit is the message size, not the size of a tar chunk.
+const MAX_REPLY_PAYLOAD: u64 = 4 * 1024 * 1024 - 64 * 1024;
+
+/// How many bytes a read request asked for, bounded to what a reply can hold.
 ///
 /// Both read protocols treat an empty reply as EOF, so an absent `length` has
 /// to mean "some of the file" rather than "none of it" — defaulting to zero
@@ -969,16 +1054,13 @@ fn numeric_metadata(metadata: &HashMap<String, String>, key: &str) -> Option<u64
 /// could never be sent. An explicit zero is left alone, because that is how
 /// `ReaderAt::init` probes for a blob's size.
 fn requested_read_length(metadata: &HashMap<String, String>) -> usize {
-    let packet = fssync::CONTEXT_CHUNK_SIZE as u64;
     numeric_metadata(metadata, "length")
-        .unwrap_or(packet)
-        .min(packet) as usize
+        .unwrap_or(MAX_REPLY_PAYLOAD)
+        .min(MAX_REPLY_PAYLOAD) as usize
 }
 
 /// Why a builder-supplied path was refused.
-fn unconfined_message(source: &str) -> String {
-    format!("{source:?} is outside the build context and will not be read")
-}
+const UNCONFINED: &str = "it resolves outside the build context";
 
 /// Map the host's Rust architecture name to its OCI/Go equivalent.
 fn host_oci_architecture() -> &'static str {
@@ -1375,6 +1457,32 @@ fn resolve_path(context: &Path, source: &str) -> Option<std::path::PathBuf> {
         }
     }
     Some(resolved)
+}
+
+/// Resolve a path the builder wants the *contents* of.
+///
+/// Reading opens the file, and opening follows symlinks, so the name being
+/// confined is not enough: a link inside the workspace — `deploy/key ->
+/// ~/.ssh/id_rsa`, which a dependency or an earlier tool may well have left
+/// there — resolves to a path under the context but reads a file outside it.
+/// The resolved path is therefore canonicalized and re-checked against the
+/// canonical context, so only a file that really lives inside it is read.
+///
+/// `Info` needs no such check and must not have one: it describes the link
+/// itself with `symlink_metadata` and BuildKit resolves links on its own side,
+/// exactly as BuildKit's own fsutil sends the link rather than its target.
+fn resolve_readable_path(
+    context: &Path,
+    source: &str,
+) -> Result<std::path::PathBuf, AppleContainerError> {
+    let unconfined = || AppleContainerError::XpcError(UNCONFINED.to_string());
+    let path = resolve_path(context, source).ok_or_else(unconfined)?;
+    let resolved = std::fs::canonicalize(&path).map_err(AppleContainerError::Io)?;
+    let root = std::fs::canonicalize(context).map_err(AppleContainerError::Io)?;
+    if !resolved.starts_with(&root) {
+        return Err(unconfined());
+    }
+    Ok(resolved)
 }
 
 /// Simple base64 encoding (no padding).
@@ -2228,49 +2336,102 @@ mod tests {
     /// NFS mount) would otherwise park the walk forever with nothing reported.
     #[test]
     fn a_walk_whose_context_never_produces_a_chunk_fails_on_the_idle_budget() {
-        let dir = context_with(&[("app.txt", "payload")]);
-        let pipe = dir.path().join("stalled.fifo");
-        let c_path = std::ffi::CString::new(pipe.to_string_lossy().as_bytes()).expect("fifo path");
-        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0, "mkfifo");
-
-        // The walk skips non-regular files, so the stall is staged directly:
-        // an entry whose metadata says "regular file" but whose path only
-        // answers `open` once something else opens the other end.
-        let entries = vec![fssync::ContextEntry {
-            name: "stalled.fifo".to_string(),
-            path: pipe.clone(),
-            metadata: std::fs::symlink_metadata(dir.path().join("app.txt")).expect("metadata"),
-        }];
         let request = build_transfer(&[("method", "Walk"), ("mode", "tar")], ".");
 
         let outcome = run(async {
+            let (tx, _rx) = tokio::sync::mpsc::channel::<ClientStream>(64);
+            // A producer that never emits and never finishes, as a hung NFS or
+            // virtiofs mount leaves it: the sender stays alive, so the receive
+            // can only end on its own deadline.
+            let (_chunks_tx, mut chunks_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
+            let writer = tokio::task::spawn_blocking(|| Ok(String::new()));
+
+            must_bound_itself(send_archive_chunks(
+                &mut chunks_rx,
+                writer,
+                &"0".repeat(64),
+                &impatient_sink(&tx),
+                REPLY_ID,
+                &request,
+            ))
+            .await
+        });
+
+        let failure = outcome.expect_err("a context that never produces must not hang the build");
+        let WalkFailure::Reportable(e) = failure else {
+            panic!("a stalled producer leaves the stream out usable, so it must be reportable");
+        };
+        assert!(
+            e.to_string().contains("produced nothing"),
+            "the error must name the stall, got: {e}"
+        );
+    }
+
+    /// A stalled producer leaves the stream out usable, so the builder is told
+    /// rather than left waiting out its own idle budget.
+    #[test]
+    fn a_stalled_walk_reports_the_stall_to_the_builder() {
+        let dir = context_with(&[("app.txt", "payload")]);
+        let request = build_transfer(&[("method", "Walk"), ("mode", "tar")], ".");
+        let entries = fssync::collect_context(dir.path(), &fssync::ContextFilter::default())
+            .expect("context walk");
+
+        let (outcome, replies) = run(async {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<ClientStream>(64);
+            // The announced checksum is wrong, which is the other reportable
+            // failure: the archive is produced fine, so the sink still works.
             let outcome = must_bound_itself(stream_walk_archive(
+                entries,
+                &"0".repeat(64),
+                &sink(&tx),
+                REPLY_ID,
+                &request,
+            ))
+            .await;
+            (outcome, drain(&mut rx))
+        });
+
+        assert!(outcome.is_err(), "a mismatched archive must not succeed");
+        assert!(
+            replies
+                .iter()
+                .any(|(_, p)| p.metadata.contains_key("error")),
+            "the shim only stops waiting when it sees an `error` key: {replies:?}"
+        );
+    }
+
+    /// When the stream out is what failed, sending an error packet on it would
+    /// only spend a second idle budget on the same wedged channel and bury the
+    /// failure that actually happened.
+    #[test]
+    fn a_walk_whose_sink_failed_reports_that_rather_than_sending_again() {
+        // Several chunks, so the sink is genuinely used mid-archive rather than
+        // only for the final packet.
+        let payload = "0123456789abcdef".repeat(fssync::CONTEXT_CHUNK_SIZE / 2);
+        let dir = context_with(&[("big.bin", payload.as_str())]);
+        let request = build_transfer(&[("method", "Walk"), ("mode", "tar")], ".");
+        let entries = fssync::collect_context(dir.path(), &fssync::ContextFilter::default())
+            .expect("context walk");
+
+        let outcome = run(async {
+            let (tx, rx) = tokio::sync::mpsc::channel::<ClientStream>(1);
+            drop(rx);
+            must_bound_itself(stream_walk_archive(
                 entries,
                 &"0".repeat(64),
                 &impatient_sink(&tx),
                 REPLY_ID,
                 &request,
             ))
-            .await;
-            // Let the parked `open` complete so the runtime can shut down.
-            let _unblock = std::fs::OpenOptions::new().write(true).open(&pipe);
-            (outcome, drain(&mut rx))
+            .await
         });
 
-        let (outcome, replies) = outcome;
         let message = outcome
-            .expect_err("a context that never produces must not hang the build")
+            .expect_err("a dead sink must surface as an error")
             .to_string();
         assert!(
-            message.contains("produced nothing"),
-            "the error must name the stall, got: {message}"
-        );
-        assert!(
-            replies
-                .iter()
-                .any(|(_, p)| p.metadata.contains_key("error")),
-            "the shim only stops waiting when it sees an `error` key: {replies:?}"
+            message.contains("failed to send"),
+            "the send failure itself must be reported, not a later one: {message}"
         );
     }
 
@@ -2296,6 +2457,56 @@ mod tests {
         let (_, reply) = &replies[0];
         assert!(reply.metadata.contains_key("error"), "{:?}", reply.metadata);
         assert!(reply.complete);
+    }
+
+    /// An error reply is addressed by the stage and method it echoes, so a
+    /// packet naming neither cannot be answered — and injecting a `complete`
+    /// packet carrying an error into a transfer that was never a request would
+    /// abort a build that was running fine.
+    #[test]
+    fn a_packet_that_names_no_request_is_not_answered() {
+        let dir = context_with(&[("app.txt", "payload")]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        for request in [
+            build_transfer(&[], "."),
+            build_transfer(&[("stage", "fssync")], "."),
+            build_transfer(&[("method", "Walk")], "."),
+        ] {
+            run(handle_build_transfer(
+                &request,
+                &sink(&tx),
+                REPLY_ID,
+                dir.path(),
+            ))
+            .expect("an unroutable packet must not fail the build");
+        }
+
+        assert!(
+            drain(&mut rx).is_empty(),
+            "nothing may be injected into a transfer that named no request"
+        );
+    }
+
+    /// This key's encoding is reverse-engineered, so an empty list arriving in
+    /// a shape this version has never seen must not turn every successful
+    /// build into a hard failure — while anything that plainly carries content
+    /// must still be reported.
+    #[test]
+    fn rejected_members_are_read_for_what_they_plainly_say() {
+        assert!(rejected_members(b"null").is_empty());
+        assert!(rejected_members(b"[]").is_empty());
+        assert!(rejected_members(b"{}").is_empty());
+
+        assert_eq!(
+            rejected_members(br#"["a.tar","b.tar"]"#),
+            ["a.tar", "b.tar"]
+        );
+        assert!(!rejected_members(br#"{"refused":["a.tar"]}"#).is_empty());
+        assert!(
+            !rejected_members(b"not json at all").is_empty(),
+            "a payload we cannot read must not read as `nothing was rejected`"
+        );
     }
 
     #[test]
@@ -2361,6 +2572,71 @@ mod tests {
         );
     }
 
+    /// Confining the name is not enough, because reading follows links: a
+    /// symlink inside the workspace pointing out of it — one a dependency or an
+    /// earlier tool left behind — would otherwise stream a private file into
+    /// the VM under a path that looks perfectly confined.
+    #[test]
+    fn read_refuses_a_symlink_that_leaves_the_context() {
+        let root = context_with(&[("context/app.txt", "payload"), ("secret.txt", "private")]);
+        let context = root.path().join("context");
+        std::os::unix::fs::symlink(root.path().join("secret.txt"), context.join("key"))
+            .expect("symlink");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let request = build_transfer(&[("method", "Read"), ("length", "64")], "key");
+
+        run(handle_read(&request, &sink(&tx), REPLY_ID, &context)).expect("read");
+
+        let (_, reply) = &drain(&mut rx)[0];
+        assert!(
+            reply.data.is_empty() && reply.metadata.contains_key("error"),
+            "a symlink out of the context must not be followed, got: {reply:?}"
+        );
+        assert!(
+            !reply.data.windows(7).any(|w| w == b"private"),
+            "the linked file's contents must never be sent"
+        );
+    }
+
+    /// A link that stays inside the context is ordinary and must still be read.
+    #[test]
+    fn read_follows_a_symlink_that_stays_inside_the_context() {
+        let dir = context_with(&[("app.txt", "payload")]);
+        std::os::unix::fs::symlink("app.txt", dir.path().join("link.txt")).expect("symlink");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let request = build_transfer(&[("method", "Read"), ("length", "64")], "link.txt");
+
+        run(handle_read(&request, &sink(&tx), REPLY_ID, dir.path())).expect("read");
+        assert_eq!(drain(&mut rx)[0].1.data, b"payload");
+    }
+
+    /// `Info` describes the link itself and BuildKit resolves it on its own
+    /// side, exactly as fsutil sends the link rather than its target — so the
+    /// read guard must not turn a symlink into an error here.
+    #[test]
+    fn info_still_describes_a_symlink_that_points_out_of_the_context() {
+        let root = context_with(&[("context/app.txt", "payload"), ("secret.txt", "private")]);
+        let context = root.path().join("context");
+        std::os::unix::fs::symlink(root.path().join("secret.txt"), context.join("key"))
+            .expect("symlink");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let request = build_transfer(&[("method", "Info")], "key");
+
+        run(handle_info(&request, &sink(&tx), REPLY_ID, &context)).expect("info");
+
+        let (_, reply) = &drain(&mut rx)[0];
+        assert!(
+            !reply.metadata.contains_key("error"),
+            "{:?}",
+            reply.metadata
+        );
+        assert!(
+            reply.metadata.contains_key("target"),
+            "the link must be described as a link: {:?}",
+            reply.metadata
+        );
+    }
+
     #[test]
     fn info_refuses_an_absolute_path_outside_the_context() {
         let dir = context_with(&[("app.txt", "payload")]);
@@ -2398,16 +2674,32 @@ mod tests {
     /// either, since a reply is a single gRPC message.
     #[test]
     fn a_read_length_is_bounded_and_never_defaults_to_nothing() {
-        let packet = fssync::CONTEXT_CHUNK_SIZE;
-        assert_eq!(requested_read_length(&metadata(&[])), packet);
+        let limit = MAX_REPLY_PAYLOAD as usize;
+        assert_eq!(requested_read_length(&metadata(&[])), limit);
         assert_eq!(requested_read_length(&metadata(&[("length", "512")])), 512);
         assert_eq!(
             requested_read_length(&metadata(&[("length", "5000000000")])),
-            packet,
-            "one reply must stay inside one packet"
+            limit,
+            "one reply must stay inside one gRPC message"
         );
         // `ReaderAt::init` probes with length 0 purely to learn a blob's size.
         assert_eq!(requested_read_length(&metadata(&[("length", "0")])), 0);
+    }
+
+    /// The shim asks for a whole layer in one `ReaderAt`, and `io.ReaderAt`
+    /// lets a caller treat a short read with no error as a filled buffer — so
+    /// shortening a blob read to a tar chunk's worth would hand it a
+    /// zero-filled tail and a digest that does not match.
+    #[test]
+    fn a_blob_read_is_not_shortened_to_a_tar_chunk() {
+        let layer = 30 * 1024 * 1024;
+        assert!(
+            requested_read_length(&metadata(&[("length", &layer.to_string())]))
+                > fssync::CONTEXT_CHUNK_SIZE,
+            "a blob read must not inherit the context transfer's chunk size"
+        );
+        // A reply must still fit inside gRPC's default message limit.
+        const { assert!(MAX_REPLY_PAYLOAD < 4 * 1024 * 1024) };
     }
 
     /// `pkg/fileutils/file_info.go` reads these out of the metadata map and

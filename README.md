@@ -63,7 +63,9 @@ column of `dev list templates`, not a fully qualified OCI reference.
 
 ## Bringing a container up with `dev up`
 
-`dev up` resolves the effective config (merging the layers below), builds the derived image if features have changed, creates and starts the container, confirms the runtime reports it running and findable by the same workspace labels `dev status` and `dev exec` search for, runs lifecycle hooks, and prints `Container '<name>' is ready.` If that confirmation does not come, `dev up` fails with what it saw instead of reporting readiness — a container `dev status` cannot find is never announced as ready.
+`dev up` resolves the effective config (merging the layers below), builds the derived image if features have changed, creates and starts the container, confirms it is usable, runs lifecycle hooks, and prints `Container '<name>' is ready.` If that confirmation does not come, `dev up` fails with what it saw instead of reporting readiness — a container `dev status` cannot find, or one no command can be run in, is never announced as ready.
+
+Confirming a container is usable means three things: the runtime reports it running, it is findable by the same workspace labels `dev status` and `dev exec` search for, and one trivial command actually runs in it as the resolved `remoteUser`. Both checks are retried for up to 15 seconds, because a VM-backed runtime boots a guest before its daemon settles. The command is a probe of the runtime, not of the image: a scratch or distroless image with no shell reports a warning and still comes up, while a container that cannot run a process at all fails the gate.
 
 ```sh
 dev up                  # build if needed and start
