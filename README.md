@@ -6,7 +6,7 @@ It exists because running an AI coding agent inside a devcontainer used to mean 
 
 ## How it got here
 
-The project evolved in a few steps, and the README follows that order:
+The project evolved in a few steps:
 
 1. **Terminal-first container access** — `dev up` brings a container up from `devcontainer.json`; `dev shell` and `dev exec` run inside it without VS Code.
 2. **Composable configuration** — a base config under `~/.dev/base`, reusable global templates, and per-runtime configs merge as layers, so preferences set once apply everywhere.
@@ -53,8 +53,11 @@ If you have no `.devcontainer/` yet, scaffold one:
 ```sh
 dev init                                  # minimal .devcontainer/ with a Dockerfile
 dev new                                   # interactive: pick a template from the registry
-dev new --template ghcr.io/devcontainers/templates/rust
+dev new --template rust                   # by template id
 ```
+
+`--template` takes the short id from the `ID` column of `dev list templates`, not a fully
+qualified OCI reference.
 
 ## Bringing a container up with `dev up`
 
@@ -70,6 +73,8 @@ dev up --buildkit       # BuildKit-optimized feature installation
 ```
 
 `--frozen-lockfile` errors if `devcontainer-lock.json` is missing or its features don't match, for reproducible builds.
+
+`--update-remote-user-uid-default` (`on` by default, also accepted by `dev build`) sets the fallback for `updateRemoteUserUID` when the config doesn't declare it: on Linux, `on` rebuilds the image with the `remoteUser`'s UID/GID remapped to yours so bind-mounted files stay writable. `never` disables the remap even when the config asks for it. It is a no-op on macOS, and when `remoteUser` is `root` or a numeric UID.
 
 Once the container is ready, the terminal-first entry points all attach to that same running container:
 
@@ -237,13 +242,17 @@ dev up
 For ad-hoc forwarding (a port not in `forwardPorts`, or a custom subdomain like `admin.appname.test`), use `dev forward`:
 
 ```sh
-dev forward 3000                       # forward 3000 → 3000
-dev forward 8080:3000                  # host 8080 → container 3000
-dev forward 3000 --name admin.appname  # custom .test subdomain
+dev forward 3000                            # forward 3000 → 3000
+dev forward 8080:3000                       # host 8080 → container 3000
+dev forward 3000 --name admin.appname.test  # custom .test subdomain
 dev forward 3000 --keepalive 30s
-dev forward --list                     # active forwarders for this workspace
-dev forward 3000 --stop                # stop a forwarder
+dev forward 3000 --stop                     # stop a forwarder
+dev forward 3000 --list                     # list this workspace's forwarders
 ```
+
+`--name` is used verbatim as the Caddy site hostname, so include the `.test` suffix — a name
+without it won't resolve through the dnsmasq `.test` resolver. `--list` reports every forwarder
+for the workspace, but the port argument is still required by the CLI (it is ignored).
 
 | Path                              | Purpose                                 |
 | --------------------------------- | --------------------------------------- |
@@ -253,11 +262,13 @@ dev forward 3000 --stop                # stop a forwarder
 ## Command reference
 
 ```sh
-dev init                       # minimal .devcontainer/ with a Dockerfile
-dev new [--template <id>]      # .devcontainer/ from a registry template
+dev init                                     # minimal .devcontainer/ with a Dockerfile
+dev new [--template <id>] [--options <k=v>…] # .devcontainer/ from a registry template
 
-dev build [--tag <t>] [--no-cache] [--buildkit] [--no-base]
+dev build [--tag <t>] [--no-cache] [--buildkit] [--no-base] [--frozen-lockfile]
+          [--update-remote-user-uid-default never|on|off]
 dev up    [--rebuild] [--no-cache] [--buildkit] [--no-base] [--ports …] [--frozen-lockfile]
+          [--update-remote-user-uid-default never|on|off]
 dev down  [--remove]
 dev shell [--shell /bin/bash]
 dev exec  [-u <user>] -- <cmd>…
@@ -271,7 +282,7 @@ dev list features  [-q <query>] [--json] [--refresh]
 dev config set   <property> <value>
 dev config add   <property> <value>     # features, forwardPorts, remoteEnv, mounts…
 dev config unset <property>
-dev config remove <property>
+dev config remove <property> <value>
 dev config list
 
 dev global new  [--name <n>] [--template <id>]
