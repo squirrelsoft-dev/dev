@@ -457,8 +457,9 @@ impl BuilderSink {
                 "failed to send {what}: {e}"
             ))),
             Err(_) => Err(AppleContainerError::XpcError(format!(
-                "builder stopped accepting packets while sending {what}; \
-                 giving up on the build"
+                "builder stopped accepting packets for {}s while sending {what}; \
+                 giving up on the build",
+                self.idle.as_secs()
             ))),
         }
     }
