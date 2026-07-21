@@ -27,6 +27,17 @@ const CONTENT_READER_AT_METHOD: &str = "/containerd.services.content.v1.Content/
 /// deadline exists to break.
 const BUILDER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// How many replies may be queued for the gRPC writer at once.
+///
+/// This bounds the memory the outbound half can hold, and the bound is set by
+/// the largest payload class on it: a content-store chunk is up to
+/// [`MAX_REPLY_PAYLOAD`], so the worst case when the writer falls behind is
+/// this many of those — roughly 63 MiB at 16, against the ~8 MiB the 512 KiB
+/// walk chunks would reach. Deep enough that the writer is never the thing
+/// pacing a build, shallow enough that a slow one cannot queue a quarter of a
+/// gigabyte.
+const OUTBOUND_PACKETS: usize = 16;
+
 /// Include the generated protobuf/gRPC code.
 pub mod proto {
     tonic::include_proto!("com.apple.container.build.v1");
@@ -146,7 +157,7 @@ pub async fn build_image(
         .map_err(|e| AppleContainerError::XpcError(format!("fresh info() failed: {e}")))?;
 
     // All headers matching the Swift reference client.
-    let (client_tx, client_rx) = tokio::sync::mpsc::channel::<ClientStream>(64);
+    let (client_tx, client_rx) = tokio::sync::mpsc::channel::<ClientStream>(OUTBOUND_PACKETS);
     let client_stream = tokio_stream::wrappers::ReceiverStream::new(client_rx);
 
     let mut request = tonic::Request::new(client_stream);
@@ -386,10 +397,14 @@ fn rejected_members(raw: &[u8]) -> RejectedMembers {
     let members = match &payload {
         serde_json::Value::Array(members) => members.as_slice(),
         serde_json::Value::Object(fields) => {
+            // The conversion is inside the lookup so a preferred key holding
+            // something that is not a list — `{"rejectedMembers":null,
+            // "rejected":["bad.tar"]}`, the natural encoding of an absent Swift
+            // optional beside the real list — falls through to the next name
+            // instead of shadowing it and reading as a clean load.
             match [XpcKey::REJECTED_MEMBERS, "rejected"]
                 .iter()
-                .find_map(|key| fields.get(*key))
-                .and_then(serde_json::Value::as_array)
+                .find_map(|key| fields.get(*key).and_then(serde_json::Value::as_array))
             {
                 Some(members) => members.as_slice(),
                 None => return RejectedMembers::default(),
@@ -660,14 +675,17 @@ fn metadata_field<'a>(metadata: &'a HashMap<String, String>, key: &str) -> &'a s
 /// echoes, so a packet naming neither can be routed nowhere and is left alone.
 ///
 /// Naming both is the whole test, and deliberately so. Neither of the other
-/// fields separates a request from an echo of one of our own replies: nothing
-/// in this crate establishes what the shim sets `complete` to on a request, and
-/// a one-shot request that carries all its parameters at once is a natural
-/// `complete: true`; `direction` describes which way the data flows, so a
-/// request for us to send data carries the same `OUTOF` our replies do. Between
-/// answering a packet that did not need it and staying silent on one that did,
-/// silence is the worse failure: the shim's receivers have no deadline, so it
-/// costs the whole 600s idle budget and the build dies with the wrong reason.
+/// fields separates a request from an echo of one of our own replies. What
+/// `complete` means on a packet the shim *sends* is not established anywhere —
+/// a one-shot request carrying all its parameters at once is a natural
+/// `complete: true`, and nothing here shows otherwise. (That it terminates a
+/// transfer on the packets this client *sends* is a different claim, and one
+/// the working fssync walk does establish; see [`send_blob_range`].)
+/// `direction` describes which way the data flows, so a request for us to send
+/// data carries the same `OUTOF` our replies do. Between answering a packet
+/// that did not need it and staying silent on one that did, silence is the
+/// worse failure: the shim's receivers have no deadline, so it costs the whole
+/// 600s idle budget and the build dies with the wrong reason.
 fn is_request(stage: &str, method: &str) -> bool {
     !stage.is_empty() && !method.is_empty()
 }
@@ -1123,14 +1141,15 @@ fn numeric_metadata(metadata: &HashMap<String, String>, key: &str) -> Option<u64
 /// `ReaderAt` — so the limit is the message size, not the size of a tar chunk.
 const MAX_REPLY_PAYLOAD: u64 = 4 * 1024 * 1024 - 64 * 1024;
 
-/// How many bytes a read request asked for.
+/// How many bytes an fssync `Read` asked for.
 ///
-/// Both read protocols treat an empty reply as EOF, so an absent `length` has
-/// to mean "some of the file" rather than "none of it" — defaulting to zero
-/// would report every blob and every context file as empty instead of failing.
-/// An explicit zero is left alone, because that is how `ReaderAt::init` probes
-/// for a blob's size. What the request cannot do is exceed what a reply can
-/// carry; that is [`readable_span`]'s business.
+/// The shim reads an empty reply as EOF, so an absent `length` has to mean
+/// "some of the file" rather than "none of it" — defaulting to zero would
+/// report every context file as empty instead of failing. One reply's worth is
+/// the right guess here precisely because `Read` loops: the shim comes back for
+/// the rest at the next offset. The content store cannot guess that way, since
+/// nothing continues an unasked-for length there, so it reads to the end of the
+/// blob instead; see [`BlobRange::requested`].
 fn requested_read_length(metadata: &HashMap<String, String>) -> u64 {
     numeric_metadata(metadata, "length").unwrap_or(MAX_REPLY_PAYLOAD)
 }
@@ -1357,7 +1376,7 @@ async fn handle_content_store(
             method,
             size,
             offset,
-            requested: requested_read_length(&transfer.metadata),
+            requested: numeric_metadata(&transfer.metadata, "length"),
         };
         return send_blob_range(builder, build_id, transfer, &range).await;
     }
@@ -1384,32 +1403,65 @@ struct BlobRange<'a> {
     /// The blob's whole size, which every reply reports.
     size: u64,
     offset: u64,
-    requested: u64,
+    /// The length the request named, or `None` when it named none.
+    ///
+    /// Absent means the rest of the blob, not one packet's worth: this reply
+    /// can be continued across packets, so there is no length it cannot serve,
+    /// and capping it would answer a 50 MiB layer with 3.94 MiB marked
+    /// `complete` — the silent truncation the chunking exists to prevent.
+    requested: Option<u64>,
 }
 
 /// Answer a `ReaderAt` with the range it asked for, across as many packets as
 /// that takes.
 ///
 /// A reply is one gRPC message and the shim asks for a whole layer in one call,
-/// so a 50 MiB layer cannot be a single packet. `complete` is what the protocol
-/// provides for exactly that: every packet but the last carries `false`, the
-/// same way the fssync walk hands over its archive. Truncating the answer would
+/// so a 50 MiB layer cannot be a single packet. Truncating the answer would
 /// leave the tail of the layer zero-filled for a caller that does not loop, and
-/// refusing it would fail every build with a real base image — chunking is the
-/// only form that actually serves the request.
+/// refusing it would fail every build with a real base image, so the answer is
+/// spread over packets with `complete` only on the last.
 ///
-/// The blob is read a packet at a time rather than buffered whole, so a layer
-/// costs one packet of memory rather than its own size.
+/// What that rests on, stated plainly because it decides whether this is
+/// correct. Observed: the fssync `Walk` hands its archive over in exactly this
+/// form — many packets, `complete` on the last — and that path demonstrably
+/// works against shim 0.8.0, so an outbound `complete` is what ends a transfer
+/// on `BuildTransfer`. Inferred: that the content-store receiver reassembles
+/// `ImageTransfer` the same way. `proto/builder.proto` documents neither, and
+/// this crate has no shim source to check against. The inference is worth
+/// making because a request for more than one message can hold is itself the
+/// caller saying it wants the whole range — a shim that looped on offset would
+/// ask in its own buffer's units — but if it is ever proved wrong, this is the
+/// decision to revisit first.
+///
+/// Memory: the producer holds one packet at a time rather than the whole blob.
+/// The pipe is what bounds the rest — see [`OUTBOUND_PACKETS`].
 async fn send_blob_range(
     builder: &BuilderSink,
     build_id: &str,
     transfer: &ImageTransfer,
     range: &BlobRange<'_>,
 ) -> Result<(), AppleContainerError> {
-    let total = range.requested.min(range.size.saturating_sub(range.offset));
-    let mut sent = 0u64;
+    let available = range.size.saturating_sub(range.offset);
+    let total = range.requested.unwrap_or(available).min(available);
 
-    loop {
+    // `ReaderAt::init` probes with length 0 purely to learn the size, and a
+    // read that starts past the end is EOF; both are one empty completed reply.
+    if total == 0 {
+        let metadata = blob_reply_metadata(range.method, range.digest, range.size, range.offset, 0);
+        return send_image_transfer(
+            builder,
+            build_id,
+            transfer,
+            range.digest,
+            metadata,
+            Vec::new(),
+            true,
+        )
+        .await;
+    }
+
+    let mut sent = 0u64;
+    while sent < total {
         let at = range.offset + sent;
         let wanted = (total - sent).min(MAX_REPLY_PAYLOAD) as usize;
         let data = match content::read_range(range.path, at, wanted) {
@@ -1421,11 +1473,30 @@ async fn send_blob_range(
             }
         };
 
-        // A read that came back short means the blob ended before the store
-        // said it would; either way there is nothing further to carry.
-        let carried = data.len() as u64;
-        let complete = carried == 0 || sent + carried >= total;
-        let metadata = blob_reply_metadata(range.method, range.digest, range.size, at, carried);
+        // `read_range` clamps to the end of the file, so a short read means the
+        // blob is no longer the size the store reported — it was replaced or
+        // collected mid-transfer. Completing the transfer here would hand the
+        // shim a layer with a zero-filled tail and a digest that will not
+        // match, so it is reported instead.
+        if data.len() < wanted {
+            let message = format!(
+                "blob {} is {} bytes shorter than the {} the content store reported; \
+                 it changed while it was being read",
+                range.digest,
+                wanted - data.len(),
+                range.size
+            );
+            return send_content_error(builder, build_id, transfer, range.method, &message).await;
+        }
+
+        sent += data.len() as u64;
+        let metadata = blob_reply_metadata(
+            range.method,
+            range.digest,
+            range.size,
+            at,
+            data.len() as u64,
+        );
         send_image_transfer(
             builder,
             build_id,
@@ -1433,15 +1504,12 @@ async fn send_blob_range(
             range.digest,
             metadata,
             data,
-            complete,
+            sent >= total,
         )
         .await?;
-
-        sent += carried;
-        if complete {
-            return Ok(());
-        }
     }
+
+    Ok(())
 }
 
 /// Metadata one content-store reply carries.
@@ -2141,7 +2209,12 @@ mod tests {
 
     /// A blob served straight out of a file, so the chunking can be exercised
     /// without a populated content store.
-    fn blob_range<'a>(path: &'a Path, size: u64, offset: u64, requested: u64) -> BlobRange<'a> {
+    fn blob_range<'a>(
+        path: &'a Path,
+        size: u64,
+        offset: u64,
+        requested: Option<u64>,
+    ) -> BlobRange<'a> {
         BlobRange {
             digest: "sha256:layer",
             path,
@@ -2823,6 +2896,16 @@ mod tests {
 
         let reply = br#"{"accepted":["app.tar"],"rejected":["bad.tar"]}"#;
         assert_eq!(rejected_members(reply).named, ["bad.tar"]);
+
+        // A preferred key holding something that is not a list — the natural
+        // encoding of an absent Swift optional — must fall through to the name
+        // that does carry one, not shadow it into a clean load.
+        let reply = br#"{"rejectedMembers":null,"rejected":["bad.tar"]}"#;
+        assert_eq!(
+            rejected_members(reply).named,
+            ["bad.tar"],
+            "a null preferred key must not hide the list beside it"
+        );
     }
 
     /// An entry this version cannot read a filename out of is still a refused
@@ -3073,7 +3156,7 @@ mod tests {
                 &sink(&tx),
                 REPLY_ID,
                 &request,
-                &blob_range(&blob, layer as u64, 0, layer as u64),
+                &blob_range(&blob, layer as u64, 0, Some(layer as u64)),
             )
             .await
             .expect("a whole layer must be servable");
@@ -3129,9 +3212,14 @@ mod tests {
 
         let replies = run(async {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<ClientStream>(8);
-            send_blob_range(&sink(&tx), REPLY_ID, &request, &blob_range(&blob, 10, 0, 0))
-                .await
-                .expect("a size probe must be answered");
+            send_blob_range(
+                &sink(&tx),
+                REPLY_ID,
+                &request,
+                &blob_range(&blob, 10, 0, Some(0)),
+            )
+            .await
+            .expect("a size probe must be answered");
             drain_image(&mut rx)
         });
 
@@ -3141,6 +3229,80 @@ mod tests {
         assert_eq!(
             replies[0].metadata.get("size").map(String::as_str),
             Some("10")
+        );
+    }
+
+    /// A `ReaderAt` that names no length wants the blob, not one packet of it.
+    /// Capping it at a packet would mark a 46 MiB-short answer `complete` and
+    /// the shim would zero-fill the rest — the truncation chunking exists to
+    /// prevent, reached through the one metadata key this client may not read.
+    #[test]
+    fn a_blob_read_without_a_length_serves_the_whole_blob() {
+        let layer = (MAX_REPLY_PAYLOAD as usize) + 4096;
+        let content: Vec<u8> = (0..layer).map(|i| (i % 251) as u8).collect();
+        let store = tempfile::tempdir().expect("temp store");
+        let blob = store.path().join("layer");
+        std::fs::write(&blob, &content).expect("blob");
+        let request = image_transfer();
+
+        let replies = run(async {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<ClientStream>(64);
+            send_blob_range(
+                &sink(&tx),
+                REPLY_ID,
+                &request,
+                &blob_range(&blob, layer as u64, 0, None),
+            )
+            .await
+            .expect("a lengthless read must still serve the blob");
+            drain_image(&mut rx)
+        });
+
+        let served: Vec<u8> = replies.iter().flat_map(|p| p.data.clone()).collect();
+        assert_eq!(served, content, "an absent length must mean the whole blob");
+        assert_eq!(replies.iter().filter(|p| p.complete).count(), 1);
+        assert!(replies.last().expect("last").complete);
+    }
+
+    /// The content store said one size and the file is another: the blob was
+    /// replaced or collected mid-transfer. Completing there would hand the shim
+    /// a layer with a zero-filled tail and a digest that cannot match, so it is
+    /// reported instead.
+    #[test]
+    fn a_blob_that_shrinks_mid_transfer_is_reported_not_completed() {
+        let store = tempfile::tempdir().expect("temp store");
+        let blob = store.path().join("layer");
+        std::fs::write(&blob, b"0123456789").expect("blob");
+        let request = image_transfer();
+
+        let replies = run(async {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<ClientStream>(8);
+            // The store reports 4 KiB; the file holds ten bytes.
+            send_blob_range(
+                &sink(&tx),
+                REPLY_ID,
+                &request,
+                &blob_range(&blob, 4096, 0, Some(4096)),
+            )
+            .await
+            .expect("the shortfall must be reported, not returned as an error here");
+            drain_image(&mut rx)
+        });
+
+        let reported = replies
+            .iter()
+            .find(|p| p.metadata.contains_key("error"))
+            .expect("a blob shorter than the store said must be reported");
+        assert!(
+            reported.metadata["error"].contains("shorter"),
+            "{}",
+            reported.metadata["error"]
+        );
+        assert!(
+            !replies
+                .iter()
+                .any(|p| p.complete && !p.metadata.contains_key("error")),
+            "a short layer must never be completed cleanly"
         );
     }
 
@@ -3158,7 +3320,7 @@ mod tests {
                 &sink(&tx),
                 REPLY_ID,
                 &request,
-                &blob_range(&blob, 10, 64, 4096),
+                &blob_range(&blob, 10, 64, Some(4096)),
             )
             .await
             .expect("a read past the end must be answered");

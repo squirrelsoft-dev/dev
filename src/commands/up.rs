@@ -476,6 +476,9 @@ pub(crate) async fn run_with_runtime(
 const READINESS_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
 const READINESS_FIRST_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 const READINESS_MAX_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+/// The least budget an attempt is worth starting with, so a bounded one is
+/// never handed a window too short to reach the runtime at all.
+const READINESS_MIN_ATTEMPT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// The retry schedule every part of the readiness gate follows.
 ///
@@ -496,12 +499,21 @@ impl ReadinessPolls {
     }
 
     /// Wait before the next attempt, or report that the budget is spent.
+    ///
+    /// An attempt is only granted when enough budget remains to actually make
+    /// one. Sleeping right up to the deadline and reporting another attempt
+    /// would hand it a zero-length window: a caller that bounds its work by
+    /// [`Self::remaining`] would then time out before the runtime was polled
+    /// even once, and report that as the runtime's failure rather than the
+    /// real one the previous attempts found.
     async fn wait(&mut self) -> bool {
-        let now = tokio::time::Instant::now();
-        if now >= self.deadline {
+        let left = self
+            .deadline
+            .saturating_duration_since(tokio::time::Instant::now());
+        if left <= READINESS_MIN_ATTEMPT {
             return false;
         }
-        tokio::time::sleep(self.next.min(self.deadline - now)).await;
+        tokio::time::sleep(self.next.min(left - READINESS_MIN_ATTEMPT)).await;
         self.next = (self.next * 2).min(READINESS_MAX_POLL);
         true
     }
@@ -566,11 +578,9 @@ async fn verify_container_execs(
     let mut polls = ReadinessPolls::new();
 
     loop {
-        let attempt = tokio::time::timeout(
-            polls.remaining(),
-            runtime.exec(container_id, &probe, remote_user),
-        )
-        .await;
+        let window = polls.remaining();
+        let attempt =
+            tokio::time::timeout(window, runtime.exec(container_id, &probe, remote_user)).await;
 
         let failure = match attempt {
             // A process that ran to completion proves the create → start → wait
@@ -589,8 +599,8 @@ async fn verify_container_execs(
             }
             Ok(Err(e)) => e.to_string(),
             Err(_) => format!(
-                "the command was accepted but never reported an exit within {}s",
-                READINESS_BUDGET.as_secs()
+                "it did not report an exit within {:.1}s",
+                window.as_secs_f64()
             ),
         };
 
@@ -1929,6 +1939,11 @@ mod tests {
             let execs = self.execs.clone();
             Box::pin(async move {
                 execs.lock().unwrap().push((cmd, user));
+                // A real exec talks to a daemon, so it is Pending on its first
+                // poll. Answering synchronously would let this fake succeed
+                // inside a zero-length timeout that a real runtime could never
+                // meet, hiding a gate that grants an attempt no budget.
+                tokio::task::yield_now().await;
                 if never_returns {
                     std::future::pending::<()>().await;
                 }
@@ -2369,8 +2384,33 @@ mod tests {
 
         let msg = format!("{err}");
         assert!(
-            msg.contains("never reported an exit"),
+            msg.contains("did not report an exit"),
             "the error must name the hang, got: {msg}"
+        );
+    }
+
+    /// A runtime that refuses for the whole budget must be reported as refusing.
+    /// The gate bounds each attempt by what is left, so an attempt granted a
+    /// window too short to reach the runtime would time out and overwrite the
+    /// real diagnosis with a hang that never happened.
+    #[tokio::test(start_paused = true)]
+    async fn up_reports_the_runtimes_own_exec_failure_not_a_phantom_hang() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let rt = UpFakeRuntime::cannot_exec();
+
+        let err = run_up_with_fake(&rt, &workspace)
+            .await
+            .expect_err("readiness must not be reported for a container that cannot exec");
+
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("exec failed (test-injected)"),
+            "the runtime's own failure must survive to the end, got: {msg}"
+        );
+        assert!(
+            !msg.contains("did not report an exit"),
+            "a refusal must not be reported as a hang, got: {msg}"
         );
     }
 
