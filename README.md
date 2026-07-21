@@ -209,8 +209,8 @@ Docker Compose (`dockerComposeFile`) is supported for the full lifecycle — bui
 
 ```sh
 brew install dnsmasq
-# Apple Silicon uses /opt/homebrew/etc; Intel Macs use /usr/local/etc
-echo 'address=/.test/127.0.0.1' >> /opt/homebrew/etc/dnsmasq.conf
+# $(brew --prefix) resolves to /opt/homebrew (Apple Silicon) or /usr/local (Intel)
+echo 'address=/.test/127.0.0.1' >> "$(brew --prefix)/etc/dnsmasq.conf"
 sudo brew services start dnsmasq
 sudo mkdir -p /etc/resolver
 echo 'nameserver 127.0.0.1' | sudo tee /etc/resolver/test
