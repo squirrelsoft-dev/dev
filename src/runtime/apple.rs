@@ -136,32 +136,33 @@ impl AppleRuntime {
     /// Resolved at most once per container: `create_container` records what it
     /// configured, and any other invocation (`dev exec`, `dev shell`) reads it
     /// back from the daemon once. A lookup failure is reported and degrades to
-    /// `/` rather than failing the command, since an exec should still run when
-    /// only its starting directory is unknown.
+    /// `/` for that command only — it is never cached, so a transient daemon
+    /// error cannot pin the rest of the invocation to the wrong directory.
     async fn container_working_directory(&self, id: &str) -> String {
         if let Some(known) = self.remembered_working_directory(id) {
             return known;
         }
 
-        let working_directory = match self.client.get(id).await {
-            Ok(snapshot) => absolute_or_root([Some(
-                snapshot
-                    .configuration
-                    .init_process
-                    .working_directory
-                    .as_str(),
-            )]),
+        match self.client.get(id).await {
+            Ok(snapshot) => {
+                let working_directory = absolute_or_root([Some(
+                    snapshot
+                        .configuration
+                        .init_process
+                        .working_directory
+                        .as_str(),
+                )]);
+                self.remember_working_directory(id, &working_directory);
+                working_directory
+            }
             Err(e) => {
                 eprintln!(
                     "Warning: could not read the working directory of container '{id}' \
-                     ({e}); running commands from /"
+                     ({e}); running this command from /"
                 );
                 "/".to_string()
             }
-        };
-
-        self.remember_working_directory(id, &working_directory);
-        working_directory
+        }
     }
 
     /// Run a command against the caller's terminal and wait for it to exit.
@@ -171,11 +172,13 @@ impl AppleRuntime {
         cmd: &[String],
         user: Option<&str>,
     ) -> Result<i32, DevError> {
-        let _raw_guard = RawModeGuard::enter()?;
-
-        let process_id = next_process_id("exec-interactive");
+        // Resolved before raw mode: this can warn, and a raw terminal needs
+        // CRLF to keep such output from staircasing.
         let working_directory = self.container_working_directory(id).await;
         let proc_config = exec_process_config(cmd, user, true, &working_directory);
+
+        let _raw_guard = RawModeGuard::enter()?;
+        let process_id = next_process_id("exec-interactive");
 
         // Hand the real terminal descriptors to the daemon; it drives the pty.
         self.client

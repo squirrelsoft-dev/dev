@@ -292,6 +292,23 @@ impl BollardRuntime {
         &self,
         config: &ContainerConfig,
     ) -> Result<String, DevError> {
+        let container_config = Self::to_create_body(config);
+
+        let opts = CreateContainerOptions {
+            name: Some(config.name.clone()),
+            ..Default::default()
+        };
+
+        let response = self
+            .client
+            .create_container(Some(opts), container_config)
+            .await?;
+
+        Ok(response.id)
+    }
+
+    /// Build the daemon-facing create body from our generic container config.
+    fn to_create_body(config: &ContainerConfig) -> ContainerCreateBody {
         let mut binds = Vec::new();
         for m in &config.mounts {
             let ro = if m.readonly { ":ro" } else { "" };
@@ -351,7 +368,7 @@ impl BollardRuntime {
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
 
-        let container_config = ContainerCreateBody {
+        ContainerCreateBody {
             image: Some(config.image.clone()),
             labels: Some(
                 labels
@@ -361,6 +378,11 @@ impl BollardRuntime {
             ),
             env: Some(env),
             exposed_ports: Some(exposed_ports),
+            // The resolved workspaceFolder becomes the container's WorkingDir,
+            // which every `docker exec` without an explicit one inherits — so
+            // lifecycle hooks and `dev exec` run where the devcontainer spec
+            // says they should, matching the Apple runtime.
+            working_dir: config.workspace_folder.clone(),
             host_config: Some(host_config),
             entrypoint: config.entrypoint.as_ref().map(|ep| vec![ep.clone()]),
             // Keep the container running with a default command if no entrypoint provided.
@@ -370,19 +392,7 @@ impl BollardRuntime {
                 None
             },
             ..Default::default()
-        };
-
-        let opts = CreateContainerOptions {
-            name: Some(config.name.clone()),
-            ..Default::default()
-        };
-
-        let response = self
-            .client
-            .create_container(Some(opts), container_config)
-            .await?;
-
-        Ok(response.id)
+        }
     }
 
     async fn start_container_impl(&self, id: &str) -> Result<(), DevError> {
@@ -1039,5 +1049,61 @@ impl ContainerRuntime for DockerRuntime {
         user: Option<&str>,
     ) -> BoxFut<'_, AttachedExec> {
         self.0.exec_attached(id, cmd, user)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::WorkspaceMount;
+
+    fn container_config(workspace_folder: Option<&str>) -> ContainerConfig {
+        ContainerConfig {
+            image: "ubuntu:24.04".to_string(),
+            name: "vsc-test".to_string(),
+            labels: HashMap::new(),
+            env: HashMap::new(),
+            mounts: vec![],
+            volumes: vec![],
+            ports: vec![],
+            workspace_mount: Some(WorkspaceMount {
+                source: std::path::PathBuf::from("/host/monorepo"),
+                target: "/srv/app".to_string(),
+            }),
+            workspace_folder: workspace_folder.map(str::to_string),
+            extra_args: vec![],
+            entrypoint: None,
+            init: false,
+            privileged: false,
+            cap_add: vec![],
+            security_opt: vec![],
+        }
+    }
+
+    /// The container's `WorkingDir` is the resolved `workspaceFolder`, which
+    /// may be a subdirectory of the workspace mount. Every `docker exec` that
+    /// does not name its own working directory inherits this, so lifecycle
+    /// hooks and `dev exec` run where the devcontainer spec says — the same
+    /// place the Apple runtime uses.
+    #[test]
+    fn create_body_runs_in_the_resolved_workspace_folder() {
+        let body = BollardRuntime::to_create_body(&container_config(Some("/srv/app/packages/api")));
+
+        assert_eq!(body.working_dir.as_deref(), Some("/srv/app/packages/api"));
+        assert_eq!(
+            body.host_config
+                .and_then(|h| h.binds)
+                .and_then(|b| b.first().cloned()),
+            Some("/host/monorepo:/srv/app".to_string()),
+            "the source tree is still bound at the workspaceMount target"
+        );
+    }
+
+    /// Without a resolved folder the field stays unset, so the daemon keeps
+    /// using the image's own `WorkingDir`.
+    #[test]
+    fn create_body_leaves_working_dir_unset_without_a_workspace_folder() {
+        let body = BollardRuntime::to_create_body(&container_config(None));
+        assert_eq!(body.working_dir, None);
     }
 }
