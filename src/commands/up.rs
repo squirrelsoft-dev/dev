@@ -576,18 +576,20 @@ async fn verify_container_execs(
 ) -> anyhow::Result<()> {
     let probe = vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()];
     let mut polls = ReadinessPolls::new();
-    // A runtime that answered — even to refuse — said something more specific
-    // than a deadline can, so its last word outlives a later attempt that only
-    // ran out of window.
+    // The last attempt's outcome is the diagnosis, because it describes the
+    // state the container is actually in now. An earlier refusal is kept as
+    // context rather than as the headline: a runtime that refused while its
+    // exec endpoint was still coming up and then stopped answering altogether
+    // is a hang, and reporting the stale refusal would name the wrong symptom
+    // for precisely the bug this gate exists to catch.
     let mut refusal: Option<String> = None;
-    let mut timeout: Option<String> = None;
 
     loop {
         let window = polls.remaining();
         let attempt =
             tokio::time::timeout(window, runtime.exec(container_id, &probe, remote_user)).await;
 
-        match attempt {
+        let latest = match attempt {
             // A process that ran to completion proves the create → start → wait
             // sequence works, whatever status it reported — and that sequence
             // is the whole of what this gate certifies. The status belongs to
@@ -602,25 +604,39 @@ async fn verify_container_execs(
                 warn_probe_command_missing(container_id, &e.to_string());
                 return Ok(());
             }
-            Ok(Err(e)) => refusal = Some(e.to_string()),
-            Err(_) => {
-                timeout = Some(format!(
-                    "it did not report an exit within {:.1}s",
-                    window.as_secs_f64()
-                ));
+            Ok(Err(e)) => {
+                refusal = Some(e.to_string());
+                e.to_string()
             }
-        }
+            Err(_) => format!(
+                "it did not report an exit within {:.1}s",
+                window.as_secs_f64()
+            ),
+        };
 
         if !polls.wait().await {
-            let failure = refusal
-                .or(timeout)
-                .unwrap_or_else(|| "the runtime gave no reason".to_string());
             anyhow::bail!(
                 "Container '{container_id}' was started and is running, but no command can be \
-                 run in it: {failure}. `dev exec`, `dev shell` and lifecycle hooks would all \
-                 fail the same way."
+                 run in it: {}. `dev exec`, `dev shell` and lifecycle hooks would all \
+                 fail the same way.",
+                probe_diagnosis(&latest, refusal)
             );
         }
+    }
+}
+
+/// What to tell the user the probe found, newest signal first.
+///
+/// The last attempt describes the container as it stands. When an earlier
+/// attempt was refused and the last one merely ran out of window, both are
+/// worth having: the timeout is what is happening, the refusal is how it
+/// started.
+fn probe_diagnosis(latest: &str, refusal: Option<String>) -> String {
+    match refusal {
+        Some(refusal) if refusal != latest => {
+            format!("{latest} (an earlier attempt was refused: {refusal})")
+        }
+        _ => latest.to_string(),
     }
 }
 
@@ -2451,11 +2467,13 @@ mod tests {
         );
     }
 
-    /// A runtime that refuses and then, on a later attempt, simply runs out of
-    /// window must still be reported as refusing: the runtime said something
-    /// specific, and a deadline expiring says nothing the user can act on.
+    /// A runtime that refuses while its exec endpoint is coming up and then
+    /// stops answering altogether is hanging, not refusing — the issue #4
+    /// symptom. The last attempt leads because it describes the container as it
+    /// stands, and the earlier refusal rides along as context rather than as
+    /// the headline that would name the wrong problem.
     #[tokio::test(start_paused = true)]
-    async fn up_keeps_the_runtimes_refusal_over_a_later_timeout() {
+    async fn up_leads_with_the_latest_hang_and_keeps_the_earlier_refusal() {
         let workspace = TempDir::new().unwrap();
         write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
         let rt = UpFakeRuntime::refuses_then_stops_answering(1);
@@ -2465,13 +2483,35 @@ mod tests {
             .expect_err("readiness must not be reported for a container that cannot exec");
 
         let msg = format!("{err}");
+        let hang = msg
+            .find("did not report an exit")
+            .unwrap_or_else(|| panic!("the hang is what is happening now, got: {msg}"));
+        let refused = msg
+            .find("exec failed (test-injected)")
+            .unwrap_or_else(|| panic!("the earlier refusal must survive as context: {msg}"));
         assert!(
-            msg.contains("exec failed (test-injected)"),
-            "the refusal must outlive the timeout that followed it, got: {msg}"
+            hang < refused,
+            "the latest signal leads and the refusal follows it, got: {msg}"
         );
+    }
+
+    /// When every attempt is refused, the refusal is both the latest signal and
+    /// the whole story — it must not be dressed up as its own context.
+    #[tokio::test(start_paused = true)]
+    async fn up_reports_a_refusal_once_when_nothing_else_happened() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let rt = UpFakeRuntime::cannot_exec();
+
+        let err = run_up_with_fake(&rt, &workspace)
+            .await
+            .expect_err("readiness must not be reported for a container that cannot exec");
+
+        let msg = format!("{err}");
+        assert!(msg.contains("exec failed (test-injected)"), "{msg}");
         assert!(
-            !msg.contains("did not report an exit"),
-            "a deadline says less than the refusal it replaced, got: {msg}"
+            !msg.contains("an earlier attempt was refused"),
+            "a refusal is not context for itself, got: {msg}"
         );
     }
 

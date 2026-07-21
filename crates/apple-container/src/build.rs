@@ -1135,10 +1135,13 @@ fn numeric_metadata(metadata: &HashMap<String, String>, key: &str) -> Option<u64
 /// The most payload one reply may carry.
 ///
 /// gRPC's default message limit is 4 MiB and a reply carries its metadata map
-/// as well, so the payload stops a little under it. This is the only honest
-/// bound on a read: shortening a reply further would hand a caller that does
-/// not loop a zero-filled tail, and the shim asks for a whole layer in one
-/// `ReaderAt` — so the limit is the message size, not the size of a tar chunk.
+/// as well, so the payload stops a little under it.
+///
+/// This is a ceiling, not a working size. The shim reads a layer through a
+/// prefetcher whose `ChunkSize` is 1 MiB (`pkg/content/readerat.go`), so a
+/// content-store request asks for well under this and it never binds in
+/// practice; a request that would exceed it is refused rather than answered
+/// short. See [`send_blob_range`].
 const MAX_REPLY_PAYLOAD: u64 = 4 * 1024 * 1024 - 64 * 1024;
 
 /// How many bytes an fssync `Read` asked for.
@@ -1354,6 +1357,15 @@ async fn handle_content_store(
         .await;
     };
 
+    // Read before anything is fetched on the request's behalf: a request whose
+    // own numbers cannot be read should not send us pulling an image for it.
+    let window = match content_read_window(&transfer.metadata) {
+        Ok(window) => window,
+        Err(message) => {
+            return send_content_error(builder, build_id, transfer, method, &message).await;
+        }
+    };
+
     let size = match ensure_blob(&digest, session).await {
         Ok(size) => size,
         Err(e) => {
@@ -1361,21 +1373,11 @@ async fn handle_content_store(
         }
     };
 
-    // `ReaderAt` probes with offset 0 and length 0 purely to learn the size,
-    // and reads an empty payload as EOF thereafter.
-    let offset = numeric_metadata(&transfer.metadata, "offset").unwrap_or(0);
+    let offset = window.offset;
     if method == CONTENT_READER_AT_METHOD {
         let Some(path) = content::blob_path(&digest) else {
             let message = format!("content store: malformed digest {digest:?}");
             return send_content_error(builder, build_id, transfer, method, &message).await;
-        };
-        let requested = match content_read_length(&transfer.metadata) {
-            RequestedLength::Named(length) => Some(length),
-            RequestedLength::Absent => None,
-            RequestedLength::Unreadable(raw) => {
-                let message = format!("content-store read named an unreadable length {raw:?}");
-                return send_content_error(builder, build_id, transfer, method, &message).await;
-            }
         };
         let range = BlobRange {
             digest: &digest,
@@ -1383,7 +1385,7 @@ async fn handle_content_store(
             method,
             size,
             offset,
-            requested,
+            requested: window.length,
         };
         return send_blob_range(builder, build_id, transfer, &range).await;
     }
@@ -1402,26 +1404,67 @@ async fn handle_content_store(
     .await
 }
 
-/// What a content-store read said about how much it wanted.
+/// What a request said about one of its numeric fields.
 ///
-/// A length this client cannot read is deliberately not folded into "named
-/// none": the two call for opposite answers, and guessing on the caller's
-/// behalf would serve a windowed read something it never asked for.
+/// A value this client cannot read is deliberately not folded into "absent":
+/// the two call for opposite answers, and guessing on the caller's behalf would
+/// serve a windowed read something it never asked for — for `offset`, bytes
+/// from somewhere else in the blob entirely.
 #[derive(Debug, PartialEq, Eq)]
-enum RequestedLength<'a> {
+enum RequestedNumber<'a> {
     Named(u64),
     Absent,
     Unreadable(&'a str),
 }
 
-fn content_read_length(metadata: &HashMap<String, String>) -> RequestedLength<'_> {
-    match metadata.get("length") {
-        None => RequestedLength::Absent,
+fn requested_number<'a>(metadata: &'a HashMap<String, String>, key: &str) -> RequestedNumber<'a> {
+    match metadata.get(key) {
+        None => RequestedNumber::Absent,
         Some(raw) => match raw.trim().parse::<u64>() {
-            Ok(length) => RequestedLength::Named(length),
-            Err(_) => RequestedLength::Unreadable(raw),
+            Ok(value) => RequestedNumber::Named(value),
+            Err(_) => RequestedNumber::Unreadable(raw),
         },
     }
+}
+
+/// Where a content-store request wants to read from, and how much.
+#[derive(Debug, PartialEq, Eq)]
+struct ContentReadWindow {
+    /// `ReaderAt` probes at offset 0 to learn a blob's size, so an absent
+    /// offset means the start.
+    offset: u64,
+    /// The caller's buffer size, or `None` when the request named no length.
+    length: Option<u64>,
+}
+
+/// Read the window a content-store request named, or say why it cannot be read.
+///
+/// Both numbers are read through the same rule, because both fail the same way.
+/// A request whose offset this client cannot read is refused rather than
+/// defaulted to the start: `readerAt.ReadAt` (`pkg/content/readerat.go`) ignores
+/// the offset a reply reports and copies the payload straight into the buffer it
+/// asked for, so start-of-blob bytes answered for a request that named some
+/// other position are cached under the wrong chunk index and corrupt the layer.
+fn content_read_window(metadata: &HashMap<String, String>) -> Result<ContentReadWindow, String> {
+    let offset = match requested_number(metadata, "offset") {
+        RequestedNumber::Named(offset) => offset,
+        RequestedNumber::Absent => 0,
+        RequestedNumber::Unreadable(raw) => {
+            return Err(format!(
+                "content-store read named an unreadable offset {raw:?}"
+            ));
+        }
+    };
+    let length = match requested_number(metadata, "length") {
+        RequestedNumber::Named(length) => Some(length),
+        RequestedNumber::Absent => None,
+        RequestedNumber::Unreadable(raw) => {
+            return Err(format!(
+                "content-store read named an unreadable length {raw:?}"
+            ));
+        }
+    };
+    Ok(ContentReadWindow { offset, length })
 }
 
 /// The slice of a stored blob one `ReaderAt` asked for.
@@ -1444,16 +1487,22 @@ struct BlobRange<'a> {
 /// `ContentStoreProxy.request` (`pkg/content/content.go`) forwards to
 /// `Request` (`pkg/stream/stage.go`), which does exactly one `demux.Recv()`.
 /// Nothing on this path reassembles packets, and nothing reads `complete`. A
-/// second packet would not extend the answer — it would sit in the demux queue
-/// for the *next* `ReadAt` on the same id and be returned as that read's data,
-/// at the wrong offset, silently corrupting the layer.
+/// second packet would not extend the answer, and it would not reach the next
+/// read either: `request` mints a fresh uuid per call and uses it as both the
+/// stream's build id and the demux key, then closes that demux when it returns,
+/// so `UnimplementedBaseStage.run` (`pkg/stream/stage.go`) discards the extra
+/// packet as one with no matching — or an already closed — handler. It would
+/// simply be thrown away, and the bytes it carried lost.
 ///
-/// So the answer is bounded, not continued, and a short answer is what the
-/// protocol expects: `ReadAt` returns `(n, nil)` for `n < len(p)` and its caller
-/// reads on from the new offset. `readerAt` is wrapped in a prefetcher
-/// configured with `ChunkSize: 1 << 20`, so a request never asks for more than
-/// 1 MiB in practice and [`MAX_REPLY_PAYLOAD`] is headroom rather than a limit
-/// that bites.
+/// So the answer is one packet, and a short answer is what the protocol
+/// expects: `ReadAt` returns `(n, nil)` for `n < len(p)` and its caller reads
+/// on from the new offset. `readerAt` is wrapped in a prefetcher configured
+/// with `ChunkSize: 1 << 20`, so a request never asks for more than 1 MiB in
+/// practice and [`MAX_REPLY_PAYLOAD`] is headroom rather than a limit that
+/// bites. A request that would exceed it is refused rather than cut short,
+/// because the prefetcher's `fetchChunk` (`pkg/prefetch/prefetch.go`) caches a
+/// short read as a chunk of that length with no refill — a quietly truncated
+/// reply would be compacted against the next chunk and corrupt the layer.
 ///
 /// The contrast is the fssync `Walk`, which *is* multi-packet:
 /// `pkg/fileutils/tarxfer.go` accumulates `bt.Data` in a loop and stops on
@@ -1468,11 +1517,28 @@ async fn send_blob_range(
     let available = range.size.saturating_sub(range.offset);
     // `ReaderAt::init` probes with length 0 purely to learn the size, and a
     // read that starts past the end is EOF; both are one empty reply.
-    let wanted = range
-        .requested
-        .unwrap_or(MAX_REPLY_PAYLOAD)
-        .min(available)
-        .min(MAX_REPLY_PAYLOAD) as usize;
+    //
+    // A named length is a buffer the caller will compare against, so one it
+    // cannot be answered in full is refused rather than cut down. A request
+    // that names no length states no expectation to fall short of, so it gets
+    // as much as a reply holds and the `size` metadata to read on from.
+    let wanted = match range.requested {
+        Some(named) => {
+            let asked_for = named.min(available);
+            if asked_for > MAX_REPLY_PAYLOAD {
+                let message = format!(
+                    "blob {} was asked for {asked_for} bytes from offset {}, more than the \
+                     {MAX_REPLY_PAYLOAD} one reply can carry; answering short would be taken \
+                     for the whole range",
+                    range.digest, range.offset
+                );
+                return send_content_error(builder, build_id, transfer, range.method, &message)
+                    .await;
+            }
+            asked_for as usize
+        }
+        None => available.min(MAX_REPLY_PAYLOAD) as usize,
+    };
 
     let data = match content::read_range(range.path, range.offset, wanted) {
         Ok(data) => data,
@@ -3136,14 +3202,15 @@ mod tests {
         assert_eq!(readable_span(asset, asset), MAX_REPLY_PAYLOAD as usize);
     }
 
-    /// One request, one reply. `readerAt.ReadAt` takes the single
-    /// `ImageTransfer` that `proxy.request` returns — `Request`
-    /// (`pkg/stream/stage.go`) does one `demux.Recv()` and never looks at
-    /// `complete` — so a second packet would not extend this answer. It would
-    /// wait in the demux for the *next* `ReadAt` on the same id and be handed
-    /// back as that read's data, at an offset it does not belong to.
+    /// One request, one reply — so a range larger than a reply cannot be
+    /// answered at all. Cutting it short and marking it done would be taken for
+    /// the whole range: `fetchChunk` caches a short read as a chunk of that
+    /// length with no refill, and the prefetcher then compacts the next chunk
+    /// against it. The verified protocol never asks this (1 MiB windows), which
+    /// is exactly why refusing costs nothing and a silent truncation would be
+    /// undiagnosable.
     #[test]
-    fn an_oversized_blob_read_is_answered_with_exactly_one_packet() {
+    fn a_blob_read_larger_than_one_reply_is_refused_not_cut_short() {
         let layer = (MAX_REPLY_PAYLOAD as usize) * 2 + 1024;
         let content: Vec<u8> = (0..layer).map(|i| (i % 251) as u8).collect();
         let store = tempfile::tempdir().expect("temp store");
@@ -3160,33 +3227,94 @@ mod tests {
                 &blob_range(&blob, layer as u64, 0, Some(layer as u64)),
             )
             .await
-            .expect("a whole layer must be servable");
+            .expect("the refusal must be reported, not returned as an error here");
             drain_image(&mut rx)
         });
 
-        assert_eq!(
-            replies.len(),
-            1,
-            "the receiver consumes one packet per request, so only one may be sent"
-        );
+        assert_eq!(replies.len(), 1);
         let reply = &replies[0];
-        assert!(reply.complete);
-        assert_eq!(
-            reply.data.len(),
-            MAX_REPLY_PAYLOAD as usize,
-            "the reply carries as much as one gRPC message holds"
+        assert!(
+            reply.metadata.contains_key("error"),
+            "a range one reply cannot carry must be refused: {:?}",
+            reply.metadata
         );
-        assert_eq!(reply.data, content[..reply.data.len()]);
-        assert_eq!(reply.metadata.get("offset").map(String::as_str), Some("0"));
-        assert_eq!(
-            reply.metadata.get("length").map(String::as_str),
-            Some(reply.data.len().to_string().as_str())
+        assert!(
+            reply.data.is_empty(),
+            "no partial payload may be handed over for a refused range"
         );
-        // The whole size is still reported, so the caller knows to read on.
-        assert_eq!(
-            reply.metadata.get("size").map(String::as_str),
-            Some(layer.to_string().as_str())
+        assert!(
+            reply.metadata["error"].contains("more than the"),
+            "{}",
+            reply.metadata["error"]
         );
+    }
+
+    /// The protocol as verified: the prefetcher walks an oversized layer in
+    /// `ChunkSize` windows, one packet each, and the windows reassemble into
+    /// the layer. This is the end-to-end claim the single-packet design rests
+    /// on, driven here rather than left to the source reading.
+    #[test]
+    fn an_oversized_layer_is_served_as_a_sequence_of_windowed_reads() {
+        const CHUNK: usize = 1 << 20;
+        let layer = CHUNK * 3 + 4096;
+        let content: Vec<u8> = (0..layer).map(|i| (i % 251) as u8).collect();
+        let store = tempfile::tempdir().expect("temp store");
+        let blob = store.path().join("layer");
+        std::fs::write(&blob, &content).expect("blob");
+
+        let served = run(async {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<ClientStream>(64);
+            let request = image_transfer();
+            let mut at = 0u64;
+            // Exactly what `prefetcher.fetchChunk` does: read `ChunkSize` at a
+            // time from successive offsets until the reads come back empty.
+            loop {
+                send_blob_range(
+                    &sink(&tx),
+                    REPLY_ID,
+                    &request,
+                    &blob_range(&blob, layer as u64, at, Some(CHUNK as u64)),
+                )
+                .await
+                .expect("each window must be servable");
+                at += CHUNK as u64;
+                if at >= layer as u64 {
+                    break;
+                }
+            }
+            drain_image(&mut rx)
+        });
+
+        assert_eq!(served.len(), 4, "a 3-and-a-bit chunk layer takes 4 windows");
+        assert!(
+            served.iter().all(|p| p.complete),
+            "every windowed read is answered whole, so each reply completes"
+        );
+        assert!(
+            served.iter().all(|p| !p.metadata.contains_key("error")),
+            "no window of a healthy layer may be refused"
+        );
+
+        let reassembled: Vec<u8> = served.iter().flat_map(|p| p.data.clone()).collect();
+        assert_eq!(
+            reassembled, content,
+            "the windows must reassemble into the layer"
+        );
+
+        let mut expected = 0usize;
+        for packet in &served {
+            assert_eq!(
+                packet.metadata.get("offset").map(String::as_str),
+                Some(expected.to_string().as_str())
+            );
+            assert_eq!(
+                packet.metadata.get("size").map(String::as_str),
+                Some(layer.to_string().as_str()),
+                "every reply reports the whole size, so the caller knows to read on"
+            );
+            expected += packet.data.len();
+        }
+        assert_eq!(expected, layer);
     }
 
     /// A read that begins part-way through is answered from that offset, which
@@ -3254,8 +3382,10 @@ mod tests {
         );
     }
 
-    /// A `ReaderAt` that names no length still gets a bounded reply rather than
-    /// nothing, and reports the whole size so the caller can read on.
+    /// A `ReaderAt` that names no length states no expectation to fall short
+    /// of, so it is answered with what a reply holds rather than refused the
+    /// way an unservable *named* length is — and it reports the whole size so
+    /// the caller can read on.
     #[test]
     fn a_blob_read_without_a_length_is_answered_bounded() {
         let layer = (MAX_REPLY_PAYLOAD as usize) + 4096;
@@ -3330,28 +3460,47 @@ mod tests {
         );
     }
 
-    /// A `length` this client cannot read is not the same as one that named
-    /// none. Folding the two together would answer a windowed read with a
-    /// whole-blob default it never asked for, silently.
+    /// A numeric field this client cannot read is not the same as one that
+    /// named none. Folding the two together would answer a windowed read with
+    /// a default it never asked for — a length it did not want, or, worse, the
+    /// bytes at offset zero when it named some other position.
     #[test]
-    fn an_unreadable_content_read_length_is_kept_apart_from_an_absent_one() {
+    fn an_unreadable_request_number_is_kept_apart_from_an_absent_one() {
         assert_eq!(
-            content_read_length(&metadata(&[("length", "4096")])),
-            RequestedLength::Named(4096)
+            content_read_window(&metadata(&[("offset", "4096"), ("length", "1024")])),
+            Ok(ContentReadWindow {
+                offset: 4096,
+                length: Some(1024)
+            })
         );
         assert_eq!(
-            content_read_length(&metadata(&[("length", "0")])),
-            RequestedLength::Named(0),
-            "the size probe names zero and must stay named"
+            content_read_window(&metadata(&[("offset", "0"), ("length", "0")])),
+            Ok(ContentReadWindow {
+                offset: 0,
+                length: Some(0)
+            }),
+            "the size probe names zero for both, and it must stay named"
         );
-        assert_eq!(content_read_length(&metadata(&[])), RequestedLength::Absent);
+        assert_eq!(
+            content_read_window(&metadata(&[])),
+            Ok(ContentReadWindow {
+                offset: 0,
+                length: None
+            }),
+            "naming neither is a whole-blob read from the start, not an error"
+        );
 
-        for unreadable in ["0x1000", "4096b", "", "18446744073709551616"] {
-            assert_eq!(
-                content_read_length(&metadata(&[("length", unreadable)])),
-                RequestedLength::Unreadable(unreadable),
-                "{unreadable:?} is present but unreadable, not absent"
-            );
+        // `-1` matters for offset in particular: the shim formats a signed
+        // int64, so a negative would arrive as text `u64` cannot read.
+        for unreadable in ["0x1000", "4096b", "", "-1", "18446744073709551616"] {
+            for key in ["length", "offset"] {
+                let refusal = content_read_window(&metadata(&[(key, unreadable)]))
+                    .expect_err("a window this client cannot read must be refused, not guessed");
+                assert!(
+                    refusal.contains(key) && refusal.contains(unreadable),
+                    "{refusal:?} should name the {key} it could not read"
+                );
+            }
         }
     }
 
