@@ -260,12 +260,14 @@ dev forward 3000 --list                     # list this workspace's forwarders
 without it won't resolve through the dnsmasq `.test` resolver. `--list` reports every forwarder
 for the workspace, but the port argument is still required by the CLI (it is ignored).
 
-Without `-d`, `dev forward <port>` runs in the foreground and blocks until you Ctrl-C, which
-stops the forwarder and removes the workspace's whole `.test` fragment — including hostnames
-belonging to other forwarders still running on that workspace. Use `dev forward <port> --stop`
-when those must keep working; it regenerates the fragment from the remaining forwarders. Pass
-`-d` (or `--daemon`) to run in the background. The forwarder pipes traffic through
-`nc`/`netcat` inside the container, so the image needs `nc`, `ncat`, or `netcat` installed.
+Without `-d`, `dev forward <port>` runs in the foreground and blocks until you Ctrl-C, which is
+the only way to stop it — only `-d` forwarders record a PID file, so `--stop` can't target a
+foreground one. That Ctrl-C removes the workspace's whole `.test` fragment, including hostnames
+belonging to other forwarders still running on that workspace. To be able to stop an individual
+forwarder without disrupting those other sites, start it with `-d` (or `--daemon`) to run it in
+the background and later stop it with `dev forward <port> --stop`, which regenerates the fragment
+from the remaining forwarders. The forwarder pipes traffic through `nc`/`netcat` inside the
+container, so the image needs `nc`, `ncat`, or `netcat` installed.
 
 ### Caddy config files
 
