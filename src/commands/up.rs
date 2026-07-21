@@ -469,8 +469,13 @@ pub(crate) async fn run_with_runtime(
 }
 
 /// How long to give the runtime to report a just-started container as running.
-const READINESS_ATTEMPTS: usize = 10;
-const READINESS_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+///
+/// Generous because a VM-backed runtime boots a guest before the daemon settles
+/// on `Running`; the polls back off so a healthy container is still confirmed
+/// in the first hundred milliseconds.
+const READINESS_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+const READINESS_FIRST_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+const READINESS_MAX_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Confirm a just-started container is actually running *and* findable by the
 /// same workspace-label query `dev status`/`dev exec` use.
@@ -488,18 +493,23 @@ async fn verify_container_discoverable(
         .map(|(k, v)| format!("{k}={v}"))
         .collect();
 
-    let mut last_state = None;
-    for attempt in 0..READINESS_ATTEMPTS {
-        if attempt > 0 {
-            tokio::time::sleep(READINESS_POLL).await;
-        }
+    let deadline = tokio::time::Instant::now() + READINESS_BUDGET;
+    let mut poll = READINESS_FIRST_POLL;
+    let last_state = loop {
         let found = runtime.list_containers(&filters).await?;
-        match found.iter().find(|c| same_container(&c.id, container_id)) {
+        let state = match found.iter().find(|c| same_container(&c.id, container_id)) {
             Some(c) if c.state == ContainerState::Running => return Ok(()),
-            Some(c) => last_state = Some(c.state.clone()),
-            None => last_state = None,
+            Some(c) => Some(c.state.clone()),
+            None => None,
+        };
+
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break state;
         }
-    }
+        tokio::time::sleep(poll.min(deadline - now)).await;
+        poll = (poll * 2).min(READINESS_MAX_POLL);
+    };
 
     match last_state {
         Some(state) => anyhow::bail!(
@@ -1472,6 +1482,9 @@ mod tests {
         start_fails: bool,
         discoverable: bool,
         starts_running: bool,
+        /// Number of list calls that still report the container as stopped,
+        /// standing in for daemon-side state that settles late.
+        running_after_polls: Arc<AtomicUsize>,
         created_id: String,
         created_config: Arc<Mutex<Option<ContainerConfig>>>,
         started_id: Arc<Mutex<Option<String>>>,
@@ -1486,6 +1499,7 @@ mod tests {
                 start_fails: false,
                 discoverable: true,
                 starts_running: true,
+                running_after_polls: Arc::new(AtomicUsize::new(0)),
                 created_id: "fake-id".to_string(),
                 created_config: Arc::new(Mutex::new(None)),
                 started_id: Arc::new(Mutex::new(None)),
@@ -1514,6 +1528,15 @@ mod tests {
         fn never_running() -> Self {
             Self {
                 starts_running: false,
+                ..Self::ok()
+            }
+        }
+
+        /// Create and start succeed, and the container reports running only
+        /// after `polls` list calls.
+        fn running_late(polls: usize) -> Self {
+            Self {
+                running_after_polls: Arc::new(AtomicUsize::new(polls)),
                 ..Self::ok()
             }
         }
@@ -1632,10 +1655,14 @@ mod tests {
                 .collect();
             let discoverable = self.discoverable;
             let containers = self.containers.clone();
+            let settling = self.running_after_polls.clone();
             Box::pin(async move {
                 if !discoverable {
                     return Ok(Vec::new());
                 }
+                let still_settling = settling
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                    .is_ok();
                 let known = containers.lock().unwrap().clone();
                 Ok(known
                     .into_iter()
@@ -1643,6 +1670,12 @@ mod tests {
                         filters
                             .iter()
                             .all(|(key, value)| c.labels.get(key).is_some_and(|got| got == value))
+                    })
+                    .map(|mut c| {
+                        if still_settling {
+                            c.state = ContainerState::Stopped;
+                        }
+                        c
                     })
                     .collect())
             })
@@ -1761,7 +1794,7 @@ mod tests {
     /// The reported issue #4 failure: create and start both succeed, but the
     /// container cannot be found by the workspace labels `dev status`/`dev exec`
     /// query with. `dev up` must fail instead of announcing readiness.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn up_fails_when_started_container_is_not_discoverable() {
         let workspace = TempDir::new().unwrap();
         write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
@@ -1778,7 +1811,7 @@ mod tests {
 
     /// A container that is created and started but never reaches the running
     /// state is not usable by `dev exec`, so `dev up` must not report readiness.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn up_fails_when_started_container_never_runs() {
         let workspace = TempDir::new().unwrap();
         write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
@@ -1791,6 +1824,20 @@ mod tests {
             msg.contains("not running"),
             "error should explain the container is not running, got: {msg}"
         );
+    }
+
+    /// A healthy container whose runtime takes a while to report `Running` must
+    /// be waited for, not failed. Twelve polls is past what a fixed
+    /// hundred-millisecond-per-attempt budget would tolerate, which is the
+    /// spurious failure a VM-backed runtime would hit.
+    #[tokio::test(start_paused = true)]
+    async fn up_waits_for_a_container_that_reports_running_late() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let rt = UpFakeRuntime::running_late(12);
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("a container that settles late must still be accepted");
     }
 
     /// A runtime that shortens ids (as Apple Containers does, to fit its

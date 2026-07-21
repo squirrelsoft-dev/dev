@@ -12,7 +12,7 @@ use apple_container::models::{
 use crate::error::DevError;
 use crate::runtime::{
     AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ContainerState,
-    ExecResult, ImageMetadata, terminal_size,
+    ExecResult, ImageMetadata, WorkspaceMount, terminal_size,
 };
 
 /// Apple Containers runtime using native XPC.
@@ -51,7 +51,8 @@ impl AppleRuntime {
         let (stderr_read, stderr_write) = exec_pipe()?;
 
         let process_id = next_process_id("exec");
-        let proc_config = exec_process_config(cmd, user, false);
+        let working_directory = self.container_working_directory(id).await;
+        let proc_config = exec_process_config(cmd, user, false, &working_directory);
 
         self.client
             .create_process(
@@ -79,20 +80,44 @@ impl AppleRuntime {
         drop(stdout_write);
         drop(stderr_write);
 
-        // Wait alongside the reads rather than after them: a process that fills
-        // a pipe buffer cannot exit until the pipe is drained.
-        let (exit_code, stdout_buf, stderr_buf) = tokio::join!(
-            self.client.wait_process(id, &process_id),
-            read_pipe(stdout_read),
-            read_pipe(stderr_read),
-        );
+        // The readers are already draining on the blocking pool, so a process
+        // that fills a pipe buffer can still reach its exit.
+        let stdout_task = read_pipe(stdout_read);
+        let stderr_task = read_pipe(stderr_read);
+
+        let exit_code = match self.client.wait_process(id, &process_id).await {
+            Ok(code) => code,
+            Err(e) => {
+                // Waiting failed while the process may still be running, and
+                // the readers only finish at EOF. Stop the process so they do,
+                // and report the wait failure instead of blocking on it.
+                let _ = self
+                    .client
+                    .kill_process(id, &process_id, libc::SIGKILL)
+                    .await;
+                return Err(DevError::Runtime(format!("exec wait failed: {e}")));
+            }
+        };
+
+        let (stdout_buf, stderr_buf) = tokio::join!(stdout_task, stderr_task);
 
         Ok(ExecResult {
-            exit_code: exit_code
-                .map_err(|e| DevError::Runtime(format!("exec wait failed: {e}")))?,
+            exit_code,
             stdout: finish_read(stdout_buf, "stdout")?,
             stderr: finish_read(stderr_buf, "stderr")?,
         })
+    }
+
+    /// The working directory the container's own processes use.
+    ///
+    /// Falls back to `/` when the container cannot be inspected: an exec should
+    /// not fail merely because its starting directory could not be resolved.
+    async fn container_working_directory(&self, id: &str) -> String {
+        let snapshot = self.client.get(id).await.ok();
+        let working_dir = snapshot
+            .as_ref()
+            .map(|s| s.configuration.init_process.working_directory.as_str());
+        absolute_or_root([working_dir])
     }
 
     /// Run a command against the caller's terminal and wait for it to exit.
@@ -105,7 +130,8 @@ impl AppleRuntime {
         let _raw_guard = RawModeGuard::enter()?;
 
         let process_id = next_process_id("exec-interactive");
-        let proc_config = exec_process_config(cmd, user, true);
+        let working_directory = self.container_working_directory(id).await;
+        let proc_config = exec_process_config(cmd, user, true, &working_directory);
 
         // Hand the real terminal descriptors to the daemon; it drives the pty.
         self.client
@@ -229,7 +255,7 @@ fn cache_key(reference: &str) -> String {
 }
 
 /// Cached OCI image config fields we care about.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct CachedImageConfig {
     env: Vec<String>,
     user: Option<String>,
@@ -420,17 +446,53 @@ fn parse_numeric_user(spec: &str) -> Option<UserId> {
 }
 
 /// Build the process configuration for an exec'd command.
-fn exec_process_config(cmd: &[String], user: Option<&str>, terminal: bool) -> ProcessConfiguration {
+fn exec_process_config(
+    cmd: &[String],
+    user: Option<&str>,
+    terminal: bool,
+    working_directory: &str,
+) -> ProcessConfiguration {
     ProcessConfiguration {
         executable: cmd.first().cloned().unwrap_or_default(),
         arguments: cmd.get(1..).map(<[String]>::to_vec).unwrap_or_default(),
         environment: Vec::new(),
-        working_directory: "/".to_string(),
+        working_directory: absolute_or_root([Some(working_directory)]),
         terminal,
         user: to_apple_user(user),
         supplemental_groups: vec![],
         rlimits: vec![],
     }
+}
+
+/// First absolute candidate, or `/` when none is usable.
+///
+/// The daemon has no "unset" working directory: it chdirs into whatever string
+/// it is given, so a relative or empty value would fail the process outright.
+fn absolute_or_root<'a>(candidates: impl IntoIterator<Item = Option<&'a str>>) -> String {
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|dir| dir.starts_with('/'))
+        .unwrap_or("/")
+        .to_string()
+}
+
+/// The directory a container's processes run in.
+///
+/// Docker and Podman leave the exec working directory unset so it inherits the
+/// container's, which comes from the image's `WorkingDir`. Apple's daemon has
+/// no such inheritance, so the same directory is resolved here and applied to
+/// both the init process and every exec: the workspace folder if the container
+/// has one — that is where lifecycle hooks like `postCreateCommand: npm
+/// install` expect to run — otherwise the image's `WorkingDir`.
+fn container_working_directory(
+    workspace_mount: Option<&WorkspaceMount>,
+    image_working_dir: Option<&str>,
+) -> String {
+    absolute_or_root([
+        workspace_mount.map(|ws| ws.target.as_str()),
+        image_working_dir,
+    ])
 }
 
 /// Create a pipe, mapping the OS error into a runtime error.
@@ -529,7 +591,7 @@ fn truncate_container_id(name: &str) -> String {
 fn to_apple_config(
     config: &ContainerConfig,
     image: ImageDescription,
-    image_env: &[String],
+    image_config: &CachedImageConfig,
 ) -> ContainerConfiguration {
     let mounts: Vec<Filesystem> = config
         .mounts
@@ -562,7 +624,7 @@ fn to_apple_config(
         })
         .collect();
 
-    let init_env = merge_env(image_env, &config.env);
+    let init_env = merge_env(&image_config.env, &config.env);
 
     let init_process = ProcessConfiguration {
         executable: config
@@ -575,7 +637,10 @@ fn to_apple_config(
             Vec::new()
         },
         environment: init_env,
-        working_directory: "/".to_string(),
+        working_directory: container_working_directory(
+            config.workspace_mount.as_ref(),
+            image_config.working_dir.as_deref(),
+        ),
         terminal: false,
         user: User::Raw {
             raw: UserString {
@@ -677,28 +742,29 @@ impl ContainerRuntime for AppleRuntime {
             let image: ImageDescription = serde_json::from_slice(&image_desc_bytes)
                 .map_err(|e| DevError::Runtime(format!("parse image descriptor: {e}")))?;
 
-            // Fetch OCI image config env vars (cached or from registry) so the
-            // init process inherits the image's expected environment.
+            // Fetch the OCI image config (cached or from registry) so the init
+            // process inherits the image's expected environment and working
+            // directory.
             let cached = read_cached_config(&config.image);
-            let image_env = if let Some(c) = cached {
-                c.env
+            let image_config = if let Some(c) = cached {
+                c
             } else if config.image.starts_with("localhost/") {
                 // Local images have no registry to query; daemon handles env vars.
-                Vec::new()
+                CachedImageConfig::default()
             } else {
                 match fetch_and_cache_oci_config(&config.image).await {
-                    Ok(c) => c.env,
+                    Ok(c) => c,
                     Err(e) => {
                         eprintln!(
                             "Warning: could not fetch image config for {}: {e}",
                             config.image
                         );
-                        Vec::new()
+                        CachedImageConfig::default()
                     }
                 }
             };
 
-            let apple_config = to_apple_config(&config, image, &image_env);
+            let apple_config = to_apple_config(&config, image, &image_config);
             let id = apple_config.id.clone();
 
             // Report truncation here rather than in the caller: only this runtime
@@ -965,15 +1031,71 @@ mod tests {
             &["sh".to_string(), "-c".to_string(), "echo hi".to_string()],
             None,
             false,
+            "/workspaces/demo",
         );
         assert_eq!(config.executable, "sh");
         assert_eq!(config.arguments, vec!["-c", "echo hi"]);
         assert!(!config.terminal);
+        assert_eq!(config.working_directory, "/workspaces/demo");
 
-        let empty = exec_process_config(&[], None, true);
+        let empty = exec_process_config(&[], None, true, "/");
         assert_eq!(empty.executable, "");
         assert!(empty.arguments.is_empty());
         assert!(empty.terminal);
+    }
+
+    /// An exec must start in the container's own working directory, the way
+    /// `docker exec` inherits the container's `WorkingDir`. Running everything
+    /// from `/` breaks relative-path lifecycle hooks such as
+    /// `postCreateCommand: npm install`.
+    #[test]
+    fn exec_working_directory_is_not_forced_to_root() {
+        let config = exec_process_config(
+            &["npm".to_string(), "install".to_string()],
+            None,
+            false,
+            "/workspaces/project",
+        );
+        assert_eq!(
+            config.working_directory, "/workspaces/project",
+            "exec must run in the container's working directory"
+        );
+    }
+
+    /// The daemon chdirs into whatever string it is handed, so an unusable
+    /// value has to become `/` rather than fail the process.
+    #[test]
+    fn unusable_working_directories_fall_back_to_root() {
+        for spec in ["", "relative/path"] {
+            let config = exec_process_config(&["sh".to_string()], None, false, spec);
+            assert_eq!(
+                config.working_directory, "/",
+                "{spec:?} must fall back to /"
+            );
+        }
+    }
+
+    /// The workspace folder is where a devcontainer's commands belong, so it
+    /// wins over the image's `WorkingDir`; the image value is the fallback for
+    /// containers without a workspace mount.
+    #[test]
+    fn container_working_directory_prefers_the_workspace_folder() {
+        let workspace = WorkspaceMount {
+            source: std::path::PathBuf::from("/host/project"),
+            target: "/workspaces/project".to_string(),
+        };
+
+        assert_eq!(
+            container_working_directory(Some(&workspace), Some("/usr/src/app")),
+            "/workspaces/project"
+        );
+        assert_eq!(
+            container_working_directory(None, Some("/usr/src/app")),
+            "/usr/src/app"
+        );
+        assert_eq!(container_working_directory(None, None), "/");
+        assert_eq!(container_working_directory(None, Some("")), "/");
+        assert_eq!(container_working_directory(None, Some("app")), "/");
     }
 
     /// A name at or under the limit must pass through untouched.
@@ -1064,7 +1186,11 @@ mod tests {
         };
 
         let image = ImageDescription::default();
-        let apple_config = to_apple_config(&container_config, image, &[]);
+        let image_config = CachedImageConfig {
+            working_dir: Some("/usr/src/app".to_string()),
+            ..CachedImageConfig::default()
+        };
+        let apple_config = to_apple_config(&container_config, image, &image_config);
 
         // (a) ID fits Apple's daemon limit.
         assert_eq!(
@@ -1091,6 +1217,13 @@ mod tests {
                 "discovery label {key} must match the label set at create time"
             );
         }
+
+        // (c) The container runs in the workspace folder, which is what execs
+        // inherit — lifecycle hooks would otherwise run in `/`.
+        assert_eq!(
+            apple_config.init_process.working_directory, "/workspaces/test-apple-repro",
+            "container working directory must be the workspace folder"
+        );
     }
 
     /// Direct integration test: create + start a container using AppleRuntime,
@@ -1379,7 +1512,7 @@ mod tests {
                 executable: "sleep".to_string(),
                 arguments: vec!["3600".to_string()],
                 environment: vec![],
-                working_directory: "/".to_string(),
+                working_directory: "/tmp".to_string(),
                 terminal: false,
                 user: User::Raw {
                     raw: UserString {
@@ -1466,6 +1599,15 @@ mod tests {
         .await;
         assert_eq!(failed.exit_code, 7, "exit code must be propagated");
         assert_eq!(failed.stderr.trim(), "oops");
+
+        // An exec starts in the container's working directory, not `/`, so
+        // relative-path lifecycle hooks resolve the way they do on docker.
+        let cwd = bounded(&runtime, container_id, &["pwd"]).await;
+        assert_eq!(
+            cwd.stdout.trim(),
+            "/tmp",
+            "exec must inherit the container's working directory"
+        );
 
         // Nothing writes to the exec'd process's stdin, so it must see EOF.
         // `cat` would otherwise block until the container is killed.

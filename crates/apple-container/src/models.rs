@@ -1,13 +1,30 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
+
+/// Container ids already reported as undecodable, so the warning stays a
+/// warning instead of becoming noise.
+static REPORTED_UNDECODABLE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+/// Whether this container's decode failure has not been reported yet.
+///
+/// `list` runs many times per command — the `dev up` readiness gate alone polls
+/// repeatedly — so an unreadable container would otherwise print the same line
+/// a dozen times per invocation.
+fn first_report_for(id: &str) -> bool {
+    let reported = REPORTED_UNDECODABLE.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut reported = reported.lock().unwrap_or_else(|e| e.into_inner());
+    reported.insert(id.to_string())
+}
 
 /// Decode a `containerList` payload one entry at a time.
 ///
 /// The daemon returns every container it knows about in a single array, so an
 /// all-or-nothing decode lets one container the models cannot represent hide
 /// all the others — which is how `dev status`/`dev exec`/`dev up` discovery
-/// broke in issue #4. Entries that fail to decode are reported on stderr and
-/// skipped so the remaining containers stay discoverable.
+/// broke in issue #4. Entries that fail to decode are reported on stderr (once
+/// per container per process) and skipped so the remaining containers stay
+/// discoverable.
 pub fn decode_snapshots(data: &[u8]) -> Result<Vec<ContainerSnapshot>, serde_json::Error> {
     let entries: Vec<serde_json::Value> = serde_json::from_slice(data)?;
     let mut snapshots = Vec::with_capacity(entries.len());
@@ -20,10 +37,14 @@ pub fn decode_snapshots(data: &[u8]) -> Result<Vec<ContainerSnapshot>, serde_jso
             .to_string();
         match serde_json::from_value::<ContainerSnapshot>(entry) {
             Ok(snapshot) => snapshots.push(snapshot),
-            Err(e) => eprintln!(
-                "Warning: ignoring container '{id}': the daemon returned a record this \
-                 version cannot read ({e})"
-            ),
+            Err(e) => {
+                if first_report_for(&id) {
+                    eprintln!(
+                        "Warning: ignoring container '{id}': the daemon returned a record this \
+                         version cannot read ({e})"
+                    );
+                }
+            }
         }
     }
     Ok(snapshots)
@@ -517,6 +538,23 @@ mod tests {
             vec!["good-one", "good-two"],
             "readable containers must stay discoverable when a sibling entry cannot be decoded"
         );
+    }
+
+    /// The undecodable-container warning is reported once per container, not
+    /// once per `list` call — `dev up` alone polls the list a dozen times, and
+    /// a repeated line buries the signal it is meant to carry.
+    #[test]
+    fn undecodable_container_is_reported_once() {
+        let payload = br#"[{"configuration": {"id": "noisy-container"}}]"#;
+
+        for round in 0..5 {
+            let snapshots = decode_snapshots(payload).expect("list payload must decode");
+            assert!(snapshots.is_empty());
+            assert!(
+                !first_report_for("noisy-container"),
+                "round {round} must not re-report an already reported container"
+            );
+        }
     }
 
     /// A payload that is not a JSON array at all is still a hard error — the
