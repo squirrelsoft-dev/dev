@@ -39,16 +39,27 @@ pub fn require_tar_walk_mode(
 /// The subset of the build context a `Walk` request asks for.
 ///
 /// BuildKit narrows each transfer to the paths it needs: `followpaths` lists
-/// exact files (`.dockerignore`, `COPY` sources) and `include-patterns` lists
-/// globs. Both arrive comma-separated under the shim's hyphenated metadata
-/// keys. An empty filter means the whole context.
+/// exact files (`.dockerignore`, `COPY` sources), `include-patterns` lists
+/// globs, and `exclude-patterns` carries the `.dockerignore` rules BuildKit
+/// already parsed. All arrive comma-separated under the shim's hyphenated
+/// metadata keys. An empty filter means the whole context.
 ///
-/// Matching deliberately errs towards including a path: BuildKit filters again
+/// Inclusion deliberately errs towards sending a path: BuildKit filters again
 /// on its side, so an extra file only costs transfer time, whereas a missing
-/// one breaks the build.
-#[derive(Debug, Default)]
+/// one breaks the build. Exclusion errs the same way — a path is only dropped
+/// when a rule clearly names it — but honouring the rules at all is what keeps
+/// `.git`, `target` and `node_modules` out of every transfer.
+#[derive(Debug, Default, Clone)]
 pub struct ContextFilter {
     patterns: Vec<String>,
+    excludes: Vec<ExcludeRule>,
+}
+
+/// One `.dockerignore` rule, with the `!` re-include form kept apart.
+#[derive(Debug, Clone)]
+struct ExcludeRule {
+    pattern: String,
+    negated: bool,
 }
 
 impl ContextFilter {
@@ -60,24 +71,75 @@ impl ContextFilter {
             .flat_map(|raw| raw.split(','))
             .filter_map(normalize_pattern)
             .collect();
-        Self { patterns }
+        let excludes = metadata
+            .get("exclude-patterns")
+            .into_iter()
+            .flat_map(|raw| raw.split(','))
+            .filter_map(normalize_exclude)
+            .collect();
+        Self { patterns, excludes }
     }
 
     /// Whether the request asked for the entire context.
     pub fn is_unfiltered(&self) -> bool {
-        self.patterns.is_empty()
+        self.patterns.is_empty() && self.excludes.is_empty()
     }
 
     /// Whether a context-relative file path was asked for.
     pub fn matches_file(&self, rel: &str) -> bool {
-        self.is_unfiltered() || self.patterns.iter().any(|p| matches_path(p, rel))
+        self.is_included(rel) && !self.is_excluded(rel)
     }
 
     /// Whether a context-relative directory could contain a requested path,
     /// and therefore has to be descended into.
     pub fn matches_dir(&self, rel: &str) -> bool {
-        self.is_unfiltered() || self.patterns.iter().any(|p| could_match_within(p, rel))
+        let reachable =
+            self.patterns.is_empty() || self.patterns.iter().any(|p| could_match_within(p, rel));
+        reachable && !self.is_pruned(rel)
     }
+
+    fn is_included(&self, rel: &str) -> bool {
+        self.patterns.is_empty() || self.patterns.iter().any(|p| matches_path(p, rel))
+    }
+
+    /// Whether the `.dockerignore` rules drop this path.
+    ///
+    /// Docker resolves conflicting rules by last match, so a trailing
+    /// `!keep/this` re-includes what an earlier rule excluded.
+    fn is_excluded(&self, rel: &str) -> bool {
+        let mut excluded = false;
+        for rule in &self.excludes {
+            if matches_path(&rule.pattern, rel) {
+                excluded = !rule.negated;
+            }
+        }
+        excluded
+    }
+
+    /// Whether an excluded directory can be skipped outright.
+    ///
+    /// Only when no re-include rule could still match something inside it —
+    /// `target` with a trailing `!target/keep.txt` still has to be descended.
+    fn is_pruned(&self, rel: &str) -> bool {
+        self.is_excluded(rel)
+            && !self
+                .excludes
+                .iter()
+                .any(|rule| rule.negated && could_match_within(&rule.pattern, rel))
+    }
+}
+
+/// Canonicalise one `.dockerignore` rule, keeping its `!` re-include sense.
+fn normalize_exclude(raw: &str) -> Option<ExcludeRule> {
+    let trimmed = raw.trim();
+    let (negated, pattern) = match trimmed.strip_prefix('!') {
+        Some(rest) => (true, rest),
+        None => (false, trimmed),
+    };
+    Some(ExcludeRule {
+        pattern: normalize_pattern(pattern)?,
+        negated,
+    })
 }
 
 /// Canonicalise one pattern, dropping the ones that select nothing.
@@ -224,22 +286,129 @@ fn collect_dir(
 
 /// Build the context tar and return it with the checksum that names it.
 ///
-/// The checksum is a digest of the archive itself, so identical contexts hit
-/// the shim's unpack cache and any change misses it.
+/// Holds the whole archive in memory, so it is only for contexts already known
+/// to be small; [`stream_context_tar`] is what a real transfer uses.
 pub fn build_context_tar(
     root: &Path,
     filter: &ContextFilter,
 ) -> Result<(String, Vec<u8>), AppleContainerError> {
     let entries = collect_context(root, filter)?;
-    let archive = write_tar(&entries)?;
+    let mut archive = Vec::new();
+    write_tar(&entries, &mut archive)?;
     let checksum = sha256_hex(&archive);
     Ok((checksum, archive))
 }
 
-fn write_tar(entries: &[ContextEntry]) -> Result<Vec<u8>, AppleContainerError> {
+/// The checksum that names this context's unpack directory in the shim.
+///
+/// A digest of the archive itself, so identical contexts hit the shim's unpack
+/// cache and any change misses it. The archive is hashed as it is produced
+/// rather than assembled first, so a multi-gigabyte context costs a digest
+/// rather than a multi-gigabyte allocation.
+pub fn context_tar_checksum(entries: &[ContextEntry]) -> Result<String, AppleContainerError> {
+    let mut digest = Sha256Sink::default();
+    write_tar(entries, &mut digest)?;
+    Ok(digest.finish())
+}
+
+/// Write the context tar out in [`CONTEXT_CHUNK_SIZE`] pieces.
+///
+/// `emit` is handed one chunk at a time and is expected to hand it straight to
+/// the transfer, so peak memory is one chunk plus whatever the caller queues —
+/// not the whole context. Blocking file reads happen on the calling thread, so
+/// callers on an async runtime belong on the blocking pool.
+pub fn stream_context_tar(
+    entries: &[ContextEntry],
+    emit: &mut dyn FnMut(Vec<u8>) -> Result<(), AppleContainerError>,
+) -> Result<(), AppleContainerError> {
+    let mut chunks = ChunkWriter::new(emit);
+    write_tar(entries, &mut chunks)?;
+    chunks.flush_remainder()
+}
+
+/// A `Write` sink that hashes without keeping anything.
+#[derive(Default)]
+struct Sha256Sink {
+    hasher: sha2::Sha256,
+}
+
+impl Sha256Sink {
+    fn finish(self) -> String {
+        use sha2::Digest;
+        hex::encode(self.hasher.finalize())
+    }
+}
+
+impl std::io::Write for Sha256Sink {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        use sha2::Digest;
+        self.hasher.update(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A `Write` sink that hands off fixed-size chunks as they fill.
+struct ChunkWriter<'a> {
+    emit: &'a mut dyn FnMut(Vec<u8>) -> Result<(), AppleContainerError>,
+    buffer: Vec<u8>,
+    failure: Option<AppleContainerError>,
+}
+
+impl<'a> ChunkWriter<'a> {
+    fn new(emit: &'a mut dyn FnMut(Vec<u8>) -> Result<(), AppleContainerError>) -> Self {
+        Self {
+            emit,
+            buffer: Vec::with_capacity(CONTEXT_CHUNK_SIZE),
+            failure: None,
+        }
+    }
+
+    /// Hand off whatever the last chunk boundary left behind.
+    fn flush_remainder(mut self) -> Result<(), AppleContainerError> {
+        if let Some(e) = self.failure.take() {
+            return Err(e);
+        }
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let last = std::mem::take(&mut self.buffer);
+        (self.emit)(last)
+    }
+}
+
+impl std::io::Write for ChunkWriter<'_> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buffer.extend_from_slice(data);
+        while self.buffer.len() >= CONTEXT_CHUNK_SIZE {
+            let remainder = self.buffer.split_off(CONTEXT_CHUNK_SIZE);
+            let chunk = std::mem::replace(&mut self.buffer, remainder);
+            if let Err(e) = (self.emit)(chunk) {
+                // `tar::Builder` only surfaces an `io::Error`, so the real
+                // cause is kept for `flush_remainder` to return.
+                let reported = std::io::Error::other(e.to_string());
+                self.failure = Some(e);
+                return Err(reported);
+            }
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn write_tar<W: std::io::Write>(
+    entries: &[ContextEntry],
+    out: W,
+) -> Result<(), AppleContainerError> {
     use std::os::unix::fs::MetadataExt;
 
-    let mut builder = tar::Builder::new(Vec::new());
+    let mut builder = tar::Builder::new(out);
     for entry in entries {
         let mut header = tar::Header::new_gnu();
         header.set_mode(entry.metadata.mode() & 0o7777);
@@ -270,7 +439,8 @@ fn write_tar(entries: &[ContextEntry]) -> Result<Vec<u8>, AppleContainerError> {
         }
     }
 
-    builder.into_inner().map_err(AppleContainerError::Io)
+    builder.into_inner().map_err(AppleContainerError::Io)?;
+    Ok(())
 }
 
 /// Seconds since the Unix epoch, or zero for timestamps we cannot read.
@@ -393,11 +563,13 @@ mod tests {
     #[test]
     fn an_absent_or_empty_filter_selects_everything() {
         assert!(ContextFilter::from_metadata(&metadata(&[])).is_unfiltered());
-        assert!(ContextFilter::from_metadata(&metadata(&[
-            ("followpaths", ""),
-            ("include-patterns", "")
-        ]))
-        .is_unfiltered());
+        assert!(
+            ContextFilter::from_metadata(&metadata(&[
+                ("followpaths", ""),
+                ("include-patterns", "")
+            ]))
+            .is_unfiltered()
+        );
         assert!(ContextFilter::default().matches_file("anything/at/all"));
     }
 
@@ -429,6 +601,156 @@ mod tests {
         let single = ContextFilter::from_metadata(&metadata(&[("include-patterns", "a?c.txt")]));
         assert!(single.matches_file("abc.txt"));
         assert!(!single.matches_file("ac.txt"));
+    }
+
+    /// `.dockerignore` reaches the client as `exclude-patterns`. Ignoring the
+    /// key tarred `.git`, `target` and `node_modules` into every build.
+    #[test]
+    fn exclude_patterns_drop_the_paths_dockerignore_names() {
+        let filter =
+            ContextFilter::from_metadata(&metadata(&[("exclude-patterns", ".git,target,*.log")]));
+
+        assert!(!filter.is_unfiltered(), "excludes alone are still a filter");
+        assert!(filter.matches_file("src/main.rs"));
+        assert!(!filter.matches_file("target/debug/dev"));
+        assert!(!filter.matches_file("app.log"));
+        assert!(
+            !filter.matches_dir("target"),
+            "an excluded directory must not be descended into"
+        );
+        assert!(!filter.matches_dir(".git"));
+        assert!(filter.matches_dir("src"));
+    }
+
+    /// Docker resolves conflicting rules by last match, so a trailing `!` rule
+    /// re-includes — and the directory holding it still has to be walked.
+    #[test]
+    fn a_negated_exclude_re_includes_what_an_earlier_rule_dropped() {
+        let filter = ContextFilter::from_metadata(&metadata(&[(
+            "exclude-patterns",
+            "target,!target/keep.txt",
+        )]));
+
+        assert!(!filter.matches_file("target/debug/dev"));
+        assert!(filter.matches_file("target/keep.txt"));
+        assert!(
+            filter.matches_dir("target"),
+            "a directory holding a re-included path must still be descended"
+        );
+    }
+
+    /// Includes and excludes compose: an excluded path stays out even when an
+    /// include pattern names it.
+    #[test]
+    fn an_exclude_overrides_an_include_pattern() {
+        let filter = ContextFilter::from_metadata(&metadata(&[
+            ("include-patterns", "src"),
+            ("exclude-patterns", "src/generated"),
+        ]));
+
+        assert!(filter.matches_file("src/main.rs"));
+        assert!(!filter.matches_file("src/generated/api.rs"));
+        assert!(!filter.matches_file("docs/readme.md"));
+    }
+
+    #[test]
+    fn excluded_paths_never_reach_the_archive() {
+        let dir = tempfile::tempdir().expect("temp context");
+        write(dir.path(), "app.txt", "payload");
+        write(dir.path(), "target/debug/huge.bin", "lots");
+        write(dir.path(), ".git/config", "[core]");
+
+        let filter =
+            ContextFilter::from_metadata(&metadata(&[("exclude-patterns", "target,.git")]));
+        let (_, archive) = build_context_tar(dir.path(), &filter).expect("context tar");
+
+        assert_eq!(tar_names(&archive), vec!["app.txt".to_string()]);
+    }
+
+    /// The transfer must not materialise the whole context first: the archive
+    /// is handed over in bounded chunks, and those chunks must reassemble into
+    /// exactly the archive the checksum names.
+    #[test]
+    fn the_archive_streams_in_bounded_chunks_that_match_the_checksum() {
+        let dir = tempfile::tempdir().expect("temp context");
+        // Larger than one chunk, so the streaming path is actually exercised.
+        write(
+            dir.path(),
+            "big.bin",
+            &"0123456789abcdef".repeat(CONTEXT_CHUNK_SIZE / 8),
+        );
+        write(dir.path(), "app.txt", "payload");
+
+        let entries = collect_context(dir.path(), &ContextFilter::default()).expect("walk");
+        let checksum = context_tar_checksum(&entries).expect("checksum");
+
+        let mut chunks: Vec<Vec<u8>> = Vec::new();
+        stream_context_tar(&entries, &mut |chunk| {
+            chunks.push(chunk);
+            Ok(())
+        })
+        .expect("stream");
+
+        assert!(
+            chunks.len() > 1,
+            "a large context must not arrive as one packet"
+        );
+        assert!(
+            chunks.iter().all(|c| c.len() <= CONTEXT_CHUNK_SIZE),
+            "no chunk may exceed the transfer limit"
+        );
+
+        let streamed: Vec<u8> = chunks.concat();
+        let (buffered_checksum, buffered) =
+            build_context_tar(dir.path(), &ContextFilter::default()).expect("context tar");
+        assert_eq!(checksum, buffered_checksum);
+        assert_eq!(
+            streamed, buffered,
+            "the stream must be the archive we hashed"
+        );
+        assert_eq!(sha256_hex(&streamed), checksum);
+    }
+
+    /// An empty context produces only the end-of-archive marker, which still
+    /// has to be handed over — the shim blocks until a data packet arrives.
+    #[test]
+    fn streaming_an_empty_context_still_emits_the_archive_marker() {
+        let dir = tempfile::tempdir().expect("temp context");
+        let entries = collect_context(dir.path(), &ContextFilter::default()).expect("walk");
+
+        let mut chunks: Vec<Vec<u8>> = Vec::new();
+        stream_context_tar(&entries, &mut |chunk| {
+            chunks.push(chunk);
+            Ok(())
+        })
+        .expect("stream");
+
+        assert_eq!(chunks.len(), 1);
+        assert!(!chunks[0].is_empty());
+    }
+
+    /// A transfer that has gone away must surface as an error rather than as a
+    /// silently truncated archive the shim would unpack as the real context.
+    #[test]
+    fn a_failing_sink_stops_the_stream_with_its_own_error() {
+        let dir = tempfile::tempdir().expect("temp context");
+        write(
+            dir.path(),
+            "big.bin",
+            &"0123456789abcdef".repeat(CONTEXT_CHUNK_SIZE / 8),
+        );
+        let entries = collect_context(dir.path(), &ContextFilter::default()).expect("walk");
+
+        let outcome = stream_context_tar(&entries, &mut |_| {
+            Err(AppleContainerError::XpcError(
+                "receiver is gone".to_string(),
+            ))
+        });
+
+        let message = outcome
+            .expect_err("a failing sink must fail the walk")
+            .to_string();
+        assert!(message.contains("receiver is gone"), "{message}");
     }
 
     #[test]

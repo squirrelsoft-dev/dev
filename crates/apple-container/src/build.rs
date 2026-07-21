@@ -554,7 +554,10 @@ async fn send_fssync_error(
 ///
 /// The shim blocks in `readTarHash` until a packet carrying `hash` arrives and
 /// only then starts draining the archive bytes, so the checksum goes first and
-/// the tar follows in chunks (`pkg/fileutils/tarxfer.go`).
+/// the tar follows in chunks (`pkg/fileutils/tarxfer.go`). The archive is
+/// produced twice — once to hash, once to send — rather than held in memory,
+/// so a repository-sized context costs file reads instead of a multi-gigabyte
+/// allocation.
 async fn handle_walk(
     transfer: &BuildTransfer,
     client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
@@ -562,16 +565,14 @@ async fn handle_walk(
     context: &Path,
 ) -> Result<(), AppleContainerError> {
     let filter = fssync::ContextFilter::from_metadata(&transfer.metadata);
-    let built = fssync::require_tar_walk_mode(&transfer.metadata)
-        .and_then(|()| fssync::build_context_tar(context, &filter));
-
-    let (checksum, archive) = match built {
-        Ok(built) => built,
+    let prepared = match prepare_walk(context, &filter, &transfer.metadata).await {
+        Ok(prepared) => prepared,
         Err(e) => {
             send_fssync_error(client_tx, build_id, transfer, "Walk", &e.to_string()).await?;
             return Err(e);
         }
     };
+    let (entries, checksum) = prepared;
 
     let mut hash_metadata = fssync_metadata("Walk");
     hash_metadata.insert("hash".to_string(), checksum);
@@ -586,34 +587,111 @@ async fn handle_walk(
     )
     .await?;
 
-    // `readTarHeader` blocks until at least one data packet arrives, so an
-    // empty context still has to send its end-of-archive marker.
-    let chunks: Vec<&[u8]> = if archive.is_empty() {
-        vec![&[]]
-    } else {
-        archive.chunks(fssync::CONTEXT_CHUNK_SIZE).collect()
-    };
-    let last = chunks.len() - 1;
-    for (index, chunk) in chunks.into_iter().enumerate() {
-        send_build_transfer(
-            client_tx,
-            build_id,
-            transfer,
-            fssync_metadata("Walk"),
-            chunk.to_vec(),
-            index == last,
-            false,
-        )
-        .await?;
+    stream_walk_archive(entries, client_tx, build_id, transfer).await
+}
+
+/// Collect the context and hash the archive it will produce.
+///
+/// Both walk the tree and read every selected file, so they run on the
+/// blocking pool rather than on a runtime worker.
+async fn prepare_walk(
+    context: &Path,
+    filter: &fssync::ContextFilter,
+    metadata: &HashMap<String, String>,
+) -> Result<(Vec<fssync::ContextEntry>, String), AppleContainerError> {
+    fssync::require_tar_walk_mode(metadata)?;
+    let context = context.to_path_buf();
+    let filter = filter.clone();
+    blocking(move || {
+        let entries = fssync::collect_context(&context, &filter)?;
+        let checksum = fssync::context_tar_checksum(&entries)?;
+        Ok((entries, checksum))
+    })
+    .await
+}
+
+/// Send the archive as `BuildTransfer` packets, one chunk at a time.
+///
+/// The last packet is the one that carries `complete`, so each chunk is held
+/// back until the next arrives — and a failure part-way through is reported as
+/// an fssync error rather than as a truncated archive the shim would accept.
+async fn stream_walk_archive(
+    entries: Vec<fssync::ContextEntry>,
+    client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
+    build_id: &str,
+    transfer: &BuildTransfer,
+) -> Result<(), AppleContainerError> {
+    let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
+    let writer = tokio::task::spawn_blocking(move || {
+        let mut emit = |chunk: Vec<u8>| {
+            chunk_tx.blocking_send(chunk).map_err(|_| {
+                AppleContainerError::XpcError("build context transfer was abandoned".to_string())
+            })
+        };
+        fssync::stream_context_tar(&entries, &mut emit)
+    });
+
+    let mut pending: Option<Vec<u8>> = None;
+    while let Some(chunk) = chunk_rx.recv().await {
+        if let Some(previous) = pending.replace(chunk) {
+            send_build_transfer(
+                client_tx,
+                build_id,
+                transfer,
+                fssync_metadata("Walk"),
+                previous,
+                false,
+                false,
+            )
+            .await?;
+        }
     }
 
-    Ok(())
+    // The sender is dropped when the writer finishes, so the loop above has
+    // already ended by the time this resolves.
+    if let Err(e) = join_blocking(writer).await {
+        send_fssync_error(client_tx, build_id, transfer, "Walk", &e.to_string()).await?;
+        return Err(e);
+    }
+
+    // `readTarHeader` blocks until at least one data packet arrives, so an
+    // empty context still has to send its end-of-archive marker.
+    send_build_transfer(
+        client_tx,
+        build_id,
+        transfer,
+        fssync_metadata("Walk"),
+        pending.unwrap_or_default(),
+        true,
+        false,
+    )
+    .await
+}
+
+/// Run blocking filesystem work off the runtime's worker threads.
+async fn blocking<T, F>(work: F) -> Result<T, AppleContainerError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, AppleContainerError> + Send + 'static,
+{
+    join_blocking(tokio::task::spawn_blocking(work)).await
+}
+
+/// Unwrap the two error layers a blocking task can fail with.
+async fn join_blocking<T>(
+    handle: tokio::task::JoinHandle<Result<T, AppleContainerError>>,
+) -> Result<T, AppleContainerError> {
+    handle.await.map_err(|e| {
+        AppleContainerError::XpcError(format!("build context task did not finish: {e}"))
+    })?
 }
 
 /// Answer an fssync `Read` with a slice of a context file.
 ///
 /// The shim sends the caller's buffer size as `length` (`pkg/fssync/file.go`)
-/// and reads an empty reply as EOF.
+/// and reads an empty reply as EOF. An absent `length` therefore falls back to
+/// the rest of the file, not to zero: a shim that renames or drops the key
+/// would otherwise silently build an image whose files are all empty.
 async fn handle_read(
     transfer: &BuildTransfer,
     client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
@@ -623,7 +701,8 @@ async fn handle_read(
     let source = transfer.source.as_deref().unwrap_or("");
     let path = resolve_path(context, source);
     let offset = numeric_metadata(&transfer.metadata, "offset").unwrap_or(0);
-    let length = numeric_metadata(&transfer.metadata, "length").unwrap_or(0) as usize;
+    let length = numeric_metadata(&transfer.metadata, "length")
+        .map_or(usize::MAX, |requested| requested as usize);
 
     let data = match content::read_range(&path, offset, length) {
         Ok(data) => data,
@@ -1494,7 +1573,10 @@ mod tests {
     fn walk_replies_with_a_checksum_packet_and_then_the_archive() {
         let dir = context_with(&[("app.txt", "payload")]);
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-        let request = build_transfer(&[("stage", "fssync"), ("method", "Walk"), ("mode", "tar")], ".");
+        let request = build_transfer(
+            &[("stage", "fssync"), ("method", "Walk"), ("mode", "tar")],
+            ".",
+        );
 
         run(handle_walk(&request, &tx, REPLY_ID, dir.path())).expect("a tar walk must succeed");
         let replies = drain(&mut rx);
@@ -1506,20 +1588,30 @@ mod tests {
             "the first packet must carry the checksum: {:?}",
             hash_packet.metadata
         );
-        assert!(hash_packet.data.is_empty(), "the hash packet carries no data");
+        assert!(
+            hash_packet.data.is_empty(),
+            "the hash packet carries no data"
+        );
         assert!(!hash_packet.complete);
 
         assert!(
-            replies.iter().all(|(_, p)| p.metadata.get("mode").is_none()),
+            replies
+                .iter()
+                .all(|(_, p)| p.metadata.get("mode").is_none()),
             "no reply may advertise a transfer mode the shim does not implement"
         );
         assert!(
-            replies[1..].iter().all(|(_, p)| !p.metadata.contains_key("hash")),
+            replies[1..]
+                .iter()
+                .all(|(_, p)| !p.metadata.contains_key("hash")),
             "only the first packet may carry a hash, or the rest are read as more hashes"
         );
 
         let (_, last) = replies.last().expect("at least one packet");
-        assert!(last.complete, "the final archive packet must set `complete`");
+        assert!(
+            last.complete,
+            "the final archive packet must set `complete`"
+        );
         assert_eq!(
             replies[..replies.len() - 1]
                 .iter()
@@ -1537,7 +1629,13 @@ mod tests {
         let names: Vec<String> = tar::Archive::new(archive.as_slice())
             .entries()
             .expect("entries")
-            .map(|e| e.expect("entry").path().expect("path").to_string_lossy().to_string())
+            .map(|e| {
+                e.expect("entry")
+                    .path()
+                    .expect("path")
+                    .to_string_lossy()
+                    .to_string()
+            })
             .collect();
         assert_eq!(names, vec!["app.txt".to_string()]);
     }
@@ -1566,7 +1664,10 @@ mod tests {
         let request = build_transfer(&[("method", "Walk"), ("mode", "json")], ".");
 
         let outcome = run(handle_walk(&request, &tx, REPLY_ID, dir.path()));
-        assert!(outcome.is_err(), "an unsupported mode must not report success");
+        assert!(
+            outcome.is_err(),
+            "an unsupported mode must not report success"
+        );
 
         let replies = drain(&mut rx);
         assert_eq!(replies.len(), 1, "exactly one error packet");
@@ -1590,8 +1691,92 @@ mod tests {
         run(handle_walk(&request, &tx, REPLY_ID, dir.path())).expect("walk");
         let replies = drain(&mut rx);
 
-        assert!(replies.len() >= 2, "a hash packet and at least one data packet");
+        assert!(
+            replies.len() >= 2,
+            "a hash packet and at least one data packet"
+        );
         assert!(replies.last().expect("last").1.complete);
+    }
+
+    /// `.dockerignore` reaches the client as `exclude-patterns`; a walk that
+    /// ignores it ships `.git` and `target` on every build.
+    #[test]
+    fn walk_honours_the_exclude_patterns_dockerignore_produced() {
+        let dir = context_with(&[
+            ("app.txt", "payload"),
+            ("target/debug/huge.bin", "lots"),
+            (".git/config", "[core]"),
+        ]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let request = build_transfer(
+            &[
+                ("method", "Walk"),
+                ("mode", "tar"),
+                ("exclude-patterns", "target,.git"),
+            ],
+            ".",
+        );
+
+        run(handle_walk(&request, &tx, REPLY_ID, dir.path())).expect("walk");
+        let replies = drain(&mut rx);
+
+        let archive: Vec<u8> = replies[1..]
+            .iter()
+            .flat_map(|(_, p)| p.data.clone())
+            .collect();
+        let names: Vec<String> = tar::Archive::new(archive.as_slice())
+            .entries()
+            .expect("entries")
+            .map(|e| {
+                e.expect("entry")
+                    .path()
+                    .expect("path")
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(names, vec!["app.txt".to_string()]);
+    }
+
+    /// A context larger than one packet must arrive as several bounded
+    /// packets, with `complete` only on the last one.
+    #[test]
+    fn walk_sends_a_large_context_as_bounded_chunks() {
+        let payload = "0123456789abcdef".repeat(fssync::CONTEXT_CHUNK_SIZE / 8);
+        let dir = context_with(&[("big.bin", payload.as_str())]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let request = build_transfer(&[("method", "Walk"), ("mode", "tar")], ".");
+
+        run(handle_walk(&request, &tx, REPLY_ID, dir.path())).expect("walk");
+        let replies = drain(&mut rx);
+
+        let data = &replies[1..];
+        assert!(data.len() > 1, "a large context must span several packets");
+        assert!(
+            data.iter()
+                .all(|(_, p)| p.data.len() <= fssync::CONTEXT_CHUNK_SIZE),
+            "no packet may exceed the transfer limit"
+        );
+        assert_eq!(
+            data.iter().filter(|(_, p)| p.complete).count(),
+            1,
+            "`complete` ends the transfer, so exactly one packet may set it"
+        );
+        assert!(data.last().expect("last").1.complete);
+
+        let archive: Vec<u8> = data.iter().flat_map(|(_, p)| p.data.clone()).collect();
+        let (_, hash_packet) = &replies[0];
+        let expected = fssync::build_context_tar(dir.path(), &fssync::ContextFilter::default())
+            .expect("reference archive");
+        assert_eq!(
+            archive, expected.1,
+            "the packets must reassemble the archive"
+        );
+        assert_eq!(
+            hash_packet.metadata.get("hash").map(String::as_str),
+            Some(expected.0.as_str()),
+            "the checksum must name the archive that was actually sent"
+        );
     }
 
     /// `pkg/fileutils/file_info.go` reads these out of the metadata map and
@@ -1615,7 +1800,10 @@ mod tests {
         }
         // Parsed with `time.Parse(time.RFC3339, ...)`, which rejects an integer.
         let modified = reply.metadata.get("modified_at").expect("modified_at");
-        assert!(modified.ends_with('Z') && modified.contains('T'), "{modified}");
+        assert!(
+            modified.ends_with('Z') && modified.contains('T'),
+            "{modified}"
+        );
     }
 
     #[test]
@@ -1653,6 +1841,23 @@ mod tests {
 
         run(handle_read(&request, &tx, REPLY_ID, dir.path())).expect("read");
         assert_eq!(drain(&mut rx)[0].1.data, b"234");
+    }
+
+    /// `content::read_range` treats length 0 as "nothing", and the shim reads
+    /// an empty payload as EOF — so defaulting a missing `length` to zero
+    /// would build an image whose files are all empty instead of failing.
+    #[test]
+    fn read_without_a_length_falls_back_to_the_rest_of_the_file() {
+        let dir = context_with(&[("app.txt", "0123456789")]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let request = build_transfer(&[("method", "Read"), ("offset", "4")], "app.txt");
+
+        run(handle_read(&request, &tx, REPLY_ID, dir.path())).expect("read");
+        assert_eq!(
+            drain(&mut rx)[0].1.data,
+            b"456789",
+            "an absent length must read to the end, not read as EOF"
+        );
     }
 
     #[test]

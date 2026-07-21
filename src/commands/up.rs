@@ -484,6 +484,12 @@ const READINESS_MAX_POLL: std::time::Duration = std::time::Duration::from_secs(1
 /// A successful create/start call is not proof of either: issue #4 was a
 /// container that `dev up` had started but that neither command could find.
 /// Reporting readiness is gated on this check so the two can never disagree.
+///
+/// A failing list is retried like a missing one: this runs in the window where
+/// a VM-backed runtime is still settling, so its list call is the most likely
+/// thing to fail transiently, and aborting a healthy `dev up` on the first such
+/// blip is exactly the spurious failure this gate must not introduce. The last
+/// error is only surfaced once the budget is spent.
 async fn verify_container_discoverable(
     runtime: &dyn ContainerRuntime,
     container_id: &str,
@@ -496,12 +502,18 @@ async fn verify_container_discoverable(
 
     let deadline = tokio::time::Instant::now() + READINESS_BUDGET;
     let mut poll = READINESS_FIRST_POLL;
+    let mut last_error = None;
     let last_state = loop {
-        let found = runtime.list_containers(&filters).await?;
-        let state = match found.iter().find(|c| same_container(&c.id, container_id)) {
-            Some(c) if c.state == ContainerState::Running => return Ok(()),
-            Some(c) => Some(c.state.clone()),
-            None => None,
+        let state = match runtime.list_containers(&filters).await {
+            Ok(found) => match found.iter().find(|c| same_container(&c.id, container_id)) {
+                Some(c) if c.state == ContainerState::Running => return Ok(()),
+                Some(c) => Some(c.state.clone()),
+                None => None,
+            },
+            Err(e) => {
+                last_error = Some(e);
+                None
+            }
         };
 
         let now = tokio::time::Instant::now();
@@ -512,12 +524,16 @@ async fn verify_container_discoverable(
         poll = (poll * 2).min(READINESS_MAX_POLL);
     };
 
-    match last_state {
-        Some(state) => anyhow::bail!(
+    match (last_state, last_error) {
+        (Some(state), _) => anyhow::bail!(
             "Container '{container_id}' was started but is {state:?}, not running. \
              Check the runtime's logs for why its init process exited."
         ),
-        None => anyhow::bail!(
+        (None, Some(e)) => anyhow::bail!(
+            "Container '{container_id}' was started but the runtime could not be asked \
+             whether it is running: {e}"
+        ),
+        (None, None) => anyhow::bail!(
             "Container '{container_id}' was started but is not discoverable by the \
              workspace labels `dev status` and `dev exec` search for ({}). \
              The container exists but no command can reach it.",
@@ -1486,6 +1502,11 @@ mod tests {
         /// Number of list calls that still report the container as stopped,
         /// standing in for daemon-side state that settles late.
         running_after_polls: Arc<AtomicUsize>,
+        /// Number of list calls that fail before the runtime answers at all,
+        /// standing in for a daemon whose list/XPC call is still settling.
+        list_errors_before_success: Arc<AtomicUsize>,
+        /// Every list call fails, standing in for a runtime that never answers.
+        list_always_fails: bool,
         created_id: String,
         created_config: Arc<Mutex<Option<ContainerConfig>>>,
         started_id: Arc<Mutex<Option<String>>>,
@@ -1501,6 +1522,8 @@ mod tests {
                 discoverable: true,
                 starts_running: true,
                 running_after_polls: Arc::new(AtomicUsize::new(0)),
+                list_errors_before_success: Arc::new(AtomicUsize::new(0)),
+                list_always_fails: false,
                 created_id: "fake-id".to_string(),
                 created_config: Arc::new(Mutex::new(None)),
                 started_id: Arc::new(Mutex::new(None)),
@@ -1538,6 +1561,23 @@ mod tests {
         fn running_late(polls: usize) -> Self {
             Self {
                 running_after_polls: Arc::new(AtomicUsize::new(polls)),
+                ..Self::ok()
+            }
+        }
+
+        /// Create and start succeed, but the first `polls` list calls fail
+        /// before the runtime answers at all.
+        fn listing_fails_at_first(polls: usize) -> Self {
+            Self {
+                list_errors_before_success: Arc::new(AtomicUsize::new(polls)),
+                ..Self::ok()
+            }
+        }
+
+        /// Create and start succeed, but the runtime can never be listed.
+        fn listing_never_works() -> Self {
+            Self {
+                list_always_fails: true,
                 ..Self::ok()
             }
         }
@@ -1657,7 +1697,22 @@ mod tests {
             let discoverable = self.discoverable;
             let containers = self.containers.clone();
             let settling = self.running_after_polls.clone();
+            let list_errors = self.list_errors_before_success.clone();
+            let list_always_fails = self.list_always_fails;
+            let started = self.started_id.clone();
             Box::pin(async move {
+                // The injected list failures model the window right after
+                // start, which is the only one the readiness gate polls in.
+                if started.lock().unwrap().is_some() {
+                    let transient = list_errors
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                        .is_ok();
+                    if transient || list_always_fails {
+                        return Err(DevError::Runtime(
+                            "list_containers failed (test-injected)".to_string(),
+                        ));
+                    }
+                }
                 if !discoverable {
                     return Ok(Vec::new());
                 }
@@ -1893,6 +1948,38 @@ mod tests {
         run_up_with_fake(&rt, &workspace)
             .await
             .expect("a container that settles late must still be accepted");
+    }
+
+    /// The readiness gate polls in exactly the window where a VM-backed
+    /// runtime's list/XPC call is most likely to fail transiently. A blip
+    /// there must be retried like a not-yet-visible container, not turned into
+    /// a hard failure for a container that is coming up fine.
+    #[tokio::test(start_paused = true)]
+    async fn up_retries_a_transient_list_failure_while_waiting_for_readiness() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let rt = UpFakeRuntime::listing_fails_at_first(5);
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("a transient list failure must not abort a healthy `dev up`");
+    }
+
+    /// Tolerating list failures must not become ignoring them: a runtime that
+    /// never answers has to fail the gate with the reason, not with a
+    /// misleading "not discoverable".
+    #[tokio::test(start_paused = true)]
+    async fn up_reports_the_list_failure_when_it_never_clears() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let rt = UpFakeRuntime::listing_never_works();
+        let err = run_up_with_fake(&rt, &workspace)
+            .await
+            .expect_err("readiness must not be reported when the runtime cannot be asked");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("list_containers failed"),
+            "the error must carry the runtime's own failure, got: {msg}"
+        );
     }
 
     /// A runtime that shortens ids (as Apple Containers does, to fit its

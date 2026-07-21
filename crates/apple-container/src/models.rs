@@ -17,26 +17,59 @@ fn first_report_for(id: &str) -> bool {
     reported.insert(id.to_string())
 }
 
+/// A `containerList` entry these models could not decode.
+///
+/// The identity fields are read straight out of the raw JSON so a caller can
+/// still tell whether the entry was the container it was looking for.
+#[derive(Debug, Clone)]
+pub struct UndecodableSnapshot {
+    pub id: String,
+    pub labels: HashMap<String, String>,
+    pub error: String,
+}
+
+/// Everything one `containerList` reply carried: what decoded, and what did not.
+#[derive(Debug, Default)]
+pub struct ContainerListing {
+    pub snapshots: Vec<ContainerSnapshot>,
+    pub undecodable: Vec<UndecodableSnapshot>,
+}
+
 /// Decode a `containerList` payload one entry at a time.
 ///
 /// The daemon returns every container it knows about in a single array, so an
 /// all-or-nothing decode lets one container the models cannot represent hide
 /// all the others — which is how `dev status`/`dev exec`/`dev up` discovery
 /// broke in issue #4. Entries that fail to decode are reported on stderr (once
-/// per container per process) and skipped so the remaining containers stay
-/// discoverable.
-pub fn decode_snapshots(data: &[u8]) -> Result<Vec<ContainerSnapshot>, serde_json::Error> {
+/// per container per process) and returned separately, so the remaining
+/// containers stay discoverable while a caller looking for one of the skipped
+/// entries can still say why it is missing rather than treating it as absent.
+pub fn decode_snapshots(data: &[u8]) -> Result<ContainerListing, serde_json::Error> {
     let entries: Vec<serde_json::Value> = serde_json::from_slice(data)?;
-    let mut snapshots = Vec::with_capacity(entries.len());
+    let mut listing = ContainerListing {
+        snapshots: Vec::with_capacity(entries.len()),
+        undecodable: Vec::new(),
+    };
     for entry in entries {
-        let id = entry
-            .get("configuration")
+        let configuration = entry.get("configuration");
+        let id = configuration
             .and_then(|c| c.get("id"))
             .and_then(|id| id.as_str())
             .unwrap_or("<unknown>")
             .to_string();
+        let labels = configuration
+            .and_then(|c| c.get("labels"))
+            .and_then(|l| l.as_object())
+            .map(|labels| {
+                labels
+                    .iter()
+                    .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         match serde_json::from_value::<ContainerSnapshot>(entry) {
-            Ok(snapshot) => snapshots.push(snapshot),
+            Ok(snapshot) => listing.snapshots.push(snapshot),
             Err(e) => {
                 if first_report_for(&id) {
                     eprintln!(
@@ -44,10 +77,15 @@ pub fn decode_snapshots(data: &[u8]) -> Result<Vec<ContainerSnapshot>, serde_jso
                          version cannot read ({e})"
                     );
                 }
+                listing.undecodable.push(UndecodableSnapshot {
+                    id,
+                    labels,
+                    error: e.to_string(),
+                });
             }
         }
     }
-    Ok(snapshots)
+    Ok(listing)
 }
 
 /// Snapshot of a container's full state, returned by list/get operations.
@@ -527,9 +565,10 @@ mod tests {
             snapshot_json("good-two", r#"{"volume": {"name": "v", "format": "ext4"}}"#),
         );
 
-        let snapshots = decode_snapshots(payload.as_bytes()).expect("list payload must decode");
+        let listing = decode_snapshots(payload.as_bytes()).expect("list payload must decode");
 
-        let ids: Vec<&str> = snapshots
+        let ids: Vec<&str> = listing
+            .snapshots
             .iter()
             .map(|s| s.configuration.id.as_str())
             .collect();
@@ -540,6 +579,50 @@ mod tests {
         );
     }
 
+    /// Skipping an entry keeps its siblings visible, but a caller searching for
+    /// the skipped container must be able to tell "cannot read this record"
+    /// apart from "no such container" — otherwise `dev up` sees an empty list
+    /// and creates a duplicate the daemon then rejects.
+    #[test]
+    fn undecodable_entries_are_returned_with_their_identity_and_cause() {
+        let payload = format!(
+            "[{},{}]",
+            snapshot_json("good-one", r#"{"virtiofs": {}}"#),
+            r#"{"configuration": {"id": "unreadable",
+                "labels": {"devcontainer.local_folder": "/w/unreadable"}}}"#,
+        );
+
+        let listing = decode_snapshots(payload.as_bytes()).expect("list payload must decode");
+
+        assert_eq!(listing.snapshots.len(), 1);
+        assert_eq!(listing.undecodable.len(), 1);
+        let skipped = &listing.undecodable[0];
+        assert_eq!(skipped.id, "unreadable");
+        assert_eq!(
+            skipped
+                .labels
+                .get("devcontainer.local_folder")
+                .map(String::as_str),
+            Some("/w/unreadable"),
+            "the labels a caller filters on must survive a failed decode"
+        );
+        assert!(
+            !skipped.error.is_empty(),
+            "the decode failure must be reportable"
+        );
+    }
+
+    /// An entry whose `configuration` is unreadable too still has to be
+    /// reported rather than dropped silently.
+    #[test]
+    fn an_undecodable_entry_without_labels_is_still_reported() {
+        let listing = decode_snapshots(b"[{\"nothing\": true}]").expect("list payload must decode");
+        assert!(listing.snapshots.is_empty());
+        assert_eq!(listing.undecodable.len(), 1);
+        assert_eq!(listing.undecodable[0].id, "<unknown>");
+        assert!(listing.undecodable[0].labels.is_empty());
+    }
+
     /// The undecodable-container warning is reported once per container, not
     /// once per `list` call — `dev up` alone polls the list a dozen times, and
     /// a repeated line buries the signal it is meant to carry.
@@ -548,8 +631,8 @@ mod tests {
         let payload = br#"[{"configuration": {"id": "noisy-container"}}]"#;
 
         for round in 0..5 {
-            let snapshots = decode_snapshots(payload).expect("list payload must decode");
-            assert!(snapshots.is_empty());
+            let listing = decode_snapshots(payload).expect("list payload must decode");
+            assert!(listing.snapshots.is_empty());
             assert!(
                 !first_report_for("noisy-container"),
                 "round {round} must not re-report an already reported container"

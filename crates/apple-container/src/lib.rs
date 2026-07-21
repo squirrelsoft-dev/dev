@@ -11,7 +11,7 @@ use std::path::Path;
 
 use error::AppleContainerError;
 use models::{
-    ContainerConfiguration, ContainerSnapshot, ContainerStats, ImageDescription,
+    ContainerConfiguration, ContainerListing, ContainerSnapshot, ContainerStats, ImageDescription,
     ProcessConfiguration, decode_snapshots,
 };
 use routes::{IMAGE_SERVICE_NAME, ImageRoute, SERVICE_NAME, XpcKey, XpcRoute};
@@ -40,13 +40,22 @@ impl AppleContainerClient {
 
     /// List all containers, optionally filtered.
     pub async fn list(&self) -> Result<Vec<ContainerSnapshot>, AppleContainerError> {
+        Ok(self.list_all().await?.snapshots)
+    }
+
+    /// List all containers, keeping the entries that could not be decoded.
+    ///
+    /// A caller that knows which container it is looking for can then tell an
+    /// unreadable record apart from an absent one instead of silently seeing
+    /// nothing.
+    pub async fn list_all(&self) -> Result<ContainerListing, AppleContainerError> {
         let msg = XpcMessage::with_route(XpcRoute::ContainerList.as_str());
         let reply = self.connection.send_async(&msg).await?;
         reply.check_error()?;
 
         let data = reply.get_data(XpcKey::CONTAINERS).unwrap_or_default();
         if data.is_empty() {
-            return Ok(Vec::new());
+            return Ok(ContainerListing::default());
         }
         Ok(decode_snapshots(&data)?)
     }
@@ -56,11 +65,24 @@ impl AppleContainerClient {
     /// Uses `containerList` and filters, since `containerGet` does not return
     /// snapshot data under a discoverable key in the XPC reply.
     pub async fn get(&self, id: &str) -> Result<ContainerSnapshot, AppleContainerError> {
-        let containers = self.list().await?;
-        containers
+        let listing = self.list_all().await?;
+        if let Some(snapshot) = listing
+            .snapshots
             .into_iter()
             .find(|s| s.configuration.id == id)
-            .ok_or_else(|| AppleContainerError::NotFound(id.to_string()))
+        {
+            return Ok(snapshot);
+        }
+        // The container is in the reply but unreadable: saying "not found"
+        // here would send the caller off to create a duplicate.
+        match listing.undecodable.iter().find(|entry| entry.id == id) {
+            Some(entry) => Err(AppleContainerError::XpcError(format!(
+                "container '{id}' exists but the daemon returned a record this version \
+                 cannot read ({})",
+                entry.error
+            ))),
+            None => Err(AppleContainerError::NotFound(id.to_string())),
+        }
     }
 
     /// Fetch the default kernel from the daemon for the given platform.
