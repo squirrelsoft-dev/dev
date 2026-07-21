@@ -228,7 +228,7 @@ When you run `dev up` and `forwardPorts` is set in the merged config, `dev` writ
 
 ```sh
 dev up
-# Container 'appname' is ready.
+# Container 'vsc-appname-<workspace-hash>' is ready.
 #   → https://appname.test → localhost:3000
 ```
 
