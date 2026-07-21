@@ -489,6 +489,71 @@ async fn handle_info(
     Ok(())
 }
 
+/// Map the host's Rust architecture name to its OCI/Go equivalent.
+fn host_oci_architecture() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        "powerpc64" => "ppc64le",
+        other => other,
+    }
+}
+
+/// The platform to resolve base images for when the builder doesn't name one.
+///
+/// The builder VM always runs Linux, so only the architecture follows the
+/// host; the OS must never be the host's (`darwin`).
+fn default_build_platform() -> String {
+    format!("linux/{}", host_oci_architecture())
+}
+
+/// Pick the platform to resolve a base image for from the builder's request,
+/// falling back to [`default_build_platform`] when it names none.
+fn requested_platform(metadata: &std::collections::HashMap<String, String>) -> String {
+    metadata
+        .get("platform")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(default_build_platform)
+}
+
+/// Split an OCI platform string (`os/arch`, optionally `os/arch/variant`)
+/// into its os and architecture components.
+fn split_platform(platform: &str) -> (String, String) {
+    let mut parts = platform.split('/');
+    let os = parts.next().unwrap_or_default().to_string();
+    let arch = parts.next().unwrap_or_default().to_string();
+    (os, arch)
+}
+
+/// Build an image-index resolver that selects the entry matching `platform`.
+///
+/// `oci_client`'s default resolver matches the *running* platform, which on
+/// macOS is `darwin/<arch>`. No Linux image index contains such an entry, so
+/// every multi-arch base image fails with "no entry found in image index
+/// manifest matching client's default platform". The builder always wants a
+/// Linux image, so resolve against the platform it requested instead.
+///
+/// Variants are ignored, matching `oci_client`'s own resolvers: an index
+/// distinguishes `arm64` from `arm`, not `arm64/v8` from bare `arm64`.
+fn platform_resolver(
+    platform: &str,
+) -> Box<dyn Fn(&[oci_client::manifest::ImageIndexEntry]) -> Option<String> + Send + Sync> {
+    let (os, arch) = split_platform(platform);
+    Box::new(move |manifests| {
+        manifests
+            .iter()
+            .find(|entry| {
+                entry
+                    .platform
+                    .as_ref()
+                    .is_some_and(|p| p.os == os && p.architecture == arch)
+            })
+            .map(|entry| entry.digest.clone())
+    })
+}
+
 /// Handle an image resolve request from the builder.
 ///
 /// The server sends an `ImageTransfer` with `stage: "resolver"` and
@@ -512,18 +577,17 @@ async fn handle_image_resolve(
             }
         })
         .ok_or_else(|| AppleContainerError::XpcError("image resolve: missing ref".into()))?;
-    let platform_str = transfer
-        .metadata
-        .get("platform")
-        .map(|s| s.as_str())
-        .unwrap_or("linux/arm64");
+    let platform_str = requested_platform(&transfer.metadata);
 
     let oci_ref: oci_client::Reference =
         reference.parse().map_err(|e: oci_client::ParseError| {
             AppleContainerError::XpcError(format!("invalid image ref: {e}"))
         })?;
 
-    let client = oci_client::Client::default();
+    let client = oci_client::Client::new(oci_client::client::ClientConfig {
+        platform_resolver: Some(platform_resolver(&platform_str)),
+        ..Default::default()
+    });
     let auth = oci_client::secrets::RegistryAuth::Anonymous;
     client
         .auth(&oci_ref, &auth, oci_client::RegistryOperation::Pull)
@@ -1117,4 +1181,179 @@ async fn wait_for_running(conn: &XpcConnection, id: &str) -> Result<(), AppleCon
     Err(AppleContainerError::XpcError(
         "Builder VM did not reach Running state within 30 seconds".to_string(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oci_client::manifest::ImageIndexEntry;
+
+    /// A multi-arch index shaped like `docker.io/library/alpine:latest`:
+    /// several Linux architectures plus an attestation entry carrying the
+    /// `unknown/unknown` platform that registries attach to modern images.
+    fn multi_arch_index() -> Vec<ImageIndexEntry> {
+        serde_json::from_str(
+            r#"[
+                {
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": "sha256:amd64digest",
+                    "size": 1,
+                    "platform": {"architecture": "amd64", "os": "linux"}
+                },
+                {
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": "sha256:armv7digest",
+                    "size": 1,
+                    "platform": {"architecture": "arm", "os": "linux", "variant": "v7"}
+                },
+                {
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": "sha256:arm64digest",
+                    "size": 1,
+                    "platform": {"architecture": "arm64", "os": "linux", "variant": "v8"}
+                },
+                {
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": "sha256:attestationdigest",
+                    "size": 1,
+                    "platform": {"architecture": "unknown", "os": "unknown"}
+                }
+            ]"#,
+        )
+        .expect("index fixture must deserialize")
+    }
+
+    fn metadata(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn default_build_platform_targets_linux_not_the_host_os() {
+        let platform = default_build_platform();
+        assert!(
+            platform.starts_with("linux/"),
+            "builder images are Linux images; got {platform}"
+        );
+        assert_eq!(platform, format!("linux/{}", host_oci_architecture()));
+    }
+
+    #[test]
+    fn host_architecture_uses_oci_names() {
+        // The resolver compares against OCI/Go names, not Rust's.
+        let arch = host_oci_architecture();
+        assert_ne!(arch, "aarch64");
+        assert_ne!(arch, "x86_64");
+    }
+
+    /// The regression this guards: `oci_client::Client::default()` resolves
+    /// against the *running* platform, which on macOS is `darwin/<arch>`. No
+    /// Linux index has such an entry, so every base image failed with
+    /// "no entry found in image index manifest matching client's default
+    /// platform" and `dev up --runtime apple` could not build its features
+    /// image.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_platform_resolver_cannot_resolve_a_linux_index() {
+        let index = multi_arch_index();
+        assert_eq!(
+            oci_client::client::current_platform_resolver(&index),
+            None,
+            "the default resolver must not be used for builder image resolution"
+        );
+        assert!(
+            platform_resolver(&default_build_platform())(&index).is_some(),
+            "our default must resolve where the host-platform resolver cannot"
+        );
+    }
+
+    #[test]
+    fn resolver_selects_the_requested_architecture() {
+        let index = multi_arch_index();
+        assert_eq!(
+            platform_resolver("linux/arm64")(&index).as_deref(),
+            Some("sha256:arm64digest")
+        );
+        assert_eq!(
+            platform_resolver("linux/amd64")(&index).as_deref(),
+            Some("sha256:amd64digest")
+        );
+    }
+
+    #[test]
+    fn resolver_ignores_a_variant_suffix() {
+        assert_eq!(
+            platform_resolver("linux/arm64/v8")(&multi_arch_index()).as_deref(),
+            Some("sha256:arm64digest")
+        );
+    }
+
+    #[test]
+    fn resolver_returns_none_when_no_entry_matches() {
+        let index = multi_arch_index();
+        assert_eq!(platform_resolver("linux/s390x")(&index), None);
+        // The host OS must never match a Linux index.
+        assert_eq!(platform_resolver("darwin/arm64")(&index), None);
+    }
+
+    #[test]
+    fn resolver_skips_entries_without_platform_metadata() {
+        let index: Vec<ImageIndexEntry> = serde_json::from_str(
+            r#"[
+                {
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": "sha256:nolatform",
+                    "size": 1
+                },
+                {
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": "sha256:arm64digest",
+                    "size": 1,
+                    "platform": {"architecture": "arm64", "os": "linux"}
+                }
+            ]"#,
+        )
+        .expect("index fixture must deserialize");
+        assert_eq!(
+            platform_resolver("linux/arm64")(&index).as_deref(),
+            Some("sha256:arm64digest")
+        );
+    }
+
+    #[test]
+    fn requested_platform_honors_the_builders_request() {
+        assert_eq!(
+            requested_platform(&metadata(&[("platform", "linux/amd64")])),
+            "linux/amd64"
+        );
+    }
+
+    #[test]
+    fn requested_platform_falls_back_when_absent_or_blank() {
+        let expected = default_build_platform();
+        assert_eq!(requested_platform(&metadata(&[])), expected);
+        assert_eq!(requested_platform(&metadata(&[("platform", "")])), expected);
+        assert_eq!(
+            requested_platform(&metadata(&[("platform", "  ")])),
+            expected
+        );
+    }
+
+    #[test]
+    fn split_platform_handles_os_arch_and_variant() {
+        assert_eq!(
+            split_platform("linux/arm64"),
+            ("linux".to_string(), "arm64".to_string())
+        );
+        assert_eq!(
+            split_platform("linux/arm64/v8"),
+            ("linux".to_string(), "arm64".to_string())
+        );
+        assert_eq!(
+            split_platform("linux"),
+            ("linux".to_string(), String::new())
+        );
+    }
 }
