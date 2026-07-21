@@ -629,8 +629,10 @@ async fn verify_container_execs(
 ///
 /// The last attempt describes the container as it stands. When an earlier
 /// attempt was refused and the last one merely ran out of window, both are
-/// worth having: the timeout is what is happening, the refusal is how it
-/// started.
+/// worth having: the timeout is what is happening, the refusal is what the
+/// runtime last said about why. `refusal` is the most recent one rather than
+/// the first — a runtime that refuses its way through several distinct errors
+/// before hanging is best described by the last thing it managed to say.
 fn probe_diagnosis(latest: &str, refusal: Option<String>) -> String {
     match refusal {
         Some(refusal) if refusal != latest => {
