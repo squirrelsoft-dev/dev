@@ -575,7 +575,7 @@ async fn handle_walk(
     let (entries, checksum) = prepared;
 
     let mut hash_metadata = fssync_metadata("Walk");
-    hash_metadata.insert("hash".to_string(), checksum);
+    hash_metadata.insert("hash".to_string(), checksum.clone());
     send_build_transfer(
         client_tx,
         build_id,
@@ -587,7 +587,7 @@ async fn handle_walk(
     )
     .await?;
 
-    stream_walk_archive(entries, client_tx, build_id, transfer).await
+    stream_walk_archive(entries, &checksum, client_tx, build_id, transfer).await
 }
 
 /// Collect the context and hash the archive it will produce.
@@ -615,20 +615,35 @@ async fn prepare_walk(
 /// The last packet is the one that carries `complete`, so each chunk is held
 /// back until the next arrives — and a failure part-way through is reported as
 /// an fssync error rather than as a truncated archive the shim would accept.
+///
+/// The bytes handed over are digested as they go and checked against the
+/// `announced` checksum before the transfer is completed. The two passes read
+/// the same files at different moments, so a file rewritten in between would
+/// otherwise register content under a hash that does not describe it — and the
+/// shim caches its unpacked context by that hash, so a later stable build would
+/// silently reuse the wrong tree.
 async fn stream_walk_archive(
     entries: Vec<fssync::ContextEntry>,
+    announced: &str,
     client_tx: &tokio::sync::mpsc::Sender<ClientStream>,
     build_id: &str,
     transfer: &BuildTransfer,
 ) -> Result<(), AppleContainerError> {
     let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
     let writer = tokio::task::spawn_blocking(move || {
-        let mut emit = |chunk: Vec<u8>| {
-            chunk_tx.blocking_send(chunk).map_err(|_| {
-                AppleContainerError::XpcError("build context transfer was abandoned".to_string())
-            })
-        };
-        fssync::stream_context_tar(&entries, &mut emit)
+        let mut digest = fssync::ArchiveDigest::default();
+        {
+            let mut emit = |chunk: Vec<u8>| {
+                digest.update(&chunk);
+                chunk_tx.blocking_send(chunk).map_err(|_| {
+                    AppleContainerError::XpcError(
+                        "build context transfer was abandoned".to_string(),
+                    )
+                })
+            };
+            fssync::stream_context_tar(&entries, &mut emit)?;
+        }
+        Ok(digest.finish())
     });
 
     let mut pending: Option<Vec<u8>> = None;
@@ -649,7 +664,17 @@ async fn stream_walk_archive(
 
     // The sender is dropped when the writer finishes, so the loop above has
     // already ended by the time this resolves.
-    if let Err(e) = join_blocking(writer).await {
+    let streamed = match join_blocking(writer).await {
+        Ok(streamed) => streamed,
+        Err(e) => {
+            send_fssync_error(client_tx, build_id, transfer, "Walk", &e.to_string()).await?;
+            return Err(e);
+        }
+    };
+    if streamed != announced {
+        let e = AppleContainerError::XpcError(format!(
+            "build context changed while it was being sent: announced {announced}, sent {streamed}"
+        ));
         send_fssync_error(client_tx, build_id, transfer, "Walk", &e.to_string()).await?;
         return Err(e);
     }
@@ -1776,6 +1801,43 @@ mod tests {
             hash_packet.metadata.get("hash").map(String::as_str),
             Some(expected.0.as_str()),
             "the checksum must name the archive that was actually sent"
+        );
+    }
+
+    /// The checksum is announced before the archive is produced a second time
+    /// to send it, so a context rewritten in between would hand the shim bytes
+    /// its hash does not describe — and the shim caches its unpacked context by
+    /// that hash, so a later stable build would silently reuse the wrong tree.
+    /// The transfer must fail instead of completing.
+    #[test]
+    fn walk_fails_when_the_sent_archive_does_not_match_the_announced_checksum() {
+        let dir = context_with(&[("app.txt", "payload")]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let request = build_transfer(&[("method", "Walk"), ("mode", "tar")], ".");
+        let entries = fssync::collect_context(dir.path(), &fssync::ContextFilter::default())
+            .expect("context walk");
+        let stale = "0".repeat(64);
+
+        let outcome = run(stream_walk_archive(
+            entries, &stale, &tx, REPLY_ID, &request,
+        ));
+        assert!(
+            outcome.is_err(),
+            "an archive that does not match its checksum must not report success"
+        );
+
+        let replies = drain(&mut rx);
+        assert!(
+            replies
+                .iter()
+                .any(|(_, p)| p.metadata.contains_key("error")),
+            "the shim only stops waiting when it sees an `error` key: {replies:?}"
+        );
+        assert!(
+            !replies
+                .iter()
+                .any(|(_, p)| p.complete && !p.metadata.contains_key("error")),
+            "a mismatched transfer must never be completed"
         );
     }
 

@@ -308,7 +308,29 @@ pub fn build_context_tar(
 pub fn context_tar_checksum(entries: &[ContextEntry]) -> Result<String, AppleContainerError> {
     let mut digest = Sha256Sink::default();
     write_tar(entries, &mut digest)?;
-    Ok(digest.finish())
+    Ok(digest.digest.finish())
+}
+
+/// Running digest of an archive as it is handed over.
+///
+/// The same definition the announced checksum is computed with, so a caller can
+/// check the bytes it actually transferred against the hash the shim was
+/// promised without the two drifting apart.
+#[derive(Default)]
+pub struct ArchiveDigest {
+    hasher: sha2::Sha256,
+}
+
+impl ArchiveDigest {
+    pub fn update(&mut self, chunk: &[u8]) {
+        use sha2::Digest;
+        self.hasher.update(chunk);
+    }
+
+    pub fn finish(self) -> String {
+        use sha2::Digest;
+        hex::encode(self.hasher.finalize())
+    }
 }
 
 /// Write the context tar out in [`CONTEXT_CHUNK_SIZE`] pieces.
@@ -322,27 +344,23 @@ pub fn stream_context_tar(
     emit: &mut dyn FnMut(Vec<u8>) -> Result<(), AppleContainerError>,
 ) -> Result<(), AppleContainerError> {
     let mut chunks = ChunkWriter::new(emit);
-    write_tar(entries, &mut chunks)?;
-    chunks.flush_remainder()
+    match write_tar(entries, &mut chunks) {
+        Ok(()) => chunks.flush_remainder(),
+        // `tar::Builder` only surfaces an `io::Error`, so a sink failure comes
+        // back re-wrapped; the sink kept the one it actually raised.
+        Err(wrapped) => Err(chunks.failure.take().unwrap_or(wrapped)),
+    }
 }
 
 /// A `Write` sink that hashes without keeping anything.
 #[derive(Default)]
 struct Sha256Sink {
-    hasher: sha2::Sha256,
-}
-
-impl Sha256Sink {
-    fn finish(self) -> String {
-        use sha2::Digest;
-        hex::encode(self.hasher.finalize())
-    }
+    digest: ArchiveDigest,
 }
 
 impl std::io::Write for Sha256Sink {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        use sha2::Digest;
-        self.hasher.update(data);
+        self.digest.update(data);
         Ok(data.len())
     }
 
@@ -368,10 +386,10 @@ impl<'a> ChunkWriter<'a> {
     }
 
     /// Hand off whatever the last chunk boundary left behind.
+    ///
+    /// Only reached once the archive was written in full, so any `failure` the
+    /// sink recorded has already been returned by [`stream_context_tar`].
     fn flush_remainder(mut self) -> Result<(), AppleContainerError> {
-        if let Some(e) = self.failure.take() {
-            return Err(e);
-        }
         if self.buffer.is_empty() {
             return Ok(());
         }
@@ -747,10 +765,33 @@ mod tests {
             ))
         });
 
-        let message = outcome
-            .expect_err("a failing sink must fail the walk")
-            .to_string();
-        assert!(message.contains("receiver is gone"), "{message}");
+        let error = outcome.expect_err("a failing sink must fail the walk");
+        // `tar::Builder` can only carry an `io::Error`, so the sink's own error
+        // has to be recovered rather than reported as a filesystem failure the
+        // caller would go looking for on disk.
+        assert!(
+            matches!(error, AppleContainerError::XpcError(_)),
+            "the sink's own error variant must survive, got {error:?}"
+        );
+        assert!(error.to_string().contains("receiver is gone"), "{error}");
+    }
+
+    /// A genuine filesystem failure must still arrive as one: recovering the
+    /// sink's error must not swallow the case where the sink was fine and the
+    /// context itself could not be read.
+    #[test]
+    fn a_read_failure_still_reports_as_an_io_error() {
+        let dir = tempfile::tempdir().expect("temp context");
+        write(dir.path(), "app.txt", "payload");
+        let entries = collect_context(dir.path(), &ContextFilter::default()).expect("walk");
+        std::fs::remove_file(dir.path().join("app.txt")).expect("remove");
+
+        let error = stream_context_tar(&entries, &mut |_| Ok(()))
+            .expect_err("a context file that vanished must fail the walk");
+        assert!(
+            matches!(error, AppleContainerError::Io(_)),
+            "a filesystem failure must stay an Io error, got {error:?}"
+        );
     }
 
     #[test]

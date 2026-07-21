@@ -502,14 +502,22 @@ async fn verify_container_discoverable(
 
     let deadline = tokio::time::Instant::now() + READINESS_BUDGET;
     let mut poll = READINESS_FIRST_POLL;
-    let mut last_error = None;
+    // Assigned by every poll, so only the final one's outcome is reported.
+    let mut last_error;
     let last_state = loop {
         let state = match runtime.list_containers(&filters).await {
-            Ok(found) => match found.iter().find(|c| same_container(&c.id, container_id)) {
-                Some(c) if c.state == ContainerState::Running => return Ok(()),
-                Some(c) => Some(c.state.clone()),
-                None => None,
-            },
+            Ok(found) => {
+                // A poll that answered clears the last failure: only a runtime
+                // still failing at the deadline may claim the diagnosis, or an
+                // early blip masks the not-discoverable report this gate exists
+                // to produce.
+                last_error = None;
+                match found.iter().find(|c| same_container(&c.id, container_id)) {
+                    Some(c) if c.state == ContainerState::Running => return Ok(()),
+                    Some(c) => Some(c.state.clone()),
+                    None => None,
+                }
+            }
             Err(e) => {
                 last_error = Some(e);
                 None
@@ -1582,6 +1590,15 @@ mod tests {
             }
         }
 
+        /// The first `polls` list calls fail, and every later one succeeds
+        /// while still not showing the container.
+        fn undiscoverable_after_a_blip(polls: usize) -> Self {
+            Self {
+                list_errors_before_success: Arc::new(AtomicUsize::new(polls)),
+                ..Self::undiscoverable()
+            }
+        }
+
         fn created_config(&self) -> ContainerConfig {
             self.created_config
                 .lock()
@@ -1979,6 +1996,29 @@ mod tests {
         assert!(
             msg.contains("list_containers failed"),
             "the error must carry the runtime's own failure, got: {msg}"
+        );
+    }
+
+    /// A blip that recovered must not claim the diagnosis. Once a later poll
+    /// answers, the container really is absent from the workspace-label query
+    /// — the exact issue #4 symptom — and that is what has to be reported,
+    /// not a transient error the runtime already recovered from.
+    #[tokio::test(start_paused = true)]
+    async fn up_reports_undiscoverable_when_an_early_list_failure_recovered() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let rt = UpFakeRuntime::undiscoverable_after_a_blip(1);
+        let err = run_up_with_fake(&rt, &workspace)
+            .await
+            .expect_err("readiness must not be reported for an undiscoverable container");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not discoverable"),
+            "a recovered blip must not mask the discovery diagnosis, got: {msg}"
+        );
+        assert!(
+            !msg.contains("list_containers failed"),
+            "the stale error must not be reported once a later poll answered, got: {msg}"
         );
     }
 

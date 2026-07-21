@@ -869,19 +869,25 @@ fn labels_match(labels: &HashMap<String, String>, filters: &[(&str, &str)]) -> b
 }
 
 /// Fail a filtered query the daemon answered with an unreadable record for the
-/// very container being asked about.
+/// very container being asked about, and nothing else.
 ///
 /// Skipping undecodable entries keeps unrelated containers discoverable, but
 /// answering "nothing matched" for the caller's *own* container reads as "no
 /// such container": `dev up` then creates a duplicate that the daemon rejects
 /// with a confusing "already exists" instead of the decode failure that
-/// explains it. An unfiltered query asks about every container rather than a
-/// specific one, so it keeps the tolerant behaviour.
+/// explains it.
+///
+/// Two cases keep the tolerant behaviour. An unfiltered query asks about every
+/// container rather than a specific one. And a query that *did* find a readable
+/// container for these labels has what the caller came for — failing it would
+/// cost `dev status`, `dev exec`, `dev shell` and `dev down` a container they
+/// can reach, leaving the unreadable one impossible to clean up.
 fn report_undecodable_match(
     undecodable: &[apple_container::models::UndecodableSnapshot],
     filters: &[(&str, &str)],
+    readable_matches: usize,
 ) -> Result<(), DevError> {
-    if filters.is_empty() {
+    if filters.is_empty() || readable_matches > 0 {
         return Ok(());
     }
     match undecodable
@@ -1103,8 +1109,6 @@ impl ContainerRuntime for AppleRuntime {
                 .map(|f| f.split_once('=').unwrap_or((f.as_str(), "")))
                 .collect();
 
-            report_undecodable_match(&listing.undecodable, &parsed_filters)?;
-
             let mut result = Vec::new();
             for snap in listing.snapshots {
                 if labels_match(&snap.configuration.labels, &parsed_filters) {
@@ -1122,6 +1126,8 @@ impl ContainerRuntime for AppleRuntime {
                     });
                 }
             }
+
+            report_undecodable_match(&listing.undecodable, &parsed_filters, result.len())?;
 
             Ok(result)
         })
@@ -1477,20 +1483,37 @@ mod tests {
         }
     }
 
-    /// An entry the models cannot read that carries *this* workspace's labels
-    /// must fail the query. Silently dropping it makes `dev up` see an empty
-    /// list and create a duplicate the daemon then rejects with an error that
-    /// says nothing about the real cause.
+    /// An entry the models cannot read that carries *this* workspace's labels,
+    /// with no readable container to fall back on, must fail the query.
+    /// Silently dropping it makes `dev up` see an empty list and create a
+    /// duplicate the daemon then rejects with an error that says nothing about
+    /// the real cause.
     #[test]
-    fn a_query_that_matches_an_undecodable_entry_fails_with_the_decode_cause() {
+    fn a_query_that_matches_only_an_undecodable_entry_fails_with_the_decode_cause() {
         let entries = vec![undecodable("vsc-mine", "/w/mine")];
         let filters = [("devcontainer.local_folder", "/w/mine")];
 
-        let err = report_undecodable_match(&entries, &filters)
+        let err = report_undecodable_match(&entries, &filters, 0)
             .expect_err("the workspace's own unreadable container must be reported");
         let message = format!("{err}");
         assert!(message.contains("vsc-mine"), "{message}");
         assert!(message.contains("missing field `status`"), "{message}");
+    }
+
+    /// The hard error exists only to stop `dev up` creating a duplicate it
+    /// cannot see. Once the query *did* find a readable container for these
+    /// labels, every command has what it came for — failing anyway would deny
+    /// `dev status`/`exec`/`shell` a container they can reach and leave
+    /// `dev down` unable to clean up.
+    #[test]
+    fn a_readable_match_keeps_the_query_working_despite_an_undecodable_sibling() {
+        let entries = vec![undecodable("vsc-mine-stale", "/w/mine")];
+        let filters = [("devcontainer.local_folder", "/w/mine")];
+
+        assert!(
+            report_undecodable_match(&entries, &filters, 1).is_ok(),
+            "a reachable container must not be hidden by an unreadable sibling"
+        );
     }
 
     /// The tolerance that made the fix work stays: another workspace's
@@ -1499,7 +1522,8 @@ mod tests {
     fn an_unrelated_undecodable_entry_does_not_fail_the_query() {
         let entries = vec![undecodable("vsc-theirs", "/w/theirs")];
         assert!(
-            report_undecodable_match(&entries, &[("devcontainer.local_folder", "/w/mine")]).is_ok()
+            report_undecodable_match(&entries, &[("devcontainer.local_folder", "/w/mine")], 0)
+                .is_ok()
         );
         // Nor may an entry whose labels are unreadable too be blamed on a
         // workspace that never owned it.
@@ -1509,7 +1533,7 @@ mod tests {
             error: "unreadable".to_string(),
         }];
         assert!(
-            report_undecodable_match(&bare, &[("devcontainer.local_folder", "/w/mine")]).is_ok()
+            report_undecodable_match(&bare, &[("devcontainer.local_folder", "/w/mine")], 0).is_ok()
         );
     }
 
@@ -1518,7 +1542,7 @@ mod tests {
     #[test]
     fn an_unfiltered_listing_still_tolerates_undecodable_entries() {
         let entries = vec![undecodable("vsc-mine", "/w/mine")];
-        assert!(report_undecodable_match(&entries, &[]).is_ok());
+        assert!(report_undecodable_match(&entries, &[], 0).is_ok());
     }
 
     /// `remoteUser` is normally a name, and a name must not silently become
