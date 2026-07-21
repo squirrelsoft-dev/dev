@@ -636,9 +636,9 @@ mod tests {
         let emitted = mounts[0]
             .substitute_and_emit(&ws, None)
             .expect("should emit a long-form string");
-        assert!(
-            emitted.contains("source=./,target=/workspace,type=bind,readonly=false"),
-            "expected long-form emit, got: {emitted}"
+        assert_eq!(
+            emitted,
+            "source=./,target=/workspace,type=bind,readonly=false"
         );
     }
 }
