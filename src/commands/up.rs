@@ -698,6 +698,12 @@ fn warn_probe_command_missing(container_id: &str, reason: &str) {
 /// thing to fail transiently, and aborting a healthy `dev up` on the first such
 /// blip is exactly the spurious failure this gate must not introduce. The last
 /// error is only surfaced once the budget is spent.
+///
+/// Each list is bounded by what remains of the budget, for the same reason the
+/// exec probe is: on a VM-backed runtime the list is a synchronous daemon call
+/// with no deadline of its own, so a dropped reply here is the same silent hang
+/// issue #4 is about. Pacing the gaps between polls would never reach the next
+/// one, and `dev up` would sit forever after "Starting container...".
 async fn verify_container_discoverable(
     runtime: &dyn ContainerRuntime,
     container_id: &str,
@@ -712,8 +718,10 @@ async fn verify_container_discoverable(
     // Assigned by every poll, so only the final one's outcome is reported.
     let mut last_error;
     let last_state = loop {
-        let state = match runtime.list_containers(&filters).await {
-            Ok(found) => {
+        let window = polls.remaining();
+        let listed = tokio::time::timeout(window, runtime.list_containers(&filters)).await;
+        let state = match listed {
+            Ok(Ok(found)) => {
                 // A poll that answered clears the last failure: only a runtime
                 // still failing at the deadline may claim the diagnosis, or an
                 // early blip masks the not-discoverable report this gate exists
@@ -725,8 +733,15 @@ async fn verify_container_discoverable(
                     None => None,
                 }
             }
-            Err(e) => {
-                last_error = Some(e);
+            Ok(Err(e)) => {
+                last_error = Some(e.to_string());
+                None
+            }
+            Err(_) => {
+                last_error = Some(format!(
+                    "it did not answer within {:.1}s",
+                    window.as_secs_f64()
+                ));
                 None
             }
         };
@@ -1722,6 +1737,9 @@ mod tests {
         list_errors_before_success: Arc<AtomicUsize>,
         /// Every list call fails, standing in for a runtime that never answers.
         list_always_fails: bool,
+        /// Every list call hangs, standing in for a daemon that accepted the
+        /// query and dropped its reply.
+        list_never_answers: bool,
         /// `exec` errors, standing in for a container whose create → start →
         /// wait sequence never reports a command's exit.
         exec_fails: bool,
@@ -1761,6 +1779,7 @@ mod tests {
                 running_after_polls: Arc::new(AtomicUsize::new(0)),
                 list_errors_before_success: Arc::new(AtomicUsize::new(0)),
                 list_always_fails: false,
+                list_never_answers: false,
                 exec_fails: false,
                 exec_errors_before_success: Arc::new(AtomicUsize::new(0)),
                 exec_command_missing: false,
@@ -1881,6 +1900,15 @@ mod tests {
         fn listing_never_works() -> Self {
             Self {
                 list_always_fails: true,
+                ..Self::ok()
+            }
+        }
+
+        /// Create and start succeed, but the list query is never answered at
+        /// all — the dropped-reply half of issue #4 on the discovery side.
+        fn listing_never_answers() -> Self {
+            Self {
+                list_never_answers: true,
                 ..Self::ok()
             }
         }
@@ -2084,11 +2112,15 @@ mod tests {
             let settling = self.running_after_polls.clone();
             let list_errors = self.list_errors_before_success.clone();
             let list_always_fails = self.list_always_fails;
+            let list_never_answers = self.list_never_answers;
             let started = self.started_id.clone();
             Box::pin(async move {
                 // The injected list failures model the window right after
                 // start, which is the only one the readiness gate polls in.
                 if started.lock().unwrap().is_some() {
+                    if list_never_answers {
+                        std::future::pending::<()>().await;
+                    }
                     let transient = list_errors
                         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
                         .is_ok();
@@ -2364,6 +2396,31 @@ mod tests {
         assert!(
             msg.contains("list_containers failed"),
             "the error must carry the runtime's own failure, got: {msg}"
+        );
+    }
+
+    /// A daemon that accepts the list query and drops its reply never fails,
+    /// so pacing the gaps between polls would never reach the next one. The
+    /// discovery half has to bound the call itself or `dev up` sits silent
+    /// after "Starting container..." exactly the way issue #4 did.
+    #[tokio::test(start_paused = true)]
+    async fn up_fails_when_the_list_query_is_never_answered() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let rt = UpFakeRuntime::listing_never_answers();
+
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(600),
+            run_up_with_fake(&rt, &workspace),
+        )
+        .await
+        .expect("the readiness gate must bound the list rather than wait forever")
+        .expect_err("readiness must not be reported when the runtime never answers the list");
+
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("did not answer within"),
+            "the error must name the hang, got: {msg}"
         );
     }
 

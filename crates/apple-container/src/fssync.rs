@@ -275,6 +275,14 @@ pub struct ContextEntry {
     /// Context-relative, slash-separated, and never prefixed with `./`: the
     /// shim rejects any tar name that does not resolve strictly under its
     /// unpack directory (`pkg/fileutils/tarxfer.go`).
+    ///
+    /// The separators are the ones the filesystem gave: a backslash is a legal
+    /// byte in a macOS filename, so rewriting it would turn a file honestly
+    /// named `..\..\etc\passwd` into the traversal `../../etc/passwd` and leave
+    /// only the shim's own validation between a crafted name and a write
+    /// outside its unpack directory. It would relocate innocent files too —
+    /// `a\b.txt` would be stored as `a/b.txt`, under a directory the context
+    /// never had.
     pub name: String,
     pub path: PathBuf,
     pub metadata: std::fs::Metadata,
@@ -286,6 +294,16 @@ pub struct ContextEntry {
 /// tree fails with a message instead of overflowing the stack and aborting the
 /// whole process.
 const MAX_CONTEXT_DEPTH: usize = 128;
+
+/// How many paths the walk will select out of a build context.
+///
+/// The walk holds one entry per selected path — a name, a path and a `stat`
+/// struct — for the whole transfer, so breadth costs resident memory the way
+/// depth costs stack. An unfiltered monorepo checkout with a vendored tree and
+/// no `.dockerignore` is the realistic way to reach this, and a build that
+/// stops with the count and the advice to write a `.dockerignore` is a far
+/// better outcome than one that is killed for its resident size.
+const MAX_CONTEXT_ENTRIES: usize = 500_000;
 
 /// Collect every context path the request selected, in a stable order.
 ///
@@ -338,7 +356,15 @@ fn collect_dir(
         let Ok(relative) = path.strip_prefix(root) else {
             continue;
         };
-        let name = relative.to_string_lossy().replace('\\', "/");
+        // `to_string_lossy` would mint a `U+FFFD` name whose bytes name a
+        // different path than the one being read, so a name this crate cannot
+        // carry stops the walk instead of being sent under a wrong one.
+        let Some(name) = relative.to_str().map(str::to_string) else {
+            return Err(AppleContainerError::XpcError(format!(
+                "build context path {} is not valid UTF-8 and cannot be named in the archive",
+                path.display()
+            )));
+        };
         // `symlink_metadata` describes the link itself, so a symlink is sent
         // as a link rather than being followed out of the context.
         let metadata = match std::fs::symlink_metadata(&path) {
@@ -355,11 +381,14 @@ fn collect_dir(
             if !filter.matches_dir(&name) {
                 continue;
             }
-            entries.push(ContextEntry {
-                name,
-                path: path.clone(),
-                metadata,
-            });
+            push_entry(
+                entries,
+                ContextEntry {
+                    name,
+                    path: path.clone(),
+                    metadata,
+                },
+            )?;
             collect_dir(root, &path, filter, depth + 1, entries)?;
         } else {
             // Only regular files and symlinks have contents a tar can carry.
@@ -373,14 +402,32 @@ fn collect_dir(
             if !filter.matches_file(&name) {
                 continue;
             }
-            entries.push(ContextEntry {
-                name,
-                path,
-                metadata,
-            });
+            push_entry(
+                entries,
+                ContextEntry {
+                    name,
+                    path,
+                    metadata,
+                },
+            )?;
         }
     }
 
+    Ok(())
+}
+
+/// Record one selected path, refusing a context wider than the walk will hold.
+fn push_entry(
+    entries: &mut Vec<ContextEntry>,
+    entry: ContextEntry,
+) -> Result<(), AppleContainerError> {
+    if entries.len() >= MAX_CONTEXT_ENTRIES {
+        return Err(AppleContainerError::XpcError(format!(
+            "build context selects more than {MAX_CONTEXT_ENTRIES} paths; \
+             exclude what the build does not need with a .dockerignore"
+        )));
+    }
+    entries.push(entry);
     Ok(())
 }
 
@@ -579,7 +626,7 @@ fn write_tar<W: std::io::Write>(
 /// deadline above it. `O_NONBLOCK` makes the open return whatever the path has
 /// become so it can be reported, and is a no-op for the regular file this
 /// almost always is.
-fn open_regular(
+pub fn open_regular(
     path: &Path,
     name: &str,
 ) -> Result<(std::fs::File, std::fs::Metadata), AppleContainerError> {
@@ -764,13 +811,11 @@ mod tests {
     #[test]
     fn an_absent_or_empty_filter_selects_everything() {
         assert!(ContextFilter::from_metadata(&metadata(&[])).is_unfiltered());
-        assert!(
-            ContextFilter::from_metadata(&metadata(&[
-                ("followpaths", ""),
-                ("include-patterns", "")
-            ]))
-            .is_unfiltered()
-        );
+        assert!(ContextFilter::from_metadata(&metadata(&[
+            ("followpaths", ""),
+            ("include-patterns", "")
+        ]))
+        .is_unfiltered());
         assert!(ContextFilter::default().matches_file("anything/at/all"));
     }
 
@@ -1270,6 +1315,29 @@ mod tests {
 
         assert_eq!(first.len(), 64, "checksum must be a hex sha256: {first}");
         assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// A backslash is a legal byte in a macOS filename, and the archive names
+    /// paths for a Linux guest that reads it as one too. Rewriting it to `/`
+    /// would turn an honest filename into a traversal the shim's own validation
+    /// is then the only thing refusing, and would relocate innocent files into
+    /// directories the context never had.
+    #[test]
+    fn a_backslash_in_a_filename_is_carried_not_rewritten() {
+        let dir = tempfile::tempdir().expect("temp context");
+        write(dir.path(), r"..\..\..\etc\passwd", "not a traversal");
+        write(dir.path(), r"a\b.txt", "one file, not two");
+
+        let (_, archive) =
+            build_context_tar(dir.path(), &ContextFilter::default()).expect("context tar");
+
+        let mut names = tar_names(&archive);
+        names.sort();
+        assert_eq!(
+            names,
+            vec![r"..\..\..\etc\passwd".to_string(), r"a\b.txt".to_string()],
+            "the archive must name each file the way the filesystem does"
+        );
     }
 
     #[test]

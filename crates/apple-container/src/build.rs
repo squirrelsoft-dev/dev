@@ -38,6 +38,32 @@ const BUILDER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// gigabyte.
 const OUTBOUND_PACKETS: usize = 16;
 
+/// How long the base-image resolver may wait to reach a registry.
+///
+/// `oci_client` leaves both of these unset, which is `None` all the way down to
+/// `reqwest` — a black-holed connection through a captive portal or a hung
+/// corporate proxy then never returns. The resolve is awaited from the build
+/// loop, which is not reading the server stream while it runs, so
+/// [`BUILDER_IDLE_TIMEOUT`] cannot fire behind it and the whole build hangs on
+/// a TCP handshake nobody is going to answer.
+const REGISTRY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a registry response may go without delivering a byte.
+///
+/// Inactivity rather than total duration (`reqwest::ClientBuilder::read_timeout`),
+/// so a slow but progressing manifest or config download is not cut off.
+const REGISTRY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long the daemon has to pull a base image before the build gives up.
+///
+/// The same hang, one layer down: `imagePull` is a synchronous XPC send on a
+/// blocking thread with no deadline of its own, awaited from the build loop
+/// while the server stream goes unread. A pull moves an image over a network
+/// the host cannot watch progress on, so it gets a budget of its own rather
+/// than the stalled-stream one — generous enough for a large base image on a
+/// slow link, and still an end.
+const IMAGE_PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800);
+
 /// Include the generated protobuf/gRPC code.
 pub mod proto {
     tonic::include_proto!("com.apple.container.build.v1");
@@ -1056,13 +1082,9 @@ async fn handle_read(
     let offset = window.offset;
     let requested = fssync_read_length(window.length);
 
-    let data = match resolve_readable_path(context, source).and_then(|path| {
-        let available = std::fs::metadata(&path)
-            .map_err(AppleContainerError::Io)?
-            .len()
-            .saturating_sub(offset);
-        content::read_range(&path, offset, readable_span(requested, available))
-    }) {
+    let (context, named) = (context.to_path_buf(), source.to_string());
+    let read = blocking(move || read_context_range(&context, &named, offset, requested)).await;
+    let data = match read {
         Ok(data) => data,
         Err(e) => {
             let message = format!("cannot read {source}: {e}");
@@ -1074,6 +1096,27 @@ async fn handle_read(
     metadata.insert("offset".to_string(), offset.to_string());
     metadata.insert("length".to_string(), data.len().to_string());
     send_build_transfer(builder, build_id, transfer, metadata, data, true, false).await
+}
+
+/// Read the window an fssync `Read` asked for out of the build context.
+///
+/// Confining the *name* is not enough to open it safely. `resolve_readable_path`
+/// keeps the read inside the context, but says nothing about what the path has
+/// become: a named pipe there — and a workspace can hold one, the fixtures are
+/// literally called `dev-server.fifo` — blocks the opening thread until a writer
+/// appears, with no deadline anywhere above this call. The walk already opens
+/// context files through [`fssync::open_regular`] for that reason, so this takes
+/// the same door rather than a second one with different rules.
+fn read_context_range(
+    context: &Path,
+    source: &str,
+    offset: u64,
+    requested: u64,
+) -> Result<Vec<u8>, AppleContainerError> {
+    let path = resolve_readable_path(context, source)?;
+    let (mut file, metadata) = fssync::open_regular(&path, source)?;
+    let available = metadata.len().saturating_sub(offset);
+    content::read_range_of(&mut file, offset, readable_span(requested, available)?)
 }
 
 /// Answer an fssync `Info` with a context path's metadata.
@@ -1090,9 +1133,12 @@ async fn handle_info(
     use std::os::unix::fs::MetadataExt;
 
     let source = transfer.source.as_deref().unwrap_or("");
-    let Some(path) = resolve_path(context, source) else {
-        let message = format!("cannot stat {source}: {}", UNCONFINED);
-        return send_fssync_error(builder, build_id, transfer, "Info", &message).await;
+    let path = match resolve_stat_path(context, source) {
+        Ok(path) => path,
+        Err(e) => {
+            let message = format!("cannot stat {source}: {e}");
+            return send_fssync_error(builder, build_id, transfer, "Info", &message).await;
+        }
     };
 
     // `symlink_metadata` describes the link itself; BuildKit resolves links
@@ -1162,12 +1208,27 @@ fn fssync_read_length(named: Option<u64>) -> u64 {
 
 /// How much of a requested range one fssync `Read` reply carries.
 ///
-/// Bounded by what one gRPC message holds. `File.ReadAt` treats a reply shorter
-/// than the length it asked for as EOF (`n < length` sets `io.EOF`), so this
-/// only reads as the end of the file when the caller's buffer is larger than a
-/// reply — and its caller's buffers are far below that.
-fn readable_span(requested: u64, available: u64) -> usize {
-    requested.min(available).min(MAX_REPLY_PAYLOAD) as usize
+/// Clamped by the end of the file, which is EOF and what `File.ReadAt`
+/// (`pkg/fssync/file.go`) is asking to be told: a reply shorter than the length
+/// it asked for sets `io.EOF` on the read.
+///
+/// That is exactly why a range the file *can* serve but one reply cannot is
+/// refused instead. Cutting it to what fits would be read as the end of the
+/// file, and the shim would stop there — the built image would carry a silently
+/// truncated copy with nothing said on either side. The content store refuses
+/// the same case for the same reason; see [`send_blob_range`]. Nothing in the
+/// verified protocol asks for this much (`fssync_read_length` defaults to one
+/// reply's worth, and real callers' buffers are far below it), so the refusal
+/// costs nothing a truncation would not cost far more.
+fn readable_span(requested: u64, available: u64) -> Result<usize, AppleContainerError> {
+    let wanted = requested.min(available);
+    if wanted > MAX_REPLY_PAYLOAD {
+        return Err(AppleContainerError::XpcError(format!(
+            "{wanted} bytes are needed to answer this read, more than the {MAX_REPLY_PAYLOAD} \
+             one reply can carry; answering short would be taken for the end of the file"
+        )));
+    }
+    Ok(wanted as usize)
 }
 
 /// Why a builder-supplied path was refused.
@@ -1273,6 +1334,8 @@ async fn handle_image_resolve(
 
     let client = oci_client::Client::new(oci_client::client::ClientConfig {
         platform_resolver: Some(platform_resolver(&platform_str)),
+        connect_timeout: Some(REGISTRY_CONNECT_TIMEOUT),
+        read_timeout: Some(REGISTRY_READ_TIMEOUT),
         ..Default::default()
     });
     let auth = oci_client::secrets::RegistryAuth::Anonymous;
@@ -1540,7 +1603,9 @@ async fn send_blob_range(
     }
     let wanted = asked_for as usize;
 
-    let data = match content::read_range(range.path, range.offset, wanted) {
+    let (blob, at) = (range.path.to_path_buf(), range.offset);
+    let read = blocking(move || content::read_range(&blob, at, wanted)).await;
+    let data = match read {
         Ok(data) => data,
         Err(e) => {
             let message = format!("cannot read blob {}: {e}", range.digest);
@@ -1656,11 +1721,20 @@ async fn ensure_blob(
         "os": os,
         "architecture": architecture,
     }))?;
-    pull_image(&reference, &platform_json).await.map_err(|e| {
-        AppleContainerError::XpcError(format!(
-            "could not pull {reference} to supply blob {digest}: {e}"
-        ))
-    })?;
+    tokio::time::timeout(IMAGE_PULL_TIMEOUT, pull_image(&reference, &platform_json))
+        .await
+        .map_err(|_| {
+            AppleContainerError::XpcError(format!(
+                "pulling {reference} to supply blob {digest} made no progress within {}s; \
+                 giving up on the build",
+                IMAGE_PULL_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(|e| {
+            AppleContainerError::XpcError(format!(
+                "could not pull {reference} to supply blob {digest}: {e}"
+            ))
+        })?;
 
     content::blob_size(digest).ok_or_else(|| {
         AppleContainerError::XpcError(format!(
@@ -1784,9 +1858,10 @@ fn resolve_path(context: &Path, source: &str) -> Option<std::path::PathBuf> {
 /// The resolved path is therefore canonicalized and re-checked against the
 /// canonical context, so only a file that really lives inside it is read.
 ///
-/// `Info` needs no such check and must not have one: it describes the link
-/// itself with `symlink_metadata` and BuildKit resolves links on its own side,
-/// exactly as BuildKit's own fsutil sends the link rather than its target.
+/// `Info` cannot use this: it must describe the *final* component as the link
+/// it is, exactly as BuildKit's own fsutil sends the link rather than its
+/// target, and canonicalizing would resolve it away. It is confined by
+/// [`resolve_stat_path`] instead.
 fn resolve_readable_path(
     context: &Path,
     source: &str,
@@ -1799,6 +1874,40 @@ fn resolve_readable_path(
         return Err(unconfined());
     }
     Ok(resolved)
+}
+
+/// Resolve a path the builder wants the *metadata* of.
+///
+/// `resolve_path` refuses `..` but never normalises, so an intermediate symlink
+/// is still followed when the path is used: a context holding `deploy/etc ->
+/// /etc` — a link a dotfiles tool or a dependency can leave behind — answers an
+/// `Info` for `deploy/etc/passwd` with a host file's size, mode and ownership.
+/// The directory chain is therefore canonicalized and re-checked against the
+/// canonical context, the same confinement [`resolve_readable_path`] applies.
+///
+/// Only the chain, though: the last component is rejoined unresolved so
+/// `symlink_metadata` still describes a link as a link, which is what the shim
+/// is asking for.
+fn resolve_stat_path(
+    context: &Path,
+    source: &str,
+) -> Result<std::path::PathBuf, AppleContainerError> {
+    let unconfined = || AppleContainerError::XpcError(UNCONFINED.to_string());
+    let path = resolve_path(context, source).ok_or_else(unconfined)?;
+    let root = std::fs::canonicalize(context).map_err(AppleContainerError::Io)?;
+    // The context itself names no component to hold back.
+    if path == context {
+        return Ok(root);
+    }
+
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(unconfined());
+    };
+    let parent = std::fs::canonicalize(parent).map_err(AppleContainerError::Io)?;
+    if !parent.starts_with(&root) {
+        return Err(unconfined());
+    }
+    Ok(parent.join(name))
 }
 
 /// Simple base64 encoding (no padding).
@@ -3217,26 +3326,145 @@ mod tests {
         }
     }
 
-    /// `Read` loops on its own offset, so as much as one reply holds is a
-    /// complete answer to it: the reply states what it carries and the shim
-    /// reads on from there. Refusing an 8 MiB asset because it exceeds one
-    /// message would fail a build the protocol can serve perfectly well.
+    /// `File.ReadAt` sets `io.EOF` when the reply is shorter than the length it
+    /// asked for, so the end of the file is the one thing that may shorten one.
+    /// A range the file could serve but a reply cannot is refused instead:
+    /// clamping it would be read as the end of the file, and the image would
+    /// carry a truncated copy with nothing said on either side.
     #[test]
-    fn an_fssync_read_is_clamped_to_one_reply_rather_than_refused() {
+    fn an_fssync_read_larger_than_one_reply_is_refused_not_cut_short() {
         // A reply must still fit inside gRPC's default message limit.
         const { assert!(MAX_REPLY_PAYLOAD < 4 * 1024 * 1024) };
 
         // Short of the end of the file: complete however small.
-        assert_eq!(readable_span(512, 4096), 512);
+        assert_eq!(readable_span(512, 4096).expect("a servable span"), 512);
         // Clamped by the file's end, which is EOF rather than truncation.
-        assert_eq!(readable_span(4096, 512), 512);
+        assert_eq!(readable_span(4096, 512).expect("a servable span"), 512);
         assert_eq!(
-            readable_span(MAX_REPLY_PAYLOAD, MAX_REPLY_PAYLOAD),
+            readable_span(MAX_REPLY_PAYLOAD, MAX_REPLY_PAYLOAD).expect("a servable span"),
             MAX_REPLY_PAYLOAD as usize
         );
-        // An asset larger than one reply: answered with what fits, not refused.
+
+        // An asset larger than one reply, asked for whole.
         let asset = 8 * 1024 * 1024;
-        assert_eq!(readable_span(asset, asset), MAX_REPLY_PAYLOAD as usize);
+        let refused = readable_span(asset, asset).expect_err("a span one reply cannot carry");
+        assert!(refused.to_string().contains("more than the"), "{refused}");
+        // The file's end still shortens it, so the tail of that same asset is
+        // servable: it is capacity that is refused, not the file's size.
+        assert_eq!(
+            readable_span(asset, 4096).expect("the tail of an oversized asset"),
+            4096
+        );
+    }
+
+    /// The refusal has to reach the builder as an fssync error, not as a
+    /// silently short reply the shim would take for the end of the file.
+    #[test]
+    fn an_fssync_read_reports_a_span_one_reply_cannot_carry() {
+        let dir = tempfile::tempdir().expect("temp context");
+        let asset = (MAX_REPLY_PAYLOAD as usize) + 4096;
+        std::fs::write(dir.path().join("asset.bin"), vec![7u8; asset]).expect("asset");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let request = build_transfer(
+            &[("method", "Read"), ("length", &asset.to_string())],
+            "asset.bin",
+        );
+        run(handle_read(&request, &sink(&tx), REPLY_ID, dir.path())).expect("read");
+
+        let replies = drain(&mut rx);
+        let reported = replies[0]
+            .1
+            .metadata
+            .get("error")
+            .expect("a span one reply cannot carry must be reported");
+        assert!(reported.contains("more than the"), "{reported}");
+        assert!(
+            replies.iter().all(|(_, reply)| reply.data.is_empty()),
+            "no partial payload may be handed over for a refused read"
+        );
+    }
+
+    /// A named pipe in the context blocks its opener until a writer appears,
+    /// and nothing above this call has a deadline — so the type has to be
+    /// refused at the open rather than discovered by hanging `dev up`.
+    #[test]
+    fn an_fssync_read_of_a_named_pipe_is_refused_rather_than_blocked_on() {
+        let dir = tempfile::tempdir().expect("temp context");
+        let fifo = std::ffi::CString::new(
+            dir.path()
+                .join("dev-server.fifo")
+                .to_string_lossy()
+                .as_bytes(),
+        )
+        .expect("fifo path");
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0, "mkfifo");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let request = build_transfer(&[("method", "Read")], "dev-server.fifo");
+        run(handle_read(&request, &sink(&tx), REPLY_ID, dir.path())).expect("read");
+
+        let replies = drain(&mut rx);
+        let reported = replies[0]
+            .1
+            .metadata
+            .get("error")
+            .expect("a path that is not a regular file must be reported");
+        assert!(
+            reported.contains("stopped being a regular file"),
+            "{reported}"
+        );
+    }
+
+    /// `Info` resolves the directory chain before it stats, so a link left in
+    /// the context cannot be walked *through* to describe a host file. The
+    /// final component is still described as the link it is — that is what the
+    /// shim asked for — which is why the chain is confined and it is not.
+    #[test]
+    fn an_fssync_info_refuses_a_path_that_leaves_the_context_through_a_link() {
+        let dir = tempfile::tempdir().expect("temp context");
+        let outside = tempfile::tempdir().expect("temp outside");
+        std::fs::write(outside.path().join("secret"), "not the build's").expect("outside file");
+        std::fs::create_dir(dir.path().join("deploy")).expect("deploy");
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("deploy/etc")).expect("symlink");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let request = build_transfer(&[("method", "Info")], "deploy/etc/secret");
+        run(handle_info(&request, &sink(&tx), REPLY_ID, dir.path())).expect("info");
+
+        let replies = drain(&mut rx);
+        let reported = replies[0]
+            .1
+            .metadata
+            .get("error")
+            .expect("a path resolving outside the context must be reported");
+        assert!(reported.contains(UNCONFINED), "{reported}");
+        assert!(
+            !replies[0].1.metadata.contains_key("size"),
+            "no metadata of a host file may be handed over"
+        );
+    }
+
+    /// The link itself is still described, because BuildKit resolves links on
+    /// its own side and expects to be told the link rather than its target.
+    #[test]
+    fn an_fssync_info_still_describes_a_link_in_the_context_as_a_link() {
+        let dir = tempfile::tempdir().expect("temp context");
+        std::fs::write(dir.path().join("app.txt"), "payload").expect("app");
+        std::os::unix::fs::symlink("app.txt", dir.path().join("link.txt")).expect("symlink");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let request = build_transfer(&[("method", "Info")], "link.txt");
+        run(handle_info(&request, &sink(&tx), REPLY_ID, dir.path())).expect("info");
+
+        let replies = drain(&mut rx);
+        let metadata = &replies[0].1.metadata;
+        assert!(!metadata.contains_key("error"), "{metadata:?}");
+        assert_eq!(
+            metadata.get("target").map(String::as_str),
+            Some("app.txt"),
+            "a link must be described as a link, not as its target"
+        );
     }
 
     /// One request, one reply — so a range larger than a reply cannot be

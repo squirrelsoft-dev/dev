@@ -93,6 +93,19 @@ pub fn read_range(
     length: usize,
 ) -> Result<Vec<u8>, AppleContainerError> {
     let mut file = std::fs::File::open(path).map_err(AppleContainerError::Io)?;
+    read_range_of(&mut file, offset, length)
+}
+
+/// [`read_range`] against a file the caller has already opened.
+///
+/// Opening is what blocks on anything that is not a regular file, so a caller
+/// that has to vet the file type first — the build context, where the path is
+/// named by the builder — opens it under its own guard and reads through this.
+pub fn read_range_of(
+    file: &mut std::fs::File,
+    offset: u64,
+    length: usize,
+) -> Result<Vec<u8>, AppleContainerError> {
     let remaining = file
         .metadata()
         .map_err(AppleContainerError::Io)?

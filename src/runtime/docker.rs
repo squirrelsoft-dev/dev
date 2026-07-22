@@ -142,6 +142,16 @@ pub struct BollardRuntime {
 /// (`DevError::Io` is `#[error(transparent)]`, so it stringifies to exactly "No
 /// such file or directory") as an image without a shell, announcing readiness
 /// for a container nothing can reach.
+///
+/// A server error is not enough on its own either, because the OCI runtime
+/// reports every failure of the same start step through the same variant, and
+/// several of them carry ENOENT without the executable being the reason: `error
+/// setting cwd to "/srv/app": no such file or directory` for a `workspaceFolder`
+/// the image does not have, `open /dev/pts/0: no such file or directory` for a
+/// broken terminal. Nothing ran in either case, so the text has to be
+/// attributable to the command itself: either the runtime says so outright
+/// (`executable file not found in $PATH`), or the not-found is reported inside
+/// the `exec: "<argv0>": …` clause that names the executable it tried.
 fn reports_missing_command(error: &DevError) -> bool {
     let DevError::Bollard(bollard::errors::Error::DockerResponseServerError { message, .. }) =
         error
@@ -149,7 +159,12 @@ fn reports_missing_command(error: &DevError) -> bool {
         return false;
     };
     let message = message.to_ascii_lowercase();
-    message.contains("executable file not found") || message.contains("no such file or directory")
+    if message.contains("executable file not found") {
+        return true;
+    }
+    message
+        .split_once("exec: ")
+        .is_some_and(|(_, named)| named.contains("no such file or directory"))
 }
 
 impl BollardRuntime {
@@ -1139,18 +1154,22 @@ mod tests {
         })
     }
 
-    /// Only an error the docker server answered with can mean "the image has
-    /// no such executable". Everything else is the runtime failing to run
-    /// anything, and the readiness gate treats a missing command as tolerable
-    /// — so misreading a transport failure as one announces readiness for a
-    /// container nothing can reach.
+    /// Only an error the docker server answered with, and that the server
+    /// attributed to the executable, reads as "the image has no such
+    /// executable". Everything else is the runtime failing to run anything,
+    /// and the readiness gate treats a missing command as tolerable — so
+    /// misreading one of those announces readiness for a container nothing can
+    /// reach.
     #[test]
     fn only_a_server_side_refusal_reads_as_a_missing_command() {
         assert!(reports_missing_command(&server_error(
             "OCI runtime exec failed: exec: \"sh\": executable file not found in $PATH"
         )));
+        // An absolute argv[0] the image does not have is reported as ENOENT
+        // instead, but still inside the clause naming the executable.
         assert!(reports_missing_command(&server_error(
-            "no such file or directory"
+            "OCI runtime exec failed: exec failed: unable to start container process: \
+             exec: \"/opt/bin/sh\": stat /opt/bin/sh: no such file or directory: unknown"
         )));
 
         // A bare ENOENT from a restarted daemon or a moved socket carries the
@@ -1161,6 +1180,20 @@ mod tests {
         )));
         assert!(!reports_missing_command(&DevError::Runtime(
             "No such file or directory (os error 2)".to_string()
+        )));
+        assert!(!reports_missing_command(&server_error(
+            "no such file or directory"
+        )));
+        // The same ENOENT from the start step, about the working directory
+        // this runtime now sets from `workspaceFolder` rather than about the
+        // command. Nothing ran, so readiness must fail rather than warn.
+        assert!(!reports_missing_command(&server_error(
+            "OCI runtime exec failed: exec failed: unable to start container process: \
+             error setting cwd to \"/srv/app/packages/api\": no such file or directory: unknown"
+        )));
+        assert!(!reports_missing_command(&server_error(
+            "OCI runtime exec failed: exec failed: unable to start container process: \
+             open /dev/pts/0: no such file or directory: unknown"
         )));
         assert!(!reports_missing_command(&server_error(
             "container is not running"

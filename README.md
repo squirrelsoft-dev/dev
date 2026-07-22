@@ -37,7 +37,7 @@ dev up
 dev shell
 ```
 
-`dev shell` opens an interactive shell as the configured `remoteUser`, in the workspace folder, with `REMOTE_CONTAINERS=true` set — the same environment VS Code's devcontainer integration would give you. It probes for `zsh`, `bash`, then `sh`; pass `--shell /bin/bash` to force one. The workspace folder is the config's `workspaceFolder`, falling back to the `workspaceMount` target and then to `/workspaces/<name>`; `dev up` makes it the created container's working directory, so `dev exec` and the lifecycle hooks start there too.
+`dev shell` opens an interactive shell as the configured `remoteUser`, in the workspace folder, with `REMOTE_CONTAINERS=true` set — the same environment VS Code's devcontainer integration would give you. It probes for `zsh`, `bash`, then `sh`; pass `--shell /bin/bash` to force one.
 
 To run a one-off command instead of an interactive shell:
 
@@ -63,11 +63,7 @@ column of `dev list templates`, not a fully qualified OCI reference.
 
 ## Bringing a container up with `dev up`
 
-`dev up` resolves the effective config (merging the layers below), builds the derived image if features have changed, creates and starts the container, confirms it is usable, runs lifecycle hooks, and prints `Container '<name>' is ready.` If that confirmation does not come, `dev up` fails with what it saw instead of reporting readiness — a container `dev status` cannot find, or one no command can be run in, is never announced as ready.
-
-Confirming a container is usable means three things: the runtime reports it running, it is findable by the same workspace labels `dev status` and `dev exec` search for, and one trivial command actually runs in it as the resolved `remoteUser`. Both checks are retried for up to 15 seconds, because a VM-backed runtime boots a guest before its daemon settles.
-
-The command is a probe of the runtime, not of the image. A process that ran and exited — whatever status it reported — proves the create/start/wait sequence `dev exec` depends on, so `dev up` comes up and reports what the status means: exit 127 as no `sh` in the image (a scratch or distroless base), exit 126 as an `sh` the `remoteUser` may not execute. Only a runtime that could not run a process at all fails the gate, and a runtime that declines because the image has no such command is reported the same way rather than failing it.
+`dev up` resolves the effective config (merging the layers below), builds the derived image if features have changed, creates and starts the container, runs lifecycle hooks, and prints `Container '<name>' is ready.`
 
 ```sh
 dev up                  # build if needed and start
