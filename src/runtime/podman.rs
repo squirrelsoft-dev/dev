@@ -146,3 +146,18 @@ impl ContainerRuntime for PodmanRuntime {
         self.0.exec_attached(id, cmd, user)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Podman create uses the same bollard-backed adapter as Docker. The
+    /// create-body assertions live in `runtime::docker::tests`; this test pins
+    /// the adapter shape so those assertions honestly cover the implementation
+    /// Podman delegates to, without claiming a live Podman daemon was exercised.
+    #[test]
+    fn podman_runtime_wraps_the_shared_bollard_create_adapter() {
+        fn assert_wraps_bollard(_: fn(BollardRuntime) -> PodmanRuntime) {}
+        assert_wraps_bollard(PodmanRuntime);
+    }
+}

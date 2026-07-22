@@ -94,8 +94,18 @@ pub(crate) async fn run_with_runtime(
     let mut config = effective.config;
     apply_cli_overrides(&mut config, port_overrides)?;
 
+    let run_args_present = config
+        .run_args
+        .as_ref()
+        .is_some_and(|args| !args.is_empty());
+
     // Docker Compose configs take a completely separate code path.
     if config.is_compose() {
+        if run_args_present {
+            anyhow::bail!(
+                "`runArgs` is not supported for Docker Compose devcontainers in `dev`; put equivalent options on the Compose service definition instead"
+            );
+        }
         return run_compose(
             workspace,
             &config,
@@ -109,6 +119,18 @@ pub(crate) async fn run_with_runtime(
         )
         .await;
     }
+
+    // Validate and translate runArgs before any host-visible side effects:
+    // initializeCommand, existing-container reuse, lockfile writes, image
+    // builds, and container creation must all see the same decision.
+    let run_args: Vec<String> = config
+        .run_args
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|s| substitute_variables_with_user(s, workspace, config.remote_user.as_deref()))
+        .collect();
+    let resolved_run_args = crate::devcontainer::run_args::resolve_run_args(&run_args, workspace)?;
 
     // Run initializeCommand on the host before anything else (Gap 9).
     if let Some(ref init_cmd) = config.initialize_command {
@@ -336,9 +358,14 @@ pub(crate) async fn run_with_runtime(
 
     // Resolve feature capabilities against the image the features produced, before the
     // UID-remap layer below shadows `final_image` with a derived tag.
-    let caps =
+    let mut caps =
         resolve_container_capabilities(runtime, &final_image, &ordered_features, has_features)
             .await?;
+    caps.init |= resolved_run_args.init;
+    caps.privileged |= resolved_run_args.privileged;
+    caps.cap_add.extend(resolved_run_args.cap_add.clone());
+    caps.security_opt
+        .extend(resolved_run_args.security_opt.clone());
 
     // Build container config
     let name = container_name(workspace);
@@ -412,22 +439,11 @@ pub(crate) async fn run_with_runtime(
         .collect();
     let volumes = parse_volumes(&volume_strings);
 
-    // Substitute devcontainer variables in runArgs (e.g. `${localWorkspaceFolder}`)
-    // *before* parsing, so env-file paths resolve against the workspace. The
-    // environment subset of runArgs is translated into container env entries
-    // here; anything outside that subset is rejected before container creation
-    // rather than silently dropped (issue #5: every runArg used to be ignored).
-    let run_args: Vec<String> = config
-        .run_args
-        .as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .map(|s| substitute_variables_with_user(s, workspace, remote_user))
-        .collect();
-    let run_args_env = crate::devcontainer::run_args::resolve_env(&run_args, workspace)?;
-    // runArgs env applies after the effective create-time env map, in runArgs order, with
-    // the last value for a key winning — matching Docker CLI intent.
-    for (k, v) in run_args_env {
+    // `runArgs` env was validated before any side effects. Apply it after the
+    // effective create-time env map. `run_args::resolve_run_args` already
+    // matches Docker CLI precedence by loading all env-files before all
+    // explicit --env/-e entries.
+    for (k, v) in resolved_run_args.env {
         env.insert(k, v);
     }
 
@@ -2794,43 +2810,61 @@ mod tests {
         assert_eq!(env.get("D").map(String::as_str), Some("4"));
     }
 
-    /// Bare env tokens pass through from the host when set and are omitted
-    /// when unset; they must never invent an empty value.
+    /// Bare env tokens pass through from the host when set, but an unset host
+    /// variable fails safely instead of silently leaving the image value in
+    /// place.
     #[tokio::test]
-    async fn up_env_host_passthrough_matches_docker_intent() {
+    async fn up_env_host_passthrough_errors_when_unset() {
         let workspace = TempDir::new().unwrap();
-        unsafe { std::env::set_var("DEV_RUNARGS_UP_HOST_SET", "host-value") };
+        unsafe { std::env::set_var("DEV_RUNARGS_UP_HOST_SET_FOR_UNSET_CASE", "host-value") };
         unsafe { std::env::remove_var("DEV_RUNARGS_UP_HOST_UNSET") };
         write_project_config(
             &workspace,
-            r#"{"image":"ubuntu:24.04","runArgs":["--env","DEV_RUNARGS_UP_HOST_SET","--env","DEV_RUNARGS_UP_HOST_UNSET"]}"#,
+            r#"{"image":"ubuntu:24.04","runArgs":["--env","DEV_RUNARGS_UP_HOST_SET_FOR_UNSET_CASE","--env","DEV_RUNARGS_UP_HOST_UNSET"]}"#,
         );
         let rt = UpFakeRuntime::ok();
-        let result = run_up_with_fake(&rt, &workspace).await;
-        unsafe { std::env::remove_var("DEV_RUNARGS_UP_HOST_SET") };
-        result.expect("up should succeed with host pass-through env tokens");
-
-        let env = rt.created_config().env;
-        assert_eq!(
-            env.get("DEV_RUNARGS_UP_HOST_SET").map(String::as_str),
-            Some("host-value")
-        );
+        let err = run_up_with_fake(&rt, &workspace)
+            .await
+            .expect_err("unset host pass-through env flag must fail safely");
+        unsafe { std::env::remove_var("DEV_RUNARGS_UP_HOST_SET_FOR_UNSET_CASE") };
+        let msg = format!("{err}");
+        assert!(msg.contains("DEV_RUNARGS_UP_HOST_UNSET"), "{msg}");
         assert!(
-            !env.contains_key("DEV_RUNARGS_UP_HOST_UNSET"),
-            "unset pass-through must be omitted, not invented as empty"
+            !rt.create_was_attempted(),
+            "unset host pass-through must fail before container creation"
         );
     }
 
-    /// Precedence: `containerEnv` overlays image env, and `runArgs` env entries
-    /// apply left-to-right with the last value for a key winning. A later
-    /// `--env` must override an earlier env-file entry and `containerEnv`.
     #[tokio::test]
-    async fn up_env_precedence_last_value_wins() {
+    async fn up_env_host_passthrough_uses_set_host_value() {
+        let workspace = TempDir::new().unwrap();
+        unsafe { std::env::set_var("DEV_RUNARGS_UP_HOST_SET_ONLY", "host-value") };
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","runArgs":["--env","DEV_RUNARGS_UP_HOST_SET_ONLY"]}"#,
+        );
+        let rt = UpFakeRuntime::ok();
+        let result = run_up_with_fake(&rt, &workspace).await;
+        unsafe { std::env::remove_var("DEV_RUNARGS_UP_HOST_SET_ONLY") };
+        result.expect("up should succeed with set host pass-through env token");
+
+        let env = rt.created_config().env;
+        assert_eq!(
+            env.get("DEV_RUNARGS_UP_HOST_SET_ONLY").map(String::as_str),
+            Some("host-value")
+        );
+    }
+
+    /// Docker CLI precedence: all env-files are processed first, then all
+    /// `--env`/`-e` entries, regardless of interleaving. Explicit env flags
+    /// override duplicate file values even when the flag appears first.
+    #[tokio::test]
+    async fn up_env_precedence_env_flags_override_env_files() {
         let workspace = TempDir::new().unwrap();
         write_env_file(&workspace, "KEY=from_file\nOTHER=file\n");
         write_project_config(
             &workspace,
-            r#"{"image":"ubuntu:24.04","containerEnv":{"KEY":"from_container_env"},"runArgs":["--env-file","${localWorkspaceFolder}/.devcontainer/.env","--env","KEY=from_flag"]}"#,
+            r#"{"image":"ubuntu:24.04","containerEnv":{"KEY":"from_container_env"},"remoteEnv":{"REMOTE_ONLY":"from_remote_env"},"runArgs":["--env","KEY=from_flag","--env-file","${localWorkspaceFolder}/.devcontainer/.env"]}"#,
         );
         let rt = UpFakeRuntime::ok();
         run_up_with_fake(&rt, &workspace)
@@ -2838,9 +2872,39 @@ mod tests {
             .expect("up should succeed with overlapping env sources");
 
         let env = rt.created_config().env;
-        // runArgs --env is last, so it wins over both the env-file and containerEnv.
+        // Explicit env flags override both env-file and Dev's create-time env map.
         assert_eq!(env.get("KEY").map(String::as_str), Some("from_flag"));
         assert_eq!(env.get("OTHER").map(String::as_str), Some("file"));
+        // Existing Dev behavior: remoteEnv is also part of the create-time map.
+        assert_eq!(
+            env.get("REMOTE_ONLY").map(String::as_str),
+            Some("from_remote_env")
+        );
+    }
+
+    /// `--cap-add`, `--security-opt`, `--privileged`, and `--init` are part of
+    /// the supported runArgs subset and map onto existing container-create
+    /// runtime fields.
+    #[tokio::test]
+    async fn up_runtime_option_runargs_reach_container_config() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","runArgs":["--cap-add","SYS_PTRACE","--cap-add=NET_ADMIN","--security-opt","seccomp=unconfined","--security-opt=label=disable","--privileged","--init"]}"#,
+        );
+        let rt = UpFakeRuntime::ok();
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("supported runtime option runArgs should create successfully");
+
+        let created = rt.created_config();
+        assert_eq!(created.cap_add, vec!["SYS_PTRACE", "NET_ADMIN"]);
+        assert_eq!(
+            created.security_opt,
+            vec!["seccomp=unconfined", "label=disable"]
+        );
+        assert!(created.privileged);
+        assert!(created.init);
     }
 
     /// Repeated env files apply left-to-right; the last file's value for a key
@@ -2943,7 +3007,7 @@ mod tests {
         );
     }
 
-    /// A runArg outside the supported environment subset must fail before
+    /// A runArg outside the supported subset must fail before
     /// container creation with an error naming the unsupported flag, rather
     /// than being silently ignored (issue #5: every runArg was dropped).
     #[tokio::test]
@@ -2965,6 +3029,77 @@ mod tests {
         assert!(
             !rt.create_was_attempted(),
             "unsupported runArg must fail before container creation"
+        );
+    }
+
+    /// Unsupported runArgs must be validated before initializeCommand can make
+    /// host-visible changes.
+    #[tokio::test]
+    async fn up_unsupported_runarg_fails_before_initialize_command() {
+        let workspace = TempDir::new().unwrap();
+        let marker = workspace.path().join("initialized");
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","initializeCommand":"touch initialized","runArgs":["--network","host"]}"#,
+        );
+        let rt = UpFakeRuntime::ok();
+        let err = run_up_with_fake(&rt, &workspace)
+            .await
+            .expect_err("unsupported runArgs must fail before initializeCommand");
+        let msg = format!("{err}");
+        assert!(msg.contains("--network"), "{msg}");
+        assert!(
+            !marker.exists(),
+            "initializeCommand must not run before runArgs validation"
+        );
+    }
+
+    /// Existing-container fast paths must not bypass runArgs validation.
+    #[tokio::test(start_paused = true)]
+    async fn up_unsupported_runarg_fails_for_existing_running_container() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","runArgs":["--network","host"]}"#,
+        );
+        let rt = UpFakeRuntime::ok().already_running(workspace.path(), &config_path);
+        let err = run_up_with_fake(&rt, &workspace)
+            .await
+            .expect_err("existing-container path must still validate runArgs");
+        let msg = format!("{err}");
+        assert!(msg.contains("--network"), "{msg}");
+        assert!(
+            rt.created_config.lock().unwrap().is_none(),
+            "existing container must not be recreated during validation failure"
+        );
+    }
+
+    /// Compose projects have a separate runtime path; non-empty runArgs must
+    /// fail explicitly instead of being silently ignored or passed to docker
+    /// compose indirectly.
+    #[tokio::test]
+    async fn compose_project_with_runargs_fails_with_compose_guidance() {
+        let workspace = TempDir::new().unwrap();
+        let devcontainer_dir = workspace.path().join(".devcontainer");
+        fs::create_dir_all(&devcontainer_dir).unwrap();
+        fs::write(
+            devcontainer_dir.join("compose.yml"),
+            "services:\n  app:\n    image: ubuntu:24.04\n",
+        )
+        .unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"dockerComposeFile":"compose.yml","service":"app","runArgs":["--env","A=1"]}"#,
+        );
+        let rt = UpFakeRuntime::ok();
+        let err = run_up_with_fake(&rt, &workspace)
+            .await
+            .expect_err("compose runArgs must fail explicitly before compose commands");
+        let msg = format!("{err}");
+        assert!(msg.contains("runArgs"), "{msg}");
+        assert!(
+            msg.contains("Compose") || msg.contains("compose"),
+            "error should direct users to compose service configuration: {msg}"
         );
     }
 

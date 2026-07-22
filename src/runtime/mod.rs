@@ -82,8 +82,8 @@ pub struct ContainerConfig {
     /// subdirectory of it.
     pub workspace_folder: Option<String>,
     /// Leftover raw `runArgs` after variable substitution. Now always empty:
-    /// the environment subset of `runArgs` is translated into [`Self::env`] by
-    /// `devcontainer::run_args` before container creation, and every other
+    /// the supported subset of `runArgs` is translated into create-time fields
+    /// by `devcontainer::run_args` before container creation, and every other
     /// flag is rejected (issue #5 — `runArgs` used to be silently dropped).
     /// Retained so the struct stays a plain data bag the runtime tests build.
     #[allow(dead_code)]

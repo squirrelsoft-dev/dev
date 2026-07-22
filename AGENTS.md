@@ -24,10 +24,10 @@
   concatenate with dedup (`merge_array`), but `runArgs` concatenates **without** dedup
   (`merge_array_concat`) because repeated flags like `--env-file` are legitimate and
   order matters. Don't move `runArgs` back into the dedup path.
-- `runArgs` is translated in `src/devcontainer/run_args.rs` (env subset only:
-  `--env-file`/`--env`/`-e`) and merged into `ContainerConfig.env` in `src/commands/up.rs`
-  after `containerEnv`; every other flag is rejected before container creation. Both Docker
-  and Podman send the same bollard create body (`BollardRuntime::to_create_body`); Podman
+- `runArgs` is translated in `src/devcontainer/run_args.rs` (supported create-time subset:
+  env file/env flags plus `--cap-add`, `--security-opt`, `--privileged`, `--init`) and
+  applied in `src/commands/up.rs` before container creation. Every other flag is rejected
+  before side effects. Both Docker and Podman send the same bollard create body; Podman
   wraps `BollardRuntime`. `extra_args` on `ContainerConfig` is now always empty (kept for
   struct compatibility).
 

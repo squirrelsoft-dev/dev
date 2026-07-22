@@ -233,10 +233,13 @@ Docker Compose (`dockerComposeFile`) is supported for the full lifecycle — bui
 
 `devcontainer.json`'s `runArgs` is a list of Docker/Podman `run` flags. `dev`
 does not shell out to `docker run`, so it cannot pass arbitrary CLI flags
-through to the daemon. Instead it translates a **supported environment subset**
-of `runArgs` into the container-create request, and rejects every other flag
-*before* container creation with an actionable error — no `runArg` is ever
-silently ignored. (See [issue #5](https://github.com/squirrelsoft-dev/dev/issues/5):
+through to the daemon. Instead it translates a supported subset of `runArgs`
+into existing container-create fields, and rejects every other flag *before*
+host lifecycle commands, image builds, lockfile writes, existing-container
+reuse, or container creation with an actionable error. Docker Compose
+(`dockerComposeFile`) projects use Compose service configuration instead, so
+non-empty `runArgs` fails with Compose-specific guidance. (See
+[issue #5](https://github.com/squirrelsoft-dev/dev/issues/5):
 previously every `runArg` was parsed and then dropped.)
 
 ### Supported flags
@@ -246,11 +249,14 @@ previously every `runArg` was parsed and then dropped.)
 | `--env-file` | `--env-file PATH`, `--env-file=PATH` | env entries read from the file |
 | `--env` | `--env KEY=VALUE`, `--env=KEY=VALUE` | a `KEY=VALUE` env entry |
 | `-e` | `-e KEY=VALUE`, `-eKEY=VALUE` | a `KEY=VALUE` env entry |
+| `--cap-add` | `--cap-add VALUE`, `--cap-add=VALUE` | HostConfig `CapAdd` entries |
+| `--security-opt` | `--security-opt VALUE`, `--security-opt=VALUE` | HostConfig `SecurityOpt` entries |
+| `--privileged` | `--privileged` only | HostConfig `Privileged=true` |
+| `--init` | `--init` only | HostConfig `Init=true` |
 
-Repeated env files and env flags are processed left-to-right. Anything outside
-this subset fails before the container is created, naming the unsupported flag
-and pointing at the first-class devcontainer property to use instead (for
-example `forwardPorts`, `mounts`, `containerEnv`, or `capAdd`).
+Repeated env files, env flags, capabilities, and security options are
+preserved. Boolean assignments such as `--init=true` and `--privileged=false`
+are rejected; use the bare flag.
 
 ### The reporter's configuration
 
@@ -264,6 +270,10 @@ and Podman:
 `${localWorkspaceFolder}` is substituted *before* the file is opened, so the
 path resolves against the workspace just as it does in your editor.
 
+On versions before this fix, the direct workaround for issue #5 is to move the
+values into `containerEnv` or start the container through an editor/Docker CLI
+path that already honors `runArgs`.
+
 ### Env-file format
 
 Env files are parsed with Docker-compatible behavior (matching `docker/cli`'s
@@ -275,22 +285,33 @@ Env files are parsed with Docker-compatible behavior (matching `docker/cli`'s
 - blank lines and lines whose first non-blank character is `#` are ignored;
 - `KEY=VALUE` keeps the value verbatim — there is **no quoting, interpolation,
   or escaping** (quotes are part of the value);
-- a bare `KEY` (no `=`) passes the host environment variable through: if it is
-  set on the host it becomes `KEY=value`, and if it is unset the key is
-  **omitted** rather than invented as an empty value;
+- a bare env-file `KEY` (no `=`) passes the host environment variable through:
+  if it is set on the host it becomes `KEY=value`, and if it is unset the key
+  is **omitted** rather than invented as an empty value;
 - a key may not be empty or contain whitespace.
 
 Relative env-file paths resolve against the workspace folder — the `dev`
 equivalent of the directory `docker run` is invoked from.
 
+For `--env KEY` / `-e KEY`, Dev uses the host value when `KEY` is set. If it is
+unset, Dev fails with a precise error instead of forwarding a bare key, because
+the daemon API path cannot safely represent Docker CLI's "explicitly unset this
+key" behavior without accidentally leaving an image-provided value in place.
+
 ### Precedence
 
-Environment is applied in this order, with the last value for a key winning
-(matching Docker CLI intent):
+Environment is applied in this order, with the last value for a key winning:
 
 1. the image's own environment (lowest);
 2. `dev`'s effective `containerEnv` overlays it;
-3. env-file and `--env`/`-e` entries from `runArgs`, in `runArgs` order.
+3. Dev's current create-time `remoteEnv` layer overlays `containerEnv`;
+4. all `--env-file` entries from `runArgs`, in their relative order;
+5. all explicit `--env`/`-e` entries from `runArgs`, in their relative order.
+
+This matches Docker CLI precedence for env files and explicit env flags:
+explicit `--env`/`-e` entries override duplicate env-file values even if the
+flag appears before the file in `runArgs`. `remoteEnv` is documented here as
+Dev's current create-time behavior; changing that is outside this issue.
 
 ### Failure behavior
 
@@ -302,13 +323,16 @@ error never includes env-file contents or secret values — only the variable
 ### Workaround for unsupported flags
 
 If you need a flag `dev` does not yet translate, use the equivalent
-first-class devcontainer property. Common mappings:
+first-class devcontainer property where one exists. Common mappings:
 
 | `runArgs` flag | First-class devcontainer property |
 |----------------|-----------------------------------|
 | `--network` | (no equivalent yet — file an issue) |
 | `--add-host` | (no equivalent yet — file an issue) |
-| `--cap-add` | `capAdd` / `containerEnv`-adjacent capabilities config |
+| `--cap-add` | supported directly in `runArgs` |
+| `--security-opt` | supported directly in `runArgs` |
+| `--privileged` | supported directly in `runArgs` |
+| `--init` | supported directly in `runArgs` |
 | `--publish` | `forwardPorts` |
 | `--volume` / `--mount` | `mounts` / `volumes` |
 

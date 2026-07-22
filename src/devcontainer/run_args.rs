@@ -1,26 +1,29 @@
-//! Translate the environment subset of `devcontainer.json` `runArgs` into
-//! container-create env entries.
+//! Translate the supported subset of `devcontainer.json` `runArgs` into
+//! container-create fields.
 //!
 //! Background — issue #5: `runArgs` was parsed into `config.run_args` and mapped
 //! to `ContainerConfig.extra_args`, but `extra_args` was never consumed by any
 //! runtime's create path. Every runArg — `--env-file`, `--env`, `--network`,
-//! … — was silently dropped. This module restores the environment-related
-//! subset and rejects everything else before container creation, so no runArg
-//! is ever silently ignored.
+//! … — was silently dropped. This module restores the supported subset and
+//! rejects everything else before side effects, so no applicable runArg is ever
+//! silently ignored.
 //!
 //! ## Supported subset
 //!
 //! - `--env-file PATH` and `--env-file=PATH`
 //! - `--env KEY=VALUE`, `--env=KEY=VALUE`, `-e KEY=VALUE`, and `-eKEY=VALUE`
-//! - repeated env files and env flags, processed left-to-right
+//! - `--cap-add VALUE`, `--cap-add=VALUE`
+//! - `--security-opt VALUE`, `--security-opt=VALUE`
+//! - bare `--privileged` and `--init`
 //!
-//! ## Precedence (last value for a key wins)
+//! ## Environment precedence (last value for a key wins)
 //!
-//! Image environment is lowest; Dev's effective `containerEnv` overlays it;
-//! env-file and `--env` entries from `runArgs` apply in `runArgs` order. The
-//! caller inserts the ordered entries returned here into the env map after
-//! `containerEnv`, so the last occurrence of a key wins — matching Docker CLI
-//! intent.
+//! Image environment is lowest; Dev's effective create-time env map overlays it.
+//! Docker CLI then processes all env files in their relative order before every
+//! explicit `--env`/`-e` entry in its relative order, regardless of interleaving.
+//! The caller inserts the ordered entries returned here into the env map after
+//! Dev's create-time env map, so explicit env flags override duplicate file
+//! values.
 //!
 //! ## Env-file format
 //!
@@ -31,9 +34,9 @@
 //! - blank lines and lines whose first character is `#` are ignored;
 //! - `KEY=VALUE` keeps the value as-is (no quoting, interpolation, or
 //!   escaping — quotes are part of the value);
-//! - a bare `KEY` (no `=`) passes the host environment variable through: if the
-//!   host var is set it becomes `KEY=value`, and if it is unset the key is
-//!   omitted rather than invented as an empty value;
+//! - a bare env-file `KEY` (no `=`) passes the host environment variable
+//!   through: if the host var is set it becomes `KEY=value`, and if it is unset
+//!   the key is omitted rather than invented as an empty value;
 //! - a key may not be empty or contain whitespace.
 //!
 //! Relative env-file paths resolve against the workspace folder — the dev
@@ -43,43 +46,91 @@
 use crate::error::DevError;
 use std::path::{Path, PathBuf};
 
-/// A parsed env entry: `(key, value)`. Ordered lists of these are merged
-/// left-to-right by the caller so the last value for a key wins.
+/// A parsed env entry: `(key, value)`. The returned list is already ordered by
+/// Docker CLI precedence, so later entries win when inserted into a map.
 pub type EnvEntry = (String, String);
 
-/// Translate the environment subset of `runArgs` into ordered env entries.
-///
-/// `args` are the already-variable-substituted runArgs (so
-/// `${localWorkspaceFolder}` has expanded before any file is read). Relative
-/// env-file paths resolve against `workspace`. Anything outside the supported
-/// environment subset returns an error naming the unsupported flag.
-pub fn resolve_env(args: &[String], workspace: &Path) -> Result<Vec<EnvEntry>, DevError> {
-    let mut out: Vec<EnvEntry> = Vec::new();
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolvedRunArgs {
+    pub env: Vec<EnvEntry>,
+    pub cap_add: Vec<String>,
+    pub security_opt: Vec<String>,
+    pub privileged: bool,
+    pub init: bool,
+}
+
+/// Validate and translate the supported `runArgs` subset into the existing
+/// container-create fields Dev already carries.
+pub fn resolve_run_args(args: &[String], workspace: &Path) -> Result<ResolvedRunArgs, DevError> {
+    let mut env_file_entries: Vec<EnvEntry> = Vec::new();
+    let mut env_flag_entries: Vec<EnvEntry> = Vec::new();
+    let mut resolved = ResolvedRunArgs::default();
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
         if let Some(path) = arg.strip_prefix("--env-file=") {
-            read_env_file_into(&mut out, &resolve_env_file_path(path, workspace))?;
+            let path = non_empty_inline_value(arg, path, "--env-file")?;
+            read_env_file_into(
+                &mut env_file_entries,
+                &resolve_env_file_path(path, workspace),
+            )?;
         } else if arg == "--env-file" {
             let path = next_value(args, &mut i, arg, "--env-file")?;
-            read_env_file_into(&mut out, &resolve_env_file_path(&path, workspace))?;
+            reject_empty_value(arg, &path, "--env-file")?;
+            read_env_file_into(
+                &mut env_file_entries,
+                &resolve_env_file_path(&path, workspace),
+            )?;
         } else if let Some(rest) = arg.strip_prefix("--env=") {
-            push_env_token(&mut out, rest)?;
+            push_env_flag_token(&mut env_flag_entries, rest)?;
         } else if arg == "--env" {
             let token = next_value(args, &mut i, arg, "--env")?;
-            push_env_token(&mut out, &token)?;
+            push_env_flag_token(&mut env_flag_entries, &token)?;
         } else if arg == "-e" {
             let token = next_value(args, &mut i, arg, "-e")?;
-            push_env_token(&mut out, &token)?;
-        } else if let Some(rest) = arg.strip_prefix("-e") {
-            // `-eKEY=VALUE` (attached) — only when something follows `-e`.
-            push_env_token(&mut out, rest)?;
+            push_env_flag_token(&mut env_flag_entries, &token)?;
+        } else if arg.starts_with("-env") {
+            return Err(unsupported_flag_error(arg));
+        } else if let Some(rest) = arg.strip_prefix("-e")
+            && !rest.is_empty()
+            && !rest.starts_with('-')
+        {
+            push_env_flag_token(&mut env_flag_entries, rest)?;
+        } else if let Some(value) = arg.strip_prefix("--cap-add=") {
+            resolved
+                .cap_add
+                .push(non_empty_inline_value(arg, value, "--cap-add")?.to_string());
+        } else if arg == "--cap-add" {
+            let value = next_value(args, &mut i, arg, "--cap-add")?;
+            reject_empty_value(arg, &value, "--cap-add")?;
+            resolved.cap_add.push(value);
+        } else if let Some(value) = arg.strip_prefix("--security-opt=") {
+            resolved
+                .security_opt
+                .push(non_empty_inline_value(arg, value, "--security-opt")?.to_string());
+        } else if arg == "--security-opt" {
+            let value = next_value(args, &mut i, arg, "--security-opt")?;
+            reject_empty_value(arg, &value, "--security-opt")?;
+            resolved.security_opt.push(value);
+        } else if arg == "--privileged" {
+            resolved.privileged = true;
+        } else if arg.starts_with("--privileged=") {
+            return Err(boolean_assignment_error(arg, "--privileged"));
+        } else if arg == "--init" {
+            resolved.init = true;
+        } else if arg.starts_with("--init=") {
+            return Err(boolean_assignment_error(arg, "--init"));
         } else {
             return Err(unsupported_flag_error(arg));
         }
         i += 1;
     }
-    Ok(out)
+    // Docker CLI reads every env-file first, then applies every explicit
+    // --env/-e value after, regardless of interleaving. Preserve relative
+    // order within each group.
+    resolved.env = env_file_entries;
+    resolved.env.extend(env_flag_entries);
+    Ok(resolved)
 }
 
 /// Fetch the value token that follows a two-token flag, advancing the index so
@@ -98,6 +149,28 @@ fn next_value(
         )))
 }
 
+fn non_empty_inline_value<'a>(
+    flag: &str,
+    value: &'a str,
+    flag_name: &str,
+) -> Result<&'a str, DevError> {
+    if value.is_empty() {
+        return Err(DevError::InvalidConfig(format!(
+            "`runArgs` flag `{flag}` is missing its value; `{flag_name}` expects a non-empty value"
+        )));
+    }
+    Ok(value)
+}
+
+fn reject_empty_value(flag: &str, value: &str, flag_name: &str) -> Result<(), DevError> {
+    if value.is_empty() {
+        return Err(DevError::InvalidConfig(format!(
+            "`runArgs` flag `{flag}` is missing its value; `{flag_name}` expects a non-empty value"
+        )));
+    }
+    Ok(())
+}
+
 /// Resolve an env-file path: absolute paths are used as-is; relative paths
 /// resolve against the workspace folder.
 fn resolve_env_file_path(path: &str, workspace: &Path) -> PathBuf {
@@ -111,28 +184,33 @@ fn resolve_env_file_path(path: &str, workspace: &Path) -> PathBuf {
 
 /// Parse a single `--env`/`-e` token (`KEY=VALUE` or bare `KEY`) and append it.
 ///
-/// Matches `docker/cli` `opts.ValidateEnv`: an empty key is invalid; a bare
-/// `KEY` passes the host variable through (set → `KEY=value`, unset → omitted,
-/// never invented as empty).
-fn push_env_token(out: &mut Vec<EnvEntry>, token: &str) -> Result<(), DevError> {
+/// Docker forwards a bare unset `KEY` to the daemon; Dev fails safely instead
+/// because the daemon API representation cannot express "explicitly unset this
+/// key" without risking silently leaving an image value in place.
+fn push_env_flag_token(out: &mut Vec<EnvEntry>, token: &str) -> Result<(), DevError> {
     if let Some((key, value)) = token.split_once('=') {
         if key.is_empty() {
-            return Err(DevError::InvalidConfig(format!(
-                "invalid `runArgs` environment variable: empty name in `{token}`"
-            )));
+            return Err(DevError::InvalidConfig(
+                "invalid `runArgs` environment variable: empty name in `--env`/`-e` argument"
+                    .to_string(),
+            ));
         }
         out.push((key.to_string(), value.to_string()));
         return Ok(());
     }
-    // Bare `KEY` — host pass-through. Do not invent a value when unset.
+    // Bare `KEY` — host pass-through. Fail safely when unset so Dev does not
+    // silently leave an image-provided value in place.
     if token.is_empty() {
         return Err(DevError::InvalidConfig(
             "invalid `runArgs` environment variable: cannot be empty".to_string(),
         ));
     }
-    if let Ok(value) = std::env::var(token) {
-        out.push((token.to_string(), value));
-    }
+    let value = std::env::var(token).map_err(|_| {
+        DevError::InvalidConfig(format!(
+            "`runArgs` environment variable `{token}` uses host pass-through, but `{token}` is unset on the host; set it explicitly as `{token}=VALUE` or define it in `containerEnv`"
+        ))
+    })?;
+    out.push((token.to_string(), value));
     Ok(())
 }
 
@@ -259,16 +337,23 @@ fn parse_env_file_lines(content: &str) -> impl Iterator<Item = &str> + '_ {
         .map(|line| line.strip_suffix('\r').unwrap_or(line))
 }
 
-/// Build the error for a runArg outside the supported environment subset.
+/// Build the error for a runArg outside the supported subset.
 fn unsupported_flag_error(flag: &str) -> DevError {
     // Strip a trailing `=value` so the message names the flag itself.
     let name = flag.split_once('=').map(|(n, _)| n).unwrap_or(flag);
     DevError::InvalidConfig(format!(
-        "unsupported `runArgs` flag `{name}`: `dev` only translates the environment subset of \
-         `runArgs` into the container create request — `--env-file`, `--env`, and `-e`. \
+        "unsupported `runArgs` flag `{name}`: `dev` translates only the documented \
+         `runArgs` subset into the container create request: `--env-file`, `--env`, `-e`, \
+         `--cap-add`, `--security-opt`, `--privileged`, and `--init`. \
          Other Docker/Podman CLI flags have no direct daemon-API equivalent here; use the \
-         equivalent first-class devcontainer property instead (for example `forwardPorts`, \
-         `mounts`, `containerEnv`, or `capAdd`). See the README `runArgs` support matrix."
+         equivalent first-class devcontainer property where Dev implements one (for example \
+         `forwardPorts`, `mounts`, or `containerEnv`). See the README `runArgs` support matrix."
+    ))
+}
+
+fn boolean_assignment_error(flag: &str, flag_name: &str) -> DevError {
+    DevError::InvalidConfig(format!(
+        "`runArgs` flag `{flag}` is not supported: `{flag_name}` is a boolean flag and must be supplied without `=VALUE`"
     ))
 }
 
@@ -279,7 +364,7 @@ mod tests {
 
     fn resolve(args: &[&str], workspace: &Path) -> Result<Vec<EnvEntry>, DevError> {
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        resolve_env(&args, workspace)
+        resolve_run_args(&args, workspace).map(|resolved| resolved.env)
     }
 
     fn env_map(entries: &[EnvEntry]) -> std::collections::HashMap<String, String> {
@@ -340,8 +425,29 @@ mod tests {
     #[test]
     fn env_flag_empty_name_is_rejected() {
         let ws = PathBuf::from("/ws");
-        let err = resolve(&["--env", "=value"], &ws).unwrap_err();
-        assert!(format!("{err}").contains("empty name"));
+        let err = resolve(&["--env", "=super-secret"], &ws).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("empty name"));
+        assert!(
+            !msg.contains("super-secret"),
+            "inline env errors must not leak values: {msg}"
+        );
+    }
+
+    #[test]
+    fn env_flag_bare_key_errors_when_host_var_is_unset() {
+        let ws = PathBuf::from("/ws");
+        unsafe { std::env::remove_var("DEV_RUNARGS_UNSET_FLAG") };
+        let err = resolve(&["--env", "DEV_RUNARGS_UNSET_FLAG"], &ws).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("DEV_RUNARGS_UNSET_FLAG"),
+            "error should name the missing host variable: {msg}"
+        );
+        assert!(
+            msg.contains("unset"),
+            "error should explain the host variable is unset: {msg}"
+        );
     }
 
     #[test]
@@ -350,6 +456,26 @@ mod tests {
         let e = resolve(&["--env", "K=1", "--env", "K=2", "-eK=3"], &ws).unwrap();
         // Last value for a key wins after merging.
         assert_eq!(env_map(&e).get("K").map(String::as_str), Some("3"));
+    }
+
+    #[test]
+    fn env_flags_override_env_files_even_when_flags_come_first() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("vars.env"), "K=file\nOTHER=file\n").unwrap();
+        let e = resolve(
+            &[
+                "--env",
+                "K=flag",
+                "--env-file",
+                tmp.path().join("vars.env").to_str().unwrap(),
+            ],
+            tmp.path(),
+        )
+        .unwrap();
+
+        let map = env_map(&e);
+        assert_eq!(map.get("K").map(String::as_str), Some("flag"));
+        assert_eq!(map.get("OTHER").map(String::as_str), Some("file"));
     }
 
     #[test]
@@ -385,8 +511,71 @@ mod tests {
     #[test]
     fn bare_dash_flag_is_unsupported() {
         let ws = PathBuf::from("/ws");
-        let err = resolve(&["--privileged"], &ws).unwrap_err();
-        assert!(format!("{err}").contains("--privileged"));
+        let err = resolve(&["--network"], &ws).unwrap_err();
+        assert!(format!("{err}").contains("--network"));
+    }
+
+    #[test]
+    fn malformed_attached_env_spellings_are_not_reinterpreted() {
+        let ws = PathBuf::from("/ws");
+        let err = resolve(&["-envFOO=bar"], &ws).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("-envFOO"), "names original flag: {msg}");
+        assert!(
+            msg.contains("unsupported `runArgs` flag"),
+            "malformed -e spelling must be rejected as an unsupported argument: {msg}"
+        );
+
+        let err = resolve(&["-e-file", "vars.env"], &ws).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("-e-file"), "names original flag: {msg}");
+        assert!(
+            !msg.contains("vars.env"),
+            "must not shift the unsupported boundary to the next token: {msg}"
+        );
+    }
+
+    #[test]
+    fn cap_security_and_boolean_flags_are_accepted_by_resolved_run_args() {
+        let ws = PathBuf::from("/ws");
+        let args: Vec<String> = [
+            "--cap-add",
+            "SYS_PTRACE",
+            "--cap-add=NET_ADMIN",
+            "--security-opt",
+            "seccomp=unconfined",
+            "--security-opt=label=disable",
+            "--privileged",
+            "--init",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let resolved = super::resolve_run_args(&args, &ws).unwrap();
+        assert_eq!(resolved.cap_add, vec!["SYS_PTRACE", "NET_ADMIN"]);
+        assert_eq!(
+            resolved.security_opt,
+            vec!["seccomp=unconfined", "label=disable"]
+        );
+        assert!(resolved.privileged);
+        assert!(resolved.init);
+    }
+
+    #[test]
+    fn capability_flags_require_values_and_boolean_flags_reject_assignments() {
+        let ws = PathBuf::from("/ws");
+        let err = super::resolve_run_args(&["--cap-add".to_string()], &ws).unwrap_err();
+        assert!(format!("{err}").contains("--cap-add"));
+
+        let err = super::resolve_run_args(&["--security-opt=".to_string()], &ws).unwrap_err();
+        assert!(format!("{err}").contains("--security-opt"));
+
+        let err = super::resolve_run_args(&["--privileged=false".to_string()], &ws).unwrap_err();
+        assert!(format!("{err}").contains("--privileged=false"));
+
+        let err = super::resolve_run_args(&["--init=true".to_string()], &ws).unwrap_err();
+        assert!(format!("{err}").contains("--init=true"));
     }
 
     // ---- env-file parsing (pure) ----
