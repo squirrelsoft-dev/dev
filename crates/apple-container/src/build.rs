@@ -3,7 +3,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::Path;
 
 use crate::error::AppleContainerError;
-use crate::models::{ContainerSnapshot, RuntimeStatus};
+use crate::models::{ContainerListing, ContainerSnapshot, RuntimeStatus, decode_snapshots};
 use crate::routes::{IMAGE_SERVICE_NAME, ImageRoute, XpcKey, XpcRoute};
 use crate::xpc::connection::XpcConnection;
 use crate::xpc::message::XpcMessage;
@@ -252,10 +252,12 @@ pub async fn build_image(
 
 /// Turn a value the environment supplied into a gRPC header value.
 ///
-/// The build's context path and tag both become headers, and a header may not
-/// carry a line break or a NUL. A directory name may — a newline in a folder
-/// name is unusual but perfectly legal — so a workspace under such a path has
-/// to be reported rather than panicked on.
+/// The build's context path and tag both become headers, and this header type
+/// carries printable ASCII only: a line break, a NUL and every byte above 0x7f
+/// are all refused. A directory name may hold any of them — a newline in a
+/// folder name is unusual but legal, and an accented or CJK folder name is
+/// ordinary — so a workspace under such a path has to be reported rather than
+/// panicked on, and reported for the reason that actually applies.
 fn header_value(
     name: &str,
     value: &str,
@@ -263,7 +265,8 @@ fn header_value(
     value.parse().map_err(|_| {
         AppleContainerError::XpcError(format!(
             "the build's {name} ({value:?}) cannot be sent to the builder: \
-             a gRPC header may not carry a line break or a NUL"
+             a gRPC header carries printable ASCII only, so it may not hold a line break, \
+             a NUL, or a character outside ASCII"
         ))
     })
 }
@@ -481,7 +484,7 @@ async fn process_build_stream(
 
     let mut session = BuildSession {
         context,
-        resolved: None,
+        resolved: Vec::new(),
         pulled: Vec::new(),
         unanswered: HashSet::new(),
     };
@@ -560,9 +563,15 @@ async fn process_build_stream(
 /// State carried across one `PerformBuild` stream.
 struct BuildSession<'a> {
     context: &'a Path,
-    /// The base image most recently resolved, used to populate the local
-    /// content store when the builder asks for a blob we do not have yet.
-    resolved: Option<ResolvedImage>,
+    /// Every base image resolved for this build, in the order the frontend
+    /// resolved them, used to populate the local content store when the builder
+    /// asks for a blob we do not have yet.
+    ///
+    /// A list rather than a slot because the Dockerfile frontend resolves every
+    /// stage's `FROM` before any content-store request is issued: a single slot
+    /// leaves only the last stage's image, and a blob belonging to an earlier
+    /// stage is then looked for in an image that was never going to hold it.
+    resolved: Vec<ResolvedImage>,
     /// References already pulled for this build, so a blob that is genuinely
     /// missing cannot send us pulling the same image over and over.
     pulled: Vec<String>,
@@ -572,6 +581,7 @@ struct BuildSession<'a> {
 }
 
 /// A base image the builder asked us to resolve.
+#[derive(Clone, PartialEq, Eq)]
 struct ResolvedImage {
     reference: String,
     platform: String,
@@ -833,7 +843,7 @@ async fn handle_walk(
     context: &Path,
 ) -> Result<(), AppleContainerError> {
     let filter = fssync::ContextFilter::from_metadata(&transfer.metadata);
-    let prepared = match prepare_walk(context, &filter, &transfer.metadata).await {
+    let prepared = match prepare_walk(builder, context, &filter, &transfer.metadata).await {
         Ok(prepared) => prepared,
         Err(e) => {
             // The failure to report is never more informative than the failure
@@ -865,6 +875,7 @@ async fn handle_walk(
 /// Both walk the tree and read every selected file, so they run on the
 /// blocking pool rather than on a runtime worker.
 async fn prepare_walk(
+    builder: &BuilderSink,
     context: &Path,
     filter: &fssync::ContextFilter,
     metadata: &HashMap<String, String>,
@@ -872,7 +883,7 @@ async fn prepare_walk(
     fssync::require_tar_walk_mode(metadata)?;
     let context = context.to_path_buf();
     let filter = filter.clone();
-    blocking(move || {
+    blocking(builder.idle, move || {
         let entries = fssync::collect_context(&context, &filter)?;
         let checksum = fssync::context_tar_checksum(&entries)?;
         Ok((entries, checksum))
@@ -1045,13 +1056,31 @@ async fn send_archive_chunks(
     Ok(pending)
 }
 
-/// Run blocking filesystem work off the runtime's worker threads.
-async fn blocking<T, F>(work: F) -> Result<T, AppleContainerError>
+/// Run blocking filesystem work off the runtime's worker threads, bounded.
+///
+/// Every one of these calls reads the build context, and the context can sit on
+/// a mount that stops answering — a stalled virtiofs or NFS share, a device
+/// that never returns. Without a deadline the awaiting task never yields, so
+/// `process_build_stream` stops polling the builder's stream and the idle
+/// budget that exists to catch exactly this can never fire: the build hangs
+/// forever with nothing said, on both sides.
+///
+/// As everywhere else in this file, the deadline frees the build rather than
+/// the thread — `spawn_blocking` work already inside a filesystem call cannot
+/// be reclaimed — so it is the caller that stops waiting.
+async fn blocking<T, F>(idle: std::time::Duration, work: F) -> Result<T, AppleContainerError>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T, AppleContainerError> + Send + 'static,
 {
-    join_blocking(tokio::task::spawn_blocking(work)).await
+    let handle = tokio::task::spawn_blocking(work);
+    match tokio::time::timeout(idle, join_blocking(handle)).await {
+        Ok(done) => done,
+        Err(_) => Err(AppleContainerError::XpcError(format!(
+            "the build context did not answer within {}s; giving up on the build",
+            idle.as_secs()
+        ))),
+    }
 }
 
 /// Unwrap the two error layers a blocking task can fail with.
@@ -1087,7 +1116,10 @@ async fn handle_read(
     let requested = fssync_read_length(window.length);
 
     let (context, named) = (context.to_path_buf(), source.to_string());
-    let read = blocking(move || read_context_range(&context, &named, offset, requested)).await;
+    let read = blocking(builder.idle, move || {
+        read_context_range(&context, &named, offset, requested)
+    })
+    .await;
     let data = match read {
         Ok(data) => data,
         Err(e) => {
@@ -1134,21 +1166,16 @@ async fn handle_info(
     build_id: &str,
     context: &Path,
 ) -> Result<(), AppleContainerError> {
-    use std::os::unix::fs::MetadataExt;
-
     let source = transfer.source.as_deref().unwrap_or("");
-    let path = match resolve_stat_path(context, source) {
-        Ok(path) => path,
-        Err(e) => {
-            let message = format!("cannot stat {source}: {e}");
-            return send_fssync_error(builder, build_id, transfer, "Info", &message).await;
-        }
-    };
 
-    // `symlink_metadata` describes the link itself; BuildKit resolves links
-    // on its own side and expects to be told the target.
-    let file = match std::fs::symlink_metadata(&path) {
-        Ok(file) => file,
+    // Every syscall below reads the same context the walk does, so it takes the
+    // same door: canonicalizing and lstat'ing a path on a stalled mount would
+    // otherwise occupy a runtime worker with no await point in it, and the idle
+    // budget wrapping the builder's stream could never fire.
+    let (context, named) = (context.to_path_buf(), source.to_string());
+    let described = blocking(builder.idle, move || stat_context_path(&context, &named)).await;
+    let described = match described {
+        Ok(described) => described,
         Err(e) => {
             // A missing path is routine — BuildKit probes for `.dockerignore`
             // on every build — so report it and let the builder decide.
@@ -1156,6 +1183,33 @@ async fn handle_info(
             return send_fssync_error(builder, build_id, transfer, "Info", &message).await;
         }
     };
+
+    send_build_transfer(
+        builder,
+        build_id,
+        transfer,
+        described.metadata,
+        Vec::new(),
+        true,
+        described.is_dir,
+    )
+    .await
+}
+
+/// What an fssync `Info` reply says about one context path.
+struct StatReply {
+    metadata: HashMap<String, String>,
+    is_dir: bool,
+}
+
+/// Describe a context path the way the shim's `file_info.go` reads it.
+fn stat_context_path(context: &Path, source: &str) -> Result<StatReply, AppleContainerError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let path = resolve_stat_path(context, source)?;
+    // `symlink_metadata` describes the link itself; BuildKit resolves links
+    // on its own side and expects to be told the target.
+    let file = std::fs::symlink_metadata(&path).map_err(AppleContainerError::Io)?;
 
     let mut metadata = fssync_metadata("Info");
     metadata.insert("size".to_string(), file.len().to_string());
@@ -1166,22 +1220,33 @@ async fn handle_info(
     );
     metadata.insert("uid".to_string(), file.uid().to_string());
     metadata.insert("gid".to_string(), file.gid().to_string());
-    if file.is_symlink()
-        && let Ok(target) = std::fs::read_link(&path)
-    {
-        metadata.insert("target".to_string(), target.to_string_lossy().into_owned());
+    if file.is_symlink() {
+        metadata.insert("target".to_string(), link_target(&path, source)?);
     }
 
-    send_build_transfer(
-        builder,
-        build_id,
-        transfer,
+    Ok(StatReply {
         metadata,
-        Vec::new(),
-        true,
-        file.is_dir(),
-    )
-    .await
+        is_dir: file.is_dir(),
+    })
+}
+
+/// Where a symlink points, in the form the shim can read.
+///
+/// Both failures here would otherwise be answered as a symlink carrying *no*
+/// target, which the shim reads as an empty one: a link the builder is then
+/// told points at nothing. A lossy reading is no better — `to_string_lossy`
+/// mints a `U+FFFD` path naming somewhere the link does not point, the same
+/// hazard the walk refuses for entry names — so both are reported and the
+/// builder decides.
+fn link_target(path: &Path, source: &str) -> Result<String, AppleContainerError> {
+    let target = std::fs::read_link(path).map_err(AppleContainerError::Io)?;
+    target.to_str().map(str::to_string).ok_or_else(|| {
+        AppleContainerError::XpcError(format!(
+            "the symbolic link {source} points at {}, which is not valid UTF-8 and cannot be \
+             described to the builder; exclude it with a .dockerignore",
+            target.display()
+        ))
+    })
 }
 
 /// The most payload one reply may carry.
@@ -1364,11 +1429,14 @@ async fn handle_image_resolve(
         })?;
 
     // Remember what this build is based on: if the builder later asks for a
-    // blob the host does not have, this is the image that supplies it.
-    session.resolved = Some(ResolvedImage {
-        reference: reference.clone(),
-        platform: platform_str.clone(),
-    });
+    // blob the host does not have, one of these images supplies it.
+    remember_resolved(
+        &mut session.resolved,
+        ResolvedImage {
+            reference: reference.clone(),
+            platform: platform_str.clone(),
+        },
+    );
 
     let mut metadata = std::collections::HashMap::new();
     metadata.insert("os".to_string(), "linux".to_string());
@@ -1608,7 +1676,7 @@ async fn send_blob_range(
     let wanted = asked_for as usize;
 
     let (blob, at) = (range.path.to_path_buf(), range.offset);
-    let read = blocking(move || content::read_range(&blob, at, wanted)).await;
+    let read = blocking(builder.idle, move || content::read_range(&blob, at, wanted)).await;
     let data = match read {
         Ok(data) => data,
         Err(e) => {
@@ -1687,17 +1755,46 @@ fn content_digest(transfer: &ImageTransfer) -> Option<String> {
         .filter(|digest| !digest.is_empty())
 }
 
-/// Size of a blob, pulling the build's base image first if it is missing.
+/// Record a base image the frontend resolved, keeping the resolve order.
+///
+/// A stage whose `FROM` repeats an earlier one resolves again, and pulling the
+/// same reference twice would only spend the budget twice.
+fn remember_resolved(resolved: &mut Vec<ResolvedImage>, image: ResolvedImage) {
+    if !resolved.contains(&image) {
+        resolved.push(image);
+    }
+}
+
+/// The resolved images that could still supply a blob this build is missing.
+///
+/// A reference already pulled cannot supply anything it did not supply then, so
+/// it drops out and a genuinely absent blob fails instead of looping.
+fn unpulled(session: &BuildSession<'_>) -> Vec<ResolvedImage> {
+    session
+        .resolved
+        .iter()
+        .filter(|image| !session.pulled.iter().any(|r| r == &image.reference))
+        .cloned()
+        .collect()
+}
+
+/// Size of a blob, pulling the build's base images first if it is missing.
 ///
 /// The builder only asks the host for content it cannot find in its own cache,
-/// which happens for a base image the daemon has never unpacked. Pulling the
-/// resolved reference populates the daemon's content store, and the pull is
-/// attempted once per reference so a genuinely absent blob fails instead of
-/// looping.
+/// which happens for a base image the daemon has never unpacked. Pulling a
+/// resolved reference populates the daemon's content store, and each reference
+/// is pulled at most once.
 ///
-/// Why the pull failed is what the user needs: a registry auth, network or
+/// Which resolved image holds the blob is not knowable from the digest, and a
+/// multi-stage build resolves every stage's `FROM` before the first blob is
+/// asked for — so each candidate is tried in resolve order until the blob
+/// appears rather than only the one resolved most recently, which for
+/// `FROM golang … FROM alpine` would be alpine for every golang layer.
+///
+/// Why the pulls failed is what the user needs: a registry auth, network or
 /// rate-limit failure reported as "not in the local content store" points at
-/// the wrong subsystem entirely.
+/// the wrong subsystem entirely, so every candidate's failure is carried into
+/// the error rather than discarded on the way to the next one.
 async fn ensure_blob(
     digest: &str,
     session: &mut BuildSession<'_>,
@@ -1706,27 +1803,54 @@ async fn ensure_blob(
         return Ok(size);
     }
 
-    let Some(resolved) = session.resolved.as_ref() else {
+    if session.resolved.is_empty() {
         return Err(AppleContainerError::XpcError(format!(
             "blob {digest} is not in the local content store and the build has resolved no \
              base image to pull it from"
         )));
-    };
-    if session.pulled.iter().any(|r| r == &resolved.reference) {
+    }
+    let candidates = unpulled(session);
+    if candidates.is_empty() {
         return Err(AppleContainerError::XpcError(format!(
-            "blob {digest} is still not in the local content store after pulling {}",
-            resolved.reference
+            "blob {digest} is still not in the local content store after pulling every base \
+             image this build resolved ({})",
+            session.pulled.join(", ")
         )));
     }
-    let (reference, platform) = (resolved.reference.clone(), resolved.platform.clone());
-    session.pulled.push(reference.clone());
 
-    let (os, architecture) = split_platform(&platform);
+    let mut refusals = Vec::new();
+    for candidate in candidates {
+        session.pulled.push(candidate.reference.clone());
+        match pull_resolved(&candidate, digest).await {
+            Ok(()) => {
+                if let Some(size) = content::blob_size(digest) {
+                    return Ok(size);
+                }
+            }
+            Err(e) => refusals.push(e.to_string()),
+        }
+    }
+
+    Err(AppleContainerError::XpcError(format!(
+        "blob {digest} is not in the local content store and none of the base images this \
+         build resolved ({}) supplied it{}",
+        session.pulled.join(", "),
+        match refusals.is_empty() {
+            true => String::new(),
+            false => format!(": {}", refusals.join("; ")),
+        }
+    )))
+}
+
+/// Pull one resolved base image so the daemon's content store holds its blobs.
+async fn pull_resolved(resolved: &ResolvedImage, digest: &str) -> Result<(), AppleContainerError> {
+    let reference = &resolved.reference;
+    let (os, architecture) = split_platform(&resolved.platform);
     let platform_json = serde_json::to_vec(&serde_json::json!({
         "os": os,
         "architecture": architecture,
     }))?;
-    tokio::time::timeout(IMAGE_PULL_TIMEOUT, pull_image(&reference, &platform_json))
+    tokio::time::timeout(IMAGE_PULL_TIMEOUT, pull_image(reference, &platform_json))
         .await
         .map_err(|_| {
             AppleContainerError::XpcError(format!(
@@ -1741,12 +1865,7 @@ async fn ensure_blob(
                 "could not pull {reference} to supply blob {digest}: {e}"
             ))
         })?;
-
-    content::blob_size(digest).ok_or_else(|| {
-        AppleContainerError::XpcError(format!(
-            "{reference} was pulled but does not contain blob {digest}"
-        ))
-    })
+    Ok(())
 }
 
 /// When a blob was last written, formatted the way the shim parses it.
@@ -2137,7 +2256,7 @@ const BUILDER_IMAGE: &str = "ghcr.io/apple/container-builder-shim/builder:0.8.0"
 /// Ensure the builder VM exists and is running via XPC.
 pub async fn ensure_builder(conn: &XpcConnection) -> Result<(), AppleContainerError> {
     // Step 1: Check if the builder container already exists.
-    let snapshot = get_container(conn, BUILDER_CONTAINER_ID).await;
+    let snapshot = get_container(conn, BUILDER_CONTAINER_ID).await?;
 
     match snapshot {
         Some(snap) if snap.status == RuntimeStatus::Running => {
@@ -2255,17 +2374,53 @@ pub async fn ensure_builder(conn: &XpcConnection) -> Result<(), AppleContainerEr
 ///
 /// Uses `containerList` and filters by ID, since the list route returns
 /// snapshot data under a well-known key (`containers`).
-async fn get_container(conn: &XpcConnection, id: &str) -> Option<ContainerSnapshot> {
+///
+/// Every way this can fail is distinct from "not found" and all three used to
+/// collapse into it: a send that never reached the daemon, a daemon error, and
+/// a payload that would not decode. The last one is the issue #4 shape — one
+/// unrelated container the models cannot represent hid every other container in
+/// the array — so the reply is decoded per entry and only a builder that really
+/// is absent answers `None`. `ensure_builder` creates a container when it sees
+/// that, and creating one that already exists is refused by the daemon.
+async fn get_container(
+    conn: &XpcConnection,
+    id: &str,
+) -> Result<Option<ContainerSnapshot>, AppleContainerError> {
     let msg = XpcMessage::with_route(XpcRoute::ContainerList.as_str());
 
-    let reply = conn.send_async(&msg).await.ok()?;
-    if reply.check_error().is_err() {
-        return None;
-    }
+    let reply = conn.send_async(&msg).await?;
+    reply.check_error()?;
 
-    let data = reply.get_data(XpcKey::CONTAINERS)?;
-    let snapshots: Vec<ContainerSnapshot> = serde_json::from_slice(&data).ok()?;
-    snapshots.into_iter().find(|s| s.configuration.id == id)
+    let Some(data) = reply.get_data(XpcKey::CONTAINERS) else {
+        return Ok(None);
+    };
+    snapshot_in_listing(decode_snapshots(&data)?, id)
+}
+
+/// Pick one container out of a decoded `containerList` reply.
+///
+/// A container whose own record could not be read is not an absent container:
+/// answering `None` for it would have the caller create a container that
+/// already exists. It is reported with the decode failure that hid it.
+fn snapshot_in_listing(
+    listing: ContainerListing,
+    id: &str,
+) -> Result<Option<ContainerSnapshot>, AppleContainerError> {
+    if let Some(found) = listing
+        .snapshots
+        .into_iter()
+        .find(|s| s.configuration.id == id)
+    {
+        return Ok(Some(found));
+    }
+    if let Some(skipped) = listing.undecodable.iter().find(|s| s.id == id) {
+        return Err(AppleContainerError::XpcError(format!(
+            "the daemon returned a record for container '{id}' that this version cannot \
+             read ({})",
+            skipped.error
+        )));
+    }
+    Ok(None)
 }
 
 /// Bootstrap a container with /dev/null stdio fds.
@@ -2296,18 +2451,27 @@ async fn start_process(conn: &XpcConnection, id: &str) -> Result<(), AppleContai
 }
 
 /// Poll until the container reaches Running status (up to ~30 seconds).
+///
+/// A single failed poll does not end the wait — the daemon is busy starting a
+/// VM — but it is not discarded either: a builder that never comes up because
+/// every list failed reports that instead of a bare "did not reach Running".
 async fn wait_for_running(conn: &XpcConnection, id: &str) -> Result<(), AppleContainerError> {
+    let mut last_refusal = None;
     for _ in 0..30 {
-        if let Some(snap) = get_container(conn, id).await {
-            if snap.status == RuntimeStatus::Running {
-                return Ok(());
-            }
+        match get_container(conn, id).await {
+            Ok(Some(snap)) if snap.status == RuntimeStatus::Running => return Ok(()),
+            Ok(_) => {}
+            Err(e) => last_refusal = Some(e.to_string()),
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
-    Err(AppleContainerError::XpcError(
-        "Builder VM did not reach Running state within 30 seconds".to_string(),
-    ))
+    Err(AppleContainerError::XpcError(format!(
+        "Builder VM did not reach Running state within 30 seconds{}",
+        match last_refusal {
+            Some(refusal) => format!("; the last attempt to read its state failed: {refusal}"),
+            None => String::new(),
+        }
+    )))
 }
 
 #[cfg(test)]
@@ -2920,7 +3084,7 @@ mod tests {
     fn session_at(context: &Path) -> BuildSession<'_> {
         BuildSession {
             context,
-            resolved: None,
+            resolved: Vec::new(),
             pulled: Vec::new(),
             unanswered: HashSet::new(),
         }
@@ -3448,6 +3612,36 @@ mod tests {
         assert!(
             !replies[0].1.metadata.contains_key("size"),
             "no metadata of a host file may be handed over"
+        );
+    }
+
+    /// A link whose target this crate cannot name is reported rather than
+    /// described as a link pointing nowhere. `to_string_lossy` would mint a
+    /// `U+FFFD` path naming somewhere the link does not point, and omitting the
+    /// key reads as an empty target on the shim's side — both hand the builder
+    /// a link it can only get wrong.
+    #[test]
+    fn an_fssync_info_refuses_a_link_target_it_cannot_name() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().expect("temp context");
+        let target = std::ffi::OsStr::from_bytes(b"vendor/bad\xff.iso");
+        std::os::unix::fs::symlink(target, dir.path().join("link.iso")).expect("symlink");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let request = build_transfer(&[("method", "Info")], "link.iso");
+        run(handle_info(&request, &sink(&tx), REPLY_ID, dir.path()))
+            .expect("an Info that cannot be answered must still be answered");
+
+        let replies = drain(&mut rx);
+        let metadata = &replies[0].1.metadata;
+        let reported = metadata
+            .get("error")
+            .expect("a target that cannot be named must be reported");
+        assert!(reported.contains("not valid UTF-8"), "{reported}");
+        assert!(
+            !metadata.contains_key("target"),
+            "a target the builder would misread must not be sent at all: {metadata:?}"
         );
     }
 
@@ -4142,6 +4336,162 @@ mod tests {
         assert_eq!(
             split_platform("linux"),
             ("linux".to_string(), String::new())
+        );
+    }
+
+    // ---- a multi-stage build resolves every stage's FROM before the first
+    // blob is asked for, so every one of them can be the one that holds it ----
+
+    fn resolved(reference: &str) -> ResolvedImage {
+        ResolvedImage {
+            reference: reference.to_string(),
+            platform: "linux/arm64".to_string(),
+        }
+    }
+
+    /// `FROM golang AS build` followed by `FROM alpine` used to leave only
+    /// alpine: a golang layer the host store lacked was then looked for in
+    /// alpine, which failed naming the wrong image, and every later golang blob
+    /// short-circuited on the same reference with the same wrong name.
+    #[test]
+    fn every_stages_base_image_stays_available_to_supply_a_blob() {
+        let dir = tempfile::tempdir().expect("temp context");
+        let mut session = session_at(dir.path());
+
+        remember_resolved(&mut session.resolved, resolved("golang:1.22"));
+        remember_resolved(&mut session.resolved, resolved("alpine:3.19"));
+
+        let candidates: Vec<String> = unpulled(&session)
+            .into_iter()
+            .map(|image| image.reference)
+            .collect();
+        assert_eq!(
+            candidates,
+            vec!["golang:1.22".to_string(), "alpine:3.19".to_string()],
+            "a blob may belong to any resolved stage, in resolve order"
+        );
+    }
+
+    /// Two stages on the same base resolve twice, and a reference already
+    /// pulled cannot supply what it did not supply then — so neither repeats.
+    #[test]
+    fn a_reference_is_only_ever_a_candidate_once() {
+        let dir = tempfile::tempdir().expect("temp context");
+        let mut session = session_at(dir.path());
+
+        remember_resolved(&mut session.resolved, resolved("golang:1.22"));
+        remember_resolved(&mut session.resolved, resolved("alpine:3.19"));
+        remember_resolved(&mut session.resolved, resolved("golang:1.22"));
+        assert_eq!(
+            session.resolved.len(),
+            2,
+            "a repeated FROM is not a new one"
+        );
+
+        session.pulled.push("golang:1.22".to_string());
+        let candidates: Vec<String> = unpulled(&session)
+            .into_iter()
+            .map(|image| image.reference)
+            .collect();
+        assert_eq!(candidates, vec!["alpine:3.19".to_string()]);
+
+        session.pulled.push("alpine:3.19".to_string());
+        assert!(
+            unpulled(&session).is_empty(),
+            "a genuinely missing blob must fail rather than loop"
+        );
+    }
+
+    /// The same reference on two platforms is two candidates: the blob the
+    /// builder is missing belongs to exactly one of them.
+    #[test]
+    fn the_same_reference_on_another_platform_is_its_own_candidate() {
+        let dir = tempfile::tempdir().expect("temp context");
+        let mut session = session_at(dir.path());
+
+        remember_resolved(&mut session.resolved, resolved("alpine:3.19"));
+        remember_resolved(
+            &mut session.resolved,
+            ResolvedImage {
+                reference: "alpine:3.19".to_string(),
+                platform: "linux/amd64".to_string(),
+            },
+        );
+        assert_eq!(session.resolved.len(), 2);
+    }
+
+    // ---- the builder container is looked up through the per-entry decode, so
+    // one unreadable record cannot make a running builder look absent ----
+
+    fn listing_of(payload: &str) -> ContainerListing {
+        decode_snapshots(payload.as_bytes()).expect("list payload must decode")
+    }
+
+    fn snapshot_json(id: &str) -> String {
+        format!(
+            r#"{{"configuration":{{"id":"{id}","image":{{"reference":"img","descriptor":{{"mediaType":"m","digest":"d","size":1}}}},"mounts":[],"platform":{{"architecture":"arm64","os":"linux"}},"labels":{{}},"initProcess":{{"executable":"/bin/sh","arguments":[],"environment":[],"workingDirectory":"/","terminal":false,"user":{{"raw":{{"userString":"root"}}}},"supplementalGroups":[],"rlimits":[]}},"resources":{{"cpus":1,"memoryInBytes":1}},"networks":[],"runtimeHandler":"h","publishedPorts":[]}},"status":"running","networks":[]}}"#
+        )
+    }
+
+    /// The failure this replaces: one unrelated container the models cannot
+    /// read failed the whole array, `get_container("buildkit")` answered "not
+    /// found", and `ensure_builder` then created a container that already
+    /// existed — failing every `dev build` while the builder VM was running.
+    #[test]
+    fn an_unreadable_neighbour_does_not_hide_the_builder() {
+        let payload = format!("[{{\"nothing\":true}},{}]", snapshot_json("buildkit"));
+        let found = snapshot_in_listing(listing_of(&payload), "buildkit")
+            .expect("a neighbour this version cannot read is not the builder's business")
+            .expect("the builder is in the listing");
+        assert_eq!(found.configuration.id, "buildkit");
+    }
+
+    /// A builder whose own record could not be read is not an absent builder:
+    /// answering `None` would have the caller create one that already exists.
+    #[test]
+    fn a_builder_whose_own_record_is_unreadable_is_reported_not_absent() {
+        // `status` is required, so an entry without it cannot be decoded — it
+        // stands in for whatever the next unmodelled daemon field is.
+        let payload = r#"[{"configuration":{"id":"buildkit"}}]"#;
+        let error = snapshot_in_listing(listing_of(payload), "buildkit")
+            .expect_err("an unreadable builder record must not read as absent");
+        assert!(error.to_string().contains("buildkit"), "{error}");
+
+        assert!(
+            snapshot_in_listing(listing_of(payload), "other")
+                .expect("an unrelated unreadable record says nothing about this id")
+                .is_none()
+        );
+    }
+
+    // ---- filesystem work is bounded, or the idle budget can never fire ----
+
+    /// `process_build_stream` only polls the builder's stream between handler
+    /// calls, so a handler parked on a stalled mount stops the idle budget from
+    /// ever firing and the build hangs with nothing said. A mount cannot be
+    /// made to stop answering on demand, so the work parks on a channel the
+    /// test releases once the budget has already been spent.
+    #[test]
+    fn filesystem_work_that_never_answers_gives_up_on_its_own_budget() {
+        let outcome = run(must_bound_itself(async {
+            let (release, parked) = std::sync::mpsc::channel::<()>();
+            let outcome = blocking(std::time::Duration::from_millis(50), move || {
+                let _ = parked.recv();
+                Ok(())
+            })
+            .await;
+            // Only now, so the work really was still running when the budget
+            // freed the caller; dropping it lets the thread go.
+            drop(release);
+            outcome
+        }));
+
+        let message = outcome
+            .expect_err("work past the idle budget must free the build")
+            .to_string();
+        assert!(
+            message.contains("did not answer"),
+            "the stall itself must be reported: {message}"
         );
     }
 }

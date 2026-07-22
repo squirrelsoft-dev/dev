@@ -52,10 +52,16 @@ pub async fn run(
         None => format!("/workspaces/{}", workspace_folder_name(workspace)),
     };
 
+    let quoted_workdir = single_quoted(&workdir);
+    let quoted_shell = single_quoted(&shell_cmd);
     let cmd = vec![
         shell_cmd.clone(),
         "-c".to_string(),
-        format!("cd {workdir} 2>/dev/null; exec {shell_cmd} -l"),
+        format!(
+            "cd {quoted_workdir} || \
+             printf 'dev: could not enter %s; starting in the container default\\n' \
+             {quoted_workdir} >&2; exec {quoted_shell} -l"
+        ),
     ];
     let exit_code = runtime
         .exec_interactive(&container.id, &cmd, user.as_deref())
@@ -66,4 +72,56 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+/// Wrap a value the caller supplied so the guest's shell reads it as one word.
+///
+/// Both values interpolated into the `-c` script come from outside this
+/// process: the working directory is resolved from `workspaceFolder` or from
+/// the `target=` segment of `workspaceMount`, and the shell can be named
+/// outright with `--shell`. A path holding a space would otherwise be split
+/// (`cd /workspaces/My Projects/repo` enters `/workspaces/My`), and one holding
+/// `;` or a backtick would run as a command. Single quotes suppress every
+/// expansion the shell performs, so only the quote itself needs escaping — by
+/// closing the run, emitting a literal quote, and reopening.
+fn single_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::single_quoted;
+
+    #[test]
+    fn a_quoted_value_survives_the_guest_shell_as_one_word() {
+        assert_eq!(single_quoted("/workspaces/repo"), "'/workspaces/repo'");
+        assert_eq!(
+            single_quoted("/workspaces/My Projects/repo"),
+            "'/workspaces/My Projects/repo'"
+        );
+    }
+
+    /// The shell script this builds is the only place a `workspaceFolder` or a
+    /// `--shell` value reaches a command line, so metacharacters must arrive as
+    /// text rather than as syntax.
+    #[test]
+    fn quoting_leaves_no_metacharacter_live() {
+        for hostile in [
+            "/tmp; rm -rf /",
+            "/tmp && whoami",
+            "/tmp`id`",
+            "/tmp$(id)",
+            "/tmp\nid",
+            "/tmp|id",
+        ] {
+            let quoted = single_quoted(hostile);
+            assert_eq!(quoted, format!("'{hostile}'"));
+        }
+
+        // A quote of its own is the one character single quotes cannot carry,
+        // so the run is closed, the quote emitted literally, and the run
+        // reopened — never leaving the quoted state.
+        assert_eq!(single_quoted("/tmp/it's"), r"'/tmp/it'\''s'");
+        assert_eq!(single_quoted("';id;'"), r"''\'';id;'\'''");
+    }
 }

@@ -324,14 +324,52 @@ pub fn collect_context(
 /// those entries would leave the image missing files with nothing said about
 /// them. Taken as an iterator so the failure can be exercised: the filesystem
 /// cannot be made to fail mid-listing on demand.
-fn listed_children<I>(listing: I) -> Result<Vec<std::fs::DirEntry>, AppleContainerError>
+///
+/// The listing is bounded by [`MAX_CONTEXT_ENTRIES`] as well, because it is
+/// held whole — one `DirEntry`, each carrying a full path, per name in the
+/// directory — before anything has had a chance to filter it. Without this,
+/// a single hash-sharded cache or spool directory the request did not exclude
+/// costs gigabytes before `push_entry` is ever consulted, which is the resident
+/// size that cap exists to bound. A directory this wide is past what the walk
+/// can carry whether or not its contents survive the filter, and naming it in a
+/// `.dockerignore` keeps it from being listed at all.
+///
+/// The cap is a parameter for the same reason the listing is: a directory half
+/// a million names wide cannot be created on demand either.
+fn listed_children<I>(
+    dir: &Path,
+    listing: I,
+    cap: usize,
+) -> Result<Vec<std::fs::DirEntry>, AppleContainerError>
 where
     I: IntoIterator<Item = std::io::Result<std::fs::DirEntry>>,
 {
-    listing
-        .into_iter()
-        .map(|child| child.map_err(AppleContainerError::Io))
-        .collect()
+    let mut children = Vec::new();
+    for child in listing {
+        if children.len() >= cap {
+            return Err(AppleContainerError::XpcError(format!(
+                "build context directory {} lists more than {cap} names; \
+                 exclude what the build does not need with a .dockerignore",
+                dir.display()
+            )));
+        }
+        children.push(child.map_err(AppleContainerError::Io)?);
+    }
+    Ok(children)
+}
+
+/// Whether a directory stopped existing between being selected and being read.
+///
+/// The walk already tolerates a path that vanishes between the listing and the
+/// stat; a directory that vanishes between the stat and the recursion into it
+/// is the same race one step later — an editor, `cargo` or a bundler clearing
+/// its own cache directory while the context is being collected. Its contents
+/// could not have been sent either way, and the entry set is still being built,
+/// so the walk skips it rather than failing the build with a bare "No such file
+/// or directory". The context root is not covered: a build whose whole context
+/// disappeared has nothing to send and must say so.
+fn vanished_mid_walk(root: &Path, dir: &Path, error: &std::io::Error) -> bool {
+    dir != root && error.kind() == std::io::ErrorKind::NotFound
 }
 
 fn collect_dir(
@@ -348,8 +386,15 @@ fn collect_dir(
         )));
     }
 
-    let mut children = listed_children(std::fs::read_dir(dir).map_err(AppleContainerError::Io)?)?;
-    children.sort_by_key(std::fs::DirEntry::file_name);
+    let listing = match std::fs::read_dir(dir) {
+        Ok(listing) => listing,
+        Err(e) if vanished_mid_walk(root, dir, &e) => return Ok(()),
+        Err(e) => return Err(AppleContainerError::Io(e)),
+    };
+    let mut children = listed_children(dir, listing, MAX_CONTEXT_ENTRIES)?;
+    // `sort_by_key` would allocate an `OsString` per comparison; the name is
+    // read once per entry instead.
+    children.sort_by_cached_key(std::fs::DirEntry::file_name);
 
     for child in children {
         let path = child.path();
@@ -641,6 +686,16 @@ fn write_tar<W: std::io::Write>(
 /// deadline above it. `O_NONBLOCK` makes the open return whatever the path has
 /// become so it can be reported, and is a no-op for the regular file this
 /// almost always is.
+///
+/// `O_NOFOLLOW` closes the other half of the same window. The walk classifies
+/// with `symlink_metadata`, so a real link is archived as a link and never
+/// followed — but the open happens later, and the gap spans the rest of the
+/// walk plus the whole checksum pass, since the archive is produced twice. A
+/// path that became `deploy/key -> ~/.ssh/id_rsa` in between would otherwise be
+/// opened through the link and its contents shipped into the image under a name
+/// inside the context. Every caller is compatible with this: the walk only ever
+/// passes a path it stat'ed as a non-symlink, and `read_context_range` passes
+/// one already canonicalized and confined to the context.
 pub fn open_regular(
     path: &Path,
     name: &str,
@@ -649,9 +704,16 @@ pub fn open_regular(
 
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NONBLOCK)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
         .open(path)
-        .map_err(AppleContainerError::Io)?;
+        .map_err(|e| match e.raw_os_error() {
+            // The open refused to follow a link the walk did not see.
+            Some(libc::ELOOP) => AppleContainerError::XpcError(format!(
+                "{name} became a symbolic link while the build context was being sent; \
+                 a context file is never read through a link"
+            )),
+            _ => AppleContainerError::Io(e),
+        })?;
     let opened = file.metadata().map_err(AppleContainerError::Io)?;
     if !opened.is_file() {
         return Err(AppleContainerError::XpcError(format!(
@@ -1107,6 +1169,49 @@ mod tests {
         );
     }
 
+    /// A context file replaced by a symlink after the walk classified it must
+    /// not be read through the link. The walk lstats every entry, so a real
+    /// link is archived as a link — but the open happens later, and the window
+    /// spans the rest of the walk plus the whole checksum pass. Anything with
+    /// write access to the workspace (an install script, a group-writable
+    /// subdirectory) could otherwise point a selected name at a host file and
+    /// have its contents shipped into the image.
+    #[test]
+    fn a_file_swapped_for_a_symlink_after_the_walk_is_not_read_through_it() {
+        let outside = tempfile::tempdir().expect("temp home");
+        let secret = outside.path().join("id_rsa");
+        std::fs::write(&secret, "PRIVATE KEY").expect("write secret");
+
+        let dir = tempfile::tempdir().expect("temp context");
+        write(dir.path(), "deploy/key", "placeholder");
+        let entries = collect_context(dir.path(), &ContextFilter::default()).expect("walk");
+
+        let key = dir.path().join("deploy/key");
+        std::fs::remove_file(&key).expect("remove");
+        std::os::unix::fs::symlink(&secret, &key).expect("symlink");
+
+        let mut archive = Vec::new();
+        let error = stream_context_tar(&entries, &mut |chunk| {
+            archive.extend_from_slice(&chunk);
+            Ok(())
+        })
+        .expect_err("a selected path that became a link must be reported, not followed");
+        assert!(
+            error.to_string().contains("symbolic link"),
+            "the swap itself must be named: {error}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&archive).contains("PRIVATE KEY"),
+            "no byte of the link's target may reach the archive"
+        );
+
+        // The same door on the read path: `handle_read` confines the name and
+        // then re-opens by path, so the link must be refused there too.
+        let error = open_regular(&key, "deploy/key")
+            .expect_err("open_regular must refuse a symlink outright");
+        assert!(error.to_string().contains("symbolic link"), "{error}");
+    }
+
     /// A name the archive cannot carry stops the walk rather than being sent
     /// under a lossy one whose bytes name a different path. The advice it gives
     /// is only actionable because the guard runs after `matches_file` and the
@@ -1171,18 +1276,91 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp context");
         write(dir.path(), "app.txt", "payload");
 
-        let readable = listed_children(std::fs::read_dir(dir.path()).expect("listing"))
-            .expect("a listing that does not fail must be collected");
+        let readable = listed_children(
+            dir.path(),
+            std::fs::read_dir(dir.path()).expect("listing"),
+            MAX_CONTEXT_ENTRIES,
+        )
+        .expect("a listing that does not fail must be collected");
         assert_eq!(readable.len(), 1);
 
         let interrupted = std::fs::read_dir(dir.path())
             .expect("listing")
             .chain(std::iter::once(Err(std::io::Error::other("EIO"))));
-        let error = listed_children(interrupted)
+        let error = listed_children(dir.path(), interrupted, MAX_CONTEXT_ENTRIES)
             .expect_err("an entry that cannot be listed must not be silently dropped");
         assert!(
             matches!(error, AppleContainerError::Io(_)),
             "the filesystem's own failure must survive, got {error:?}"
+        );
+    }
+
+    /// The entry cap bounds what the walk *selects*, but the listing is held
+    /// whole before anything filters it, so a directory wider than the cap
+    /// would allocate past the bound before `push_entry` was ever consulted.
+    /// A directory that wide cannot be created on demand, so the cap is lowered
+    /// to what a fixture can reach.
+    #[test]
+    fn a_directory_wider_than_the_entry_cap_is_refused_before_it_is_held() {
+        let dir = tempfile::tempdir().expect("temp context");
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            write(dir.path(), name, "payload");
+        }
+
+        let within = listed_children(
+            dir.path(),
+            std::fs::read_dir(dir.path()).expect("listing"),
+            3,
+        )
+        .expect("a listing at the cap must still be collected");
+        assert_eq!(within.len(), 3);
+
+        let error = listed_children(
+            dir.path(),
+            std::fs::read_dir(dir.path()).expect("listing"),
+            2,
+        )
+        .expect_err("a listing past the cap must be refused, not held");
+        let message = error.to_string();
+        assert!(
+            message.contains("lists more than 2 names") && message.contains(".dockerignore"),
+            "the refusal must name the cap and the way out: {message}"
+        );
+    }
+
+    /// A directory removed between being selected and being walked into is the
+    /// same race the stat already tolerates, one step later: its contents could
+    /// not have been sent either way. The walk skips it rather than failing the
+    /// whole build with a bare "No such file or directory".
+    #[test]
+    fn a_directory_that_vanished_mid_walk_is_skipped_but_a_missing_root_is_not() {
+        let dir = tempfile::tempdir().expect("temp context");
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+
+        assert!(vanished_mid_walk(
+            dir.path(),
+            &dir.path().join("target/tmp-42"),
+            &missing
+        ));
+        assert!(
+            !vanished_mid_walk(dir.path(), dir.path(), &missing),
+            "a context whose root is gone has nothing to send and must say so"
+        );
+        assert!(
+            !vanished_mid_walk(
+                dir.path(),
+                &dir.path().join("vendor"),
+                &std::io::Error::from(std::io::ErrorKind::PermissionDenied)
+            ),
+            "a directory that exists but cannot be read still drops files silently"
+        );
+
+        let gone = dir.path().join("gone");
+        let error = collect_context(&gone, &ContextFilter::default())
+            .expect_err("a context root that does not exist must fail the build");
+        assert!(
+            matches!(error, AppleContainerError::Io(_)),
+            "the filesystem's own refusal must survive, got {error:?}"
         );
     }
 

@@ -167,6 +167,27 @@ fn reports_missing_command(error: &DevError) -> bool {
         .is_some_and(|(_, named)| named.contains("no such file or directory"))
 }
 
+/// How long an interactive exec's status is waited for once its streams close.
+///
+/// Only spent when the streams outlive the process's own exit record, which is
+/// milliseconds in practice — the shell exits as soon as it sees the EOF that
+/// ended the session. A budget rather than an unbounded wait so a process that
+/// keeps running with no stdin cannot park `dev shell` forever.
+const EXEC_STATUS_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The exit code an `inspect_exec` reply carries, if it carries a final one.
+///
+/// `None` means "ask again": docker reports a still-running exec with no code,
+/// and records the code slightly after the process ends, so both states are
+/// answers about an exec that has not finished being reported rather than an
+/// exec that succeeded.
+fn recorded_exit_code(running: Option<bool>, exit_code: Option<i64>) -> Option<i32> {
+    if running == Some(true) {
+        return None;
+    }
+    exit_code.map(|code| code as i32)
+}
+
 impl BollardRuntime {
     /// Connect to a specific socket path.
     pub fn connect_to_socket(socket: &str) -> Result<Self, DevError> {
@@ -708,18 +729,38 @@ impl BollardRuntime {
             sigwinch_abort.abort();
         }
 
-        // Report the command's own status; an exec whose code Docker has not
-        // recorded yet is treated as success, as it was before.
-        let exit_code = self
-            .client
-            .inspect_exec(&exec.id)
-            .await
-            .ok()
-            .and_then(|info| info.exit_code)
-            .unwrap_or(0) as i32;
+        let exit_code = self.recorded_exec_status(&exec.id).await?;
 
         // _raw_guard is dropped here, restoring the terminal.
         Ok(exit_code)
+    }
+
+    /// The status the interactive exec finished with.
+    ///
+    /// The stream loop can end while the process is still running: a piped or
+    /// redirected stdin reaches EOF, which ends the forwarding task and wins
+    /// the `select!` above, and only then does dropping the input half give the
+    /// container's shell its own EOF. Reading `inspect_exec` once at that
+    /// moment answers `running: true` with no code recorded, so the status is
+    /// polled until docker has one. `dev shell` turns this into its own exit
+    /// status, so neither a transport failure nor a status docker never
+    /// recorded may pass for success.
+    async fn recorded_exec_status(&self, exec_id: &str) -> Result<i32, DevError> {
+        let deadline = std::time::Instant::now() + EXEC_STATUS_BUDGET;
+        loop {
+            let info = self.client.inspect_exec(exec_id).await?;
+            if let Some(code) = recorded_exit_code(info.running, info.exit_code) {
+                return Ok(code);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(DevError::Runtime(format!(
+                    "the interactive session ended but docker reported no exit status for it \
+                     within {}s",
+                    EXEC_STATUS_BUDGET.as_secs()
+                )));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     async fn exec_attached_impl(
@@ -1062,6 +1103,10 @@ impl ContainerRuntime for DockerRuntime {
         self.0.exec(id, cmd, user)
     }
 
+    fn exec_reports_missing_command(&self, error: &DevError) -> bool {
+        self.0.exec_reports_missing_command(error)
+    }
+
     fn exec_interactive(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, i32> {
         self.0.exec_interactive(id, cmd, user)
     }
@@ -1198,5 +1243,54 @@ mod tests {
         assert!(!reports_missing_command(&server_error(
             "container is not running"
         )));
+    }
+
+    /// `detect_runtime` only ever hands out `DockerRuntime`, so a classifier
+    /// the wrapper forgets to forward is a classifier that never runs: the
+    /// trait's default answers `false` and `dev up` fails on a shell-less
+    /// image instead of tolerating it. Asked through `dyn ContainerRuntime` so
+    /// the wrapper's own table is what answers.
+    #[test]
+    fn the_docker_wrapper_forwards_the_missing_command_classifier() {
+        // A path rather than a live daemon: bollard only checks that the socket
+        // is there, and nothing here sends a request over it.
+        let socket = tempfile::NamedTempFile::new().expect("stand-in socket");
+        let runtime = DockerRuntime(
+            BollardRuntime::connect_to_socket(&socket.path().to_string_lossy())
+                .expect("building a docker client must not need a daemon"),
+        );
+        let runtime: &dyn ContainerRuntime = &runtime;
+
+        assert!(runtime.exec_reports_missing_command(&server_error(
+            "OCI runtime exec failed: exec: \"sh\": executable file not found in $PATH"
+        )));
+        assert!(!runtime.exec_reports_missing_command(&server_error("container is not running")));
+    }
+
+    /// The interactive session's streams can close before docker has recorded
+    /// the process's exit — a redirected stdin reaching EOF ends the session
+    /// while the shell is still running — so neither state may be read as a
+    /// success `dev shell` would then exit with.
+    #[test]
+    fn an_exec_status_is_only_final_once_the_process_has_stopped() {
+        assert_eq!(recorded_exit_code(Some(false), Some(7)), Some(7));
+        assert_eq!(recorded_exit_code(Some(false), Some(0)), Some(0));
+        assert_eq!(recorded_exit_code(None, Some(3)), Some(3));
+
+        assert_eq!(
+            recorded_exit_code(Some(true), None),
+            None,
+            "a running exec has not reported a status yet"
+        );
+        assert_eq!(
+            recorded_exit_code(Some(true), Some(0)),
+            None,
+            "a running exec's zero is a placeholder, not its status"
+        );
+        assert_eq!(
+            recorded_exit_code(Some(false), None),
+            None,
+            "a stopped exec whose code is not recorded yet is not a success"
+        );
     }
 }

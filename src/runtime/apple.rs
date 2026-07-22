@@ -1607,6 +1607,50 @@ mod tests {
         unsafe { libc::read(fd, std::ptr::addr_of_mut!(byte).cast(), 1) == 0 }
     }
 
+    /// A pipe to hand the daemon in place of a terminal, as `(read, write)`.
+    ///
+    /// The live smoke needs something it can read back what the pty relayed,
+    /// which `/dev/null` is not.
+    #[cfg(target_os = "macos")]
+    fn terminal_pipe() -> (OwnedFd, OwnedFd) {
+        let mut ends = [0 as RawFd; 2];
+        assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0, "pipe");
+        unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) }
+    }
+
+    /// Read from `fd` until `wanted` shows up or the budget runs out.
+    ///
+    /// Bounded on both ends: the daemon keeps its own copy of the write end, so
+    /// waiting for EOF could park forever, and a relay that never happens has
+    /// to fail the assertion rather than hang the smoke.
+    #[cfg(target_os = "macos")]
+    fn read_until(fd: &OwnedFd, wanted: &str, budget: std::time::Duration) -> String {
+        let deadline = std::time::Instant::now() + budget;
+        let mut seen = Vec::new();
+        while std::time::Instant::now() < deadline {
+            let mut watch = libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            match unsafe { libc::poll(&mut watch, 1, 250) } {
+                0 => continue,
+                ready if ready < 0 => break,
+                _ => {}
+            }
+            let mut buf = [0u8; 1024];
+            let read = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            if read <= 0 {
+                break;
+            }
+            seen.extend_from_slice(&buf[..read as usize]);
+            if String::from_utf8_lossy(&seen).contains(wanted) {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&seen).into_owned()
+    }
+
     impl FakeExecDaemon {
         fn producing(stdout: &str, stderr: &str, exit_code: i32) -> Self {
             Self {
@@ -3156,7 +3200,12 @@ mod tests {
 
         // Live smoke for Apple's terminal exec contract: `terminal=true`
         // starts with stdin/stdout and no separate stderr fd, then reports its
-        // exit.
+        // exit — and the guest's stderr still reaches the caller, because the
+        // daemon relays it over the pty. That last part is the premise the
+        // whole fix rests on: if it did not hold, `dev shell` would silently
+        // lose every error message the shell printed. So the process writes to
+        // stderr and the fd handed over as stdout is a pipe this reads back,
+        // rather than /dev/null with nobody looking.
         let defaults = ProcessDefaults {
             working_directory: "/tmp".to_string(),
             environment: Vec::new(),
@@ -3165,18 +3214,29 @@ mod tests {
             &[
                 "/bin/sh".to_string(),
                 "-c".to_string(),
-                "exit 0".to_string(),
+                "echo oops >&2; exit 0".to_string(),
             ],
             None,
             true,
             &defaults,
         );
+        let (terminal_out, terminal_in) = terminal_pipe();
         let process_id = next_process_id("exec-interactive-smoke");
         runtime
             .client
-            .create_process(container_id, &process_id, &proc_config, fd, fd, None)
+            .create_process(
+                container_id,
+                &process_id,
+                &proc_config,
+                fd,
+                terminal_in.as_raw_fd(),
+                None,
+            )
             .await
             .expect("terminal create_process failed");
+        // The daemon has its own copy; this one would otherwise hold the pipe
+        // open against the read below.
+        drop(terminal_in);
 
         let (issued, on_the_wire) = tokio::sync::oneshot::channel();
         let exit_wait = runtime
@@ -3198,6 +3258,13 @@ mod tests {
             .expect("terminal exec wait hung")
             .expect("terminal exec wait failed");
         assert_eq!(exit_code, 0);
+
+        let relayed = read_until(&terminal_out, "oops", std::time::Duration::from_secs(10));
+        assert!(
+            relayed.contains("oops"),
+            "a terminal exec omits the stderr fd, so the guest's stderr must arrive on the \
+             terminal instead; got {relayed:?}"
+        );
 
         // Clean up. The daemon can report a stop timeout after the container
         // has stopped, so deletion is the authoritative cleanup check.
@@ -3223,42 +3290,30 @@ mod tests {
 
     // ---- Apple interactive-shell regression: stderr omitted when terminal=true
 
-    #[tokio::test]
-    async fn terminal_process_creation_omits_stderr_fd() {
-        let daemon = FakeExecDaemon::default();
-        let config = exec_process_config(
-            &["/bin/sh".to_string()],
-            None,
-            true,
-            &ProcessDefaults {
-                working_directory: "/tmp".to_string(),
-                environment: Vec::new(),
-            },
+    /// The caller-side half of the terminal stderr contract: `dev shell`'s
+    /// process configuration must ask for a terminal, which is what makes the
+    /// client omit the stderr fd. That omission is proved against the XPC
+    /// message itself in `apple_container`'s own
+    /// `a_terminal_process_request_carries_no_stderr_key`, which is the only
+    /// place the key's presence is observable; asserting it against a stand-in
+    /// here would only restate the `None` this file passes in.
+    #[test]
+    fn the_interactive_exec_configuration_asks_for_a_terminal() {
+        let defaults = ProcessDefaults {
+            working_directory: "/tmp".to_string(),
+            environment: Vec::new(),
+        };
+
+        let interactive = exec_process_config(&["/bin/sh".to_string()], None, true, &defaults);
+        assert!(
+            interactive.terminal,
+            "dev shell runs against the caller's terminal"
         );
 
-        daemon
-            .create_process("cid", "pid", &config, 0, 1, None)
-            .await
-            .expect("terminal process creation should be recorded");
-
+        let captured = exec_process_config(&["/bin/sh".to_string()], None, false, &defaults);
         assert!(
-            daemon.created_terminal.load(Ordering::SeqCst),
-            "the regression must cover terminal=true process creation"
-        );
-        assert!(
-            !daemon.created_stderr.load(Ordering::SeqCst),
-            "terminal=true must omit the stderr fd"
-        );
-        assert!(
-            daemon
-                .held
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .stderr
-                .is_none(),
-            "terminal=true must not hand stderr to the daemon"
+            !captured.terminal,
+            "a captured exec reads its own stdout and stderr and must not ask for a pty"
         );
     }
 
