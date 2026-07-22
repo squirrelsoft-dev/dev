@@ -150,14 +150,131 @@ impl ContainerRuntime for PodmanRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::{ContainerRuntime, WorkspaceMount};
+    use std::collections::HashMap;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixListener;
 
-    /// Podman create uses the same bollard-backed adapter as Docker. The
-    /// create-body assertions live in `runtime::docker::tests`; this test pins
-    /// the adapter shape so those assertions honestly cover the implementation
-    /// Podman delegates to, without claiming a live Podman daemon was exercised.
-    #[test]
-    fn podman_runtime_wraps_the_shared_bollard_create_adapter() {
-        fn assert_wraps_bollard(_: fn(BollardRuntime) -> PodmanRuntime) {}
-        assert_wraps_bollard(PodmanRuntime);
+    /// Podman create delegates through the same bollard-backed create path as
+    /// Docker. This uses a fake Unix-socket daemon rather than a live Podman
+    /// daemon, so it proves the request body Podman sends through
+    /// `ContainerRuntime::create_container`, not Podman's daemon behavior.
+    #[tokio::test]
+    async fn podman_create_container_sends_the_shared_bollard_create_body() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket_path = dir.path().join("podman.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 37\r\n\r\n{\"Id\":\"podman-created\",\"Warnings\":[]}",
+                )
+                .await
+                .unwrap();
+            request
+        });
+
+        let runtime = PodmanRuntime(
+            BollardRuntime::connect_to_socket(&socket_path.to_string_lossy())
+                .expect("building a podman client must not need a daemon"),
+        );
+        let mut config = ContainerConfig {
+            image: "ubuntu:24.04".to_string(),
+            name: "vsc-test".to_string(),
+            labels: HashMap::new(),
+            env: HashMap::from([("FROM_RUNARGS".to_string(), "1".to_string())]),
+            mounts: vec![],
+            volumes: vec![],
+            ports: vec![],
+            workspace_mount: Some(WorkspaceMount {
+                source: std::path::PathBuf::from("/host/workspace"),
+                target: "/workspace".to_string(),
+            }),
+            workspace_folder: Some("/workspace".to_string()),
+            extra_args: vec![],
+            entrypoint: None,
+            init: true,
+            privileged: true,
+            cap_add: vec!["SYS_PTRACE".to_string()],
+            security_opt: vec!["seccomp=unconfined".to_string()],
+            userns_mode: Some("keep-id".to_string()),
+        };
+        config.labels.insert(
+            "devcontainer.local_folder".to_string(),
+            "/host/workspace".to_string(),
+        );
+
+        let id = (&runtime as &dyn ContainerRuntime)
+            .create_container(&config)
+            .await
+            .expect("fake daemon should accept the create request");
+
+        let request = server.await.unwrap();
+        let body = request_json_body(&request);
+
+        assert_eq!(id, "podman-created");
+        assert!(
+            request.starts_with("POST /containers/create"),
+            "create must be sent through bollard's Docker-compatible create API, got: {request}"
+        );
+        assert!(
+            request.contains("/containers/create?name=vsc-test"),
+            "container name should be passed as create option, got: {request}"
+        );
+        assert_eq!(body["Image"], "ubuntu:24.04");
+        assert_eq!(body["WorkingDir"], "/workspace");
+        assert_eq!(body["Env"], serde_json::json!(["FROM_RUNARGS=1"]));
+        assert_eq!(body["HostConfig"]["Init"], true);
+        assert_eq!(body["HostConfig"]["Privileged"], true);
+        assert_eq!(
+            body["HostConfig"]["CapAdd"],
+            serde_json::json!(["SYS_PTRACE"])
+        );
+        assert_eq!(
+            body["HostConfig"]["SecurityOpt"],
+            serde_json::json!(["seccomp=unconfined"])
+        );
+        assert_eq!(body["HostConfig"]["UsernsMode"], "keep-id");
+    }
+
+    async fn read_http_request(stream: &mut tokio::net::UnixStream) -> String {
+        let mut buf = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert_ne!(n, 0, "client closed before sending the request");
+            buf.extend_from_slice(&chunk[..n]);
+            if request_complete(&buf) {
+                return String::from_utf8(buf).unwrap();
+            }
+        }
+    }
+
+    fn request_complete(buf: &[u8]) -> bool {
+        let Some(header_end) = find_header_end(buf) else {
+            return false;
+        };
+        let headers = std::str::from_utf8(&buf[..header_end]).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or(0);
+        buf.len() >= header_end + 4 + content_length
+    }
+
+    fn find_header_end(buf: &[u8]) -> Option<usize> {
+        buf.windows(4).position(|window| window == b"\r\n\r\n")
+    }
+
+    fn request_json_body(request: &str) -> serde_json::Value {
+        let (_, body) = request.split_once("\r\n\r\n").unwrap();
+        serde_json::from_str(body).unwrap()
     }
 }
