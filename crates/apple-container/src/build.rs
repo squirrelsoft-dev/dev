@@ -58,10 +58,14 @@ const REGISTRY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 ///
 /// The same hang, one layer down: `imagePull` is a synchronous XPC send on a
 /// blocking thread with no deadline of its own, awaited from the build loop
-/// while the server stream goes unread. A pull moves an image over a network
-/// the host cannot watch progress on, so it gets a budget of its own rather
-/// than the stalled-stream one — generous enough for a large base image on a
-/// slow link, and still an end.
+/// while the server stream goes unread.
+///
+/// Total duration, not inactivity — unlike [`REGISTRY_READ_TIMEOUT`], which
+/// can be an inactivity deadline because `reqwest` is watching the bytes. One
+/// XPC reply is the whole of what crosses this boundary: the daemon says
+/// nothing until the pull is done, so there is no progress here to measure and
+/// nothing that can tell a stalled pull from a slow one. The budget is
+/// therefore sized for the slow one, and what it reports is what it measured.
 const IMAGE_PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800);
 
 /// Include the generated protobuf/gRPC code.
@@ -1619,10 +1623,11 @@ async fn send_blob_range(
     // layer whose digest cannot match, and `ReadAt` checks `metadata["error"]`
     // before it looks at the payload, so the disagreement is reported instead.
     if data.len() < wanted {
-        let short_by = available - data.len() as u64;
+        let short_by = wanted - data.len();
         let message = format!(
-            "blob {} has {short_by} fewer bytes from offset {} than the {} the content \
-             store reported; it changed while it was being read",
+            "blob {} came back {short_by} bytes short of the {wanted} this read asked for at \
+             offset {}, against the {} the content store reported; it changed while it was \
+             being read",
             range.digest, range.offset, range.size
         );
         return send_content_error(builder, build_id, transfer, range.method, &message).await;
@@ -1725,8 +1730,9 @@ async fn ensure_blob(
         .await
         .map_err(|_| {
             AppleContainerError::XpcError(format!(
-                "pulling {reference} to supply blob {digest} made no progress within {}s; \
-                 giving up on the build",
+                "pulling {reference} to supply blob {digest} did not finish within {}s; \
+                 giving up on the build. The daemon reports nothing until a pull is done, so \
+                 this may be a stalled pull or simply an image too large for the link",
                 IMAGE_PULL_TIMEOUT.as_secs()
             ))
         })?
@@ -3750,9 +3756,8 @@ mod tests {
             .iter()
             .find(|p| p.metadata.contains_key("error"))
             .expect("a blob shorter than the store said must be reported");
-        // The figure names the blob's shortfall, not the current chunk's.
         assert!(
-            reported.metadata["error"].contains("4086 fewer bytes"),
+            reported.metadata["error"].contains("4086 bytes short of the 4096"),
             "{}",
             reported.metadata["error"]
         );
@@ -3761,6 +3766,44 @@ mod tests {
                 .iter()
                 .any(|p| !p.data.is_empty() && !p.metadata.contains_key("error")),
             "no payload may be handed over once the blob is known to be short"
+        );
+    }
+
+    /// The figure is the shortfall against what this read asked for, not
+    /// against the whole of what is left of the blob. A windowed read that got
+    /// half its chunk is short by half a chunk; reporting it as short by the
+    /// rest of a multi-gigabyte layer names a number the caller never asked
+    /// about.
+    #[test]
+    fn a_short_blob_is_measured_against_what_the_read_asked_for() {
+        let store = tempfile::tempdir().expect("temp store");
+        let blob = store.path().join("layer");
+        std::fs::write(&blob, b"0123456789").expect("blob");
+        let request = image_transfer();
+
+        let replies = run(async {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<ClientStream>(8);
+            // The store reports 4 KiB, this read wants 1 KiB of it, and the
+            // file holds ten bytes: short by 1014, not by 4086.
+            send_blob_range(
+                &sink(&tx),
+                REPLY_ID,
+                &request,
+                &blob_range(&blob, 4096, 0, Some(1024)),
+            )
+            .await
+            .expect("the shortfall must be reported, not returned as an error here");
+            drain_image(&mut rx)
+        });
+
+        let reported = replies
+            .iter()
+            .find(|p| p.metadata.contains_key("error"))
+            .expect("a blob shorter than the store said must be reported");
+        assert!(
+            reported.metadata["error"].contains("1014 bytes short of the 1024"),
+            "{}",
+            reported.metadata["error"]
         );
     }
 

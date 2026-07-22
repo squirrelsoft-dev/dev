@@ -155,6 +155,7 @@ impl AppleRuntime {
         tokio::pin!(exit_wait);
         if let Err(e) = start_with_registered_exit_wait(
             "exec_interactive",
+            &proc_config.executable,
             &mut exit_wait,
             on_the_wire,
             self.client.start_process(id, &process_id),
@@ -747,6 +748,7 @@ async fn stop_past_stale_process_records(
 /// cannot exit is always answered.
 async fn start_with_registered_exit_wait<W>(
     what: &str,
+    executable: &str,
     exit_wait: &mut std::pin::Pin<&mut W>,
     on_the_wire: tokio::sync::oneshot::Receiver<()>,
     start: impl std::future::Future<Output = Result<(), AppleContainerError>>,
@@ -771,7 +773,7 @@ where
         // process nothing is watching.
         _ = on_the_wire => start
             .await
-            .map_err(|e| DevError::Runtime(format!("{what} {START_FAILED}: {e}"))),
+            .map_err(|e| DevError::Runtime(start_failure(what, executable, &e.to_string()))),
     }
 }
 
@@ -779,31 +781,79 @@ where
 /// reads it back cannot drift apart.
 const START_FAILED: &str = "start failed";
 
+/// How a start failure the daemon blamed on the executable itself is worded,
+/// for the same reason.
+const NO_SUCH_EXECUTABLE: &str = "the image has no such executable";
+
+/// Word a failed start, saying whether it was the executable's fault.
+///
+/// The attribution is made here because this is the only place that has both
+/// halves of it: what the daemon said, and which executable this exec asked
+/// it to run. [`is_missing_command_failure`] then reads the verdict back
+/// rather than re-deriving it from prose that no longer names the command.
+fn start_failure(what: &str, executable: &str, reported: &str) -> String {
+    match blames_the_executable(executable, reported) {
+        true => format!("{what} {START_FAILED}: {NO_SUCH_EXECUTABLE} ({reported})"),
+        false => format!("{what} {START_FAILED}: {reported}"),
+    }
+}
+
+/// Whether a start failure is about the executable this exec named, rather
+/// than about something else the start step touches.
+///
+/// The start step does more than `execve`: it chdirs into the working
+/// directory, and the guest has a rootfs and mounts under it. Each of those
+/// fails with the same `ENOENT` and the same `strerror` text ("No such file or
+/// directory"), so the phrase alone attributes nothing — which is what the
+/// trait contract forbids. What does attribute it is the path the daemon
+/// named: a failure to run `/bin/sh` names `/bin/sh`, while a workspace folder
+/// that is not there names the folder.
+///
+/// Matched per path segment rather than as a substring, so an executable named
+/// `sh` is not read out of an unrelated `/usr/share/...` in the message. When
+/// nothing matches, this is the runtime's problem and not the image's, which
+/// is the safe way for it to be wrong: readiness fails loudly instead of being
+/// announced for a container no command can run in.
+fn blames_the_executable(executable: &str, reported: &str) -> bool {
+    if executable.is_empty() {
+        return false;
+    }
+    let reported = reported.to_ascii_lowercase();
+    if reported.contains("executable file not found") {
+        return true;
+    }
+    if !reported.contains("no such file or directory") {
+        return false;
+    }
+    let executable = executable.to_ascii_lowercase();
+    reported
+        .split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | ',' | ';' | ':'))
+        .any(|token| {
+            token == executable
+                || token
+                    .rsplit_once('/')
+                    .is_some_and(|(_, base)| base == executable)
+        })
+}
+
 /// Whether an exec failure is the daemon refusing to run a command the image
 /// does not have.
 ///
 /// Deliberately narrow, on two axes. Only the *start* step can carry that
 /// meaning: the daemon has accepted the process configuration by then and is
-/// trying to execute it, so a not-found reported there is about the executable.
-/// A create failure, a wait failure and every XPC transport error are the
-/// runtime failing to run anything at all and must stay fatal to readiness, so
-/// the step is checked before the wording.
+/// trying to execute it. A create failure, a wait failure and every XPC
+/// transport error are the runtime failing to run anything at all and must
+/// stay fatal to readiness, so the step is checked first.
 ///
-/// The wording is the one thing here not established from this crate's own
-/// code. What is: the guest runs Linux, a missing executable fails `execve`
-/// with `ENOENT`, and its `strerror` text is "No such file or directory" —
-/// so that is the phrase matched, rather than a container-runtime phrasing
-/// this daemon has not been observed to use. An unrecognised start failure
-/// stays the runtime's problem, not the image's, which is the safe way for
-/// this to be wrong: it fails readiness loudly instead of passing a broken
-/// container.
+/// The second axis is attribution: a start failure only counts when
+/// [`blames_the_executable`] found the daemon naming the very command this
+/// exec asked for. That verdict is recorded in the message as
+/// [`NO_SUCH_EXECUTABLE`] when it is made, so nothing here has to guess at
+/// wording the daemon has not been observed to use.
 fn is_missing_command_failure(message: &str) -> bool {
-    let Some((_, detail)) = message.split_once(START_FAILED) else {
-        return false;
-    };
-    detail
-        .to_ascii_lowercase()
-        .contains("no such file or directory")
+    message
+        .split_once(START_FAILED)
+        .is_some_and(|(_, detail)| detail.contains(NO_SUCH_EXECUTABLE))
 }
 
 /// Create, start, and wait for one process, capturing its output.
@@ -847,8 +897,14 @@ async fn run_captured_process(
     let exit_wait = daemon.wait_process(id, &process_id, issued);
     tokio::pin!(exit_wait);
     let start = daemon.start_process(id, &process_id);
-    if let Err(e) =
-        start_with_registered_exit_wait("exec", &mut exit_wait, on_the_wire, start).await
+    if let Err(e) = start_with_registered_exit_wait(
+        "exec",
+        &proc_config.executable,
+        &mut exit_wait,
+        on_the_wire,
+        start,
+    )
+    .await
     {
         abandon_process(daemon, id, &process_id, output).await;
         return Err(e);
@@ -1496,7 +1552,8 @@ mod tests {
         stdout: Vec<u8>,
         stderr: Vec<u8>,
         exit_code: i32,
-        start_fails: bool,
+        /// What `start_process` refuses with, if it refuses at all.
+        start_refusal: Option<&'static str>,
         wait_fails: bool,
         /// Refuse the wait only once the process is running, so the failure
         /// lands on the caller's exit wait instead of on its start. The
@@ -1554,8 +1611,12 @@ mod tests {
         }
 
         fn failing_start() -> Self {
+            Self::refusing_the_start_with("start refused")
+        }
+
+        fn refusing_the_start_with(reason: &'static str) -> Self {
             Self {
-                start_fails: true,
+                start_refusal: Some(reason),
                 ..Self::default()
             }
         }
@@ -1652,8 +1713,8 @@ mod tests {
         ) -> DaemonFut<'a, ()> {
             Box::pin(async move {
                 self.record("start");
-                if self.start_fails {
-                    return Err(AppleContainerError::XpcError("start refused".to_string()));
+                if let Some(reason) = self.start_refusal {
+                    return Err(AppleContainerError::XpcError(reason.to_string()));
                 }
                 {
                     let held = self.held.lock().unwrap();
@@ -2190,24 +2251,99 @@ mod tests {
     /// use, which is the whole of issue #4.
     #[test]
     fn only_a_start_step_not_found_reads_as_a_missing_command() {
-        // The `strerror` text a failed `execve` produces in the Linux guest.
-        assert!(is_missing_command_failure(
-            "exec start failed: internalError: No such file or directory"
-        ));
+        let blamed = start_failure(
+            "exec",
+            "sh",
+            "internalError: No such file or directory for sh",
+        );
+        assert!(is_missing_command_failure(&blamed), "{blamed}");
 
-        // The same words on a step that never got as far as the executable.
-        assert!(!is_missing_command_failure(
-            "exec failed: no such file or directory"
-        ));
-        assert!(!is_missing_command_failure(
-            "exec wait failed: no such file or directory"
-        ));
+        // The same verdict on a step that never got as far as the executable.
+        assert!(!is_missing_command_failure(&format!(
+            "exec failed: {NO_SUCH_EXECUTABLE}"
+        )));
+        assert!(!is_missing_command_failure(&format!(
+            "exec wait failed: {NO_SUCH_EXECUTABLE}"
+        )));
         // A start that failed for a reason of the runtime's own.
         assert!(!is_missing_command_failure(
             "exec start failed: XPC send returned null"
         ));
         assert!(!is_missing_command_failure("exec start failed"));
         assert!(!is_missing_command_failure("no such file or directory"));
+    }
+
+    /// The `strerror` text alone attributes nothing: the start step chdirs into
+    /// the working directory and mounts a rootfs under it, and each of those
+    /// fails with the same `ENOENT` wording. Only the path the daemon named
+    /// says whose fault it was — so a workspace folder that is not there, or a
+    /// mount that did not attach, has to stay fatal to readiness.
+    #[test]
+    fn only_an_enoent_naming_the_executable_blames_the_image() {
+        assert!(blames_the_executable(
+            "sh",
+            "internalError: exec /bin/sh: no such file or directory"
+        ));
+        assert!(blames_the_executable(
+            "/bin/sh",
+            "internalError: \"/bin/sh\": No such file or directory"
+        ));
+        assert!(blames_the_executable(
+            "sh",
+            "exec: \"sh\": executable file not found in $PATH"
+        ));
+
+        // The working directory this branch now sets on every exec.
+        assert!(!blames_the_executable(
+            "sh",
+            "internalError: chdir /workspaces/api: no such file or directory"
+        ));
+        // A path that merely contains the executable's name is not it.
+        assert!(!blames_the_executable(
+            "sh",
+            "internalError: chdir /usr/share/app: no such file or directory"
+        ));
+        // The guest's own failures, reported with the same words.
+        assert!(!blames_the_executable(
+            "sh",
+            "internalError: mount /dev/vdb: no such file or directory"
+        ));
+        assert!(!blames_the_executable("sh", "internalError: invalidState"));
+        assert!(!blames_the_executable(
+            "",
+            "internalError: no such file or directory"
+        ));
+    }
+
+    /// End to end: a daemon that refuses the start naming the executable is
+    /// tolerable to the readiness gate, and one that refuses it naming the
+    /// working directory is not — even though both carry the same `ENOENT`
+    /// wording.
+    #[tokio::test]
+    async fn an_enoent_about_the_working_directory_stays_fatal_to_readiness() {
+        let blamed = FakeExecDaemon::refusing_the_start_with(
+            "internalError: exec /bin/echo: no such file or directory",
+        );
+        let message = bounded_exec(&blamed)
+            .await
+            .expect_err("a refused start must surface as an error")
+            .to_string();
+        assert!(
+            is_missing_command_failure(&message),
+            "an ENOENT naming the executable is the image's business: {message}"
+        );
+
+        let elsewhere = FakeExecDaemon::refusing_the_start_with(
+            "internalError: chdir /workspaces/api: no such file or directory",
+        );
+        let message = bounded_exec(&elsewhere)
+            .await
+            .expect_err("a refused start must surface as an error")
+            .to_string();
+        assert!(
+            !is_missing_command_failure(&message),
+            "an ENOENT this client cannot attribute to the command must stay fatal: {message}"
+        );
     }
 
     /// The wording the classifier reads back is the wording the exec path

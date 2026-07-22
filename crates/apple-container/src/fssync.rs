@@ -356,15 +356,10 @@ fn collect_dir(
         let Ok(relative) = path.strip_prefix(root) else {
             continue;
         };
-        // `to_string_lossy` would mint a `U+FFFD` name whose bytes name a
-        // different path than the one being read, so a name this crate cannot
-        // carry stops the walk instead of being sent under a wrong one.
-        let Some(name) = relative.to_str().map(str::to_string) else {
-            return Err(AppleContainerError::XpcError(format!(
-                "build context path {} is not valid UTF-8 and cannot be named in the archive",
-                path.display()
-            )));
-        };
+        // Only ever used to decide against a path, so a lossy reading of it is
+        // safe: nothing is transferred under this name. The name a selected
+        // entry is stored under comes from `selected_name`.
+        let candidate = relative.to_string_lossy();
         // `symlink_metadata` describes the link itself, so a symlink is sent
         // as a link rather than being followed out of the context.
         let metadata = match std::fs::symlink_metadata(&path) {
@@ -378,9 +373,10 @@ fn collect_dir(
         };
 
         if metadata.is_dir() {
-            if !filter.matches_dir(&name) {
+            if !filter.matches_dir(&candidate) {
                 continue;
             }
+            let name = selected_name(relative, &path)?;
             push_entry(
                 entries,
                 ContextEntry {
@@ -399,9 +395,10 @@ fn collect_dir(
             if !metadata.is_file() && !metadata.is_symlink() {
                 continue;
             }
-            if !filter.matches_file(&name) {
+            if !filter.matches_file(&candidate) {
                 continue;
             }
+            let name = selected_name(relative, &path)?;
             push_entry(
                 entries,
                 ContextEntry {
@@ -414,6 +411,24 @@ fn collect_dir(
     }
 
     Ok(())
+}
+
+/// The archive name for a path the walk has decided to send.
+///
+/// `to_string_lossy` would mint a `U+FFFD` name whose bytes name a different
+/// path than the one being read, so a name this crate cannot carry stops the
+/// walk instead of being sent under a wrong one. Only for a path that is
+/// actually selected, though: raising it before the type check and the
+/// `.dockerignore` filter would fail the whole build over a stray socket or an
+/// excluded artifact, and leave the user with advice that cannot work.
+fn selected_name(relative: &Path, path: &Path) -> Result<String, AppleContainerError> {
+    relative.to_str().map(str::to_string).ok_or_else(|| {
+        AppleContainerError::XpcError(format!(
+            "build context path {} is not valid UTF-8 and cannot be named in the archive; \
+             exclude it with a .dockerignore",
+            path.display()
+        ))
+    })
 }
 
 /// Record one selected path, refusing a context wider than the walk will hold.
@@ -1087,6 +1102,26 @@ mod tests {
             names,
             vec!["app.txt"],
             "a named pipe must not be opened by the transfer"
+        );
+    }
+
+    /// A name the archive cannot carry stops the walk rather than being sent
+    /// under a lossy one whose bytes name a different path. The advice it gives
+    /// is only actionable because the guard runs after `matches_file` and the
+    /// type check, so an excluded artifact never reaches it.
+    #[test]
+    fn a_name_that_is_not_utf8_is_refused_with_advice_that_works() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let relative = Path::new(std::ffi::OsStr::from_bytes(b"vendor/bad\xff.iso"));
+        let error = selected_name(relative, Path::new("/ctx/vendor/bad.iso"))
+            .expect_err("a name the archive cannot carry must stop the walk");
+        assert!(error.to_string().contains(".dockerignore"), "{error}");
+
+        assert_eq!(
+            selected_name(Path::new("a/b.txt"), Path::new("/ctx/a/b.txt"))
+                .expect("a name the archive can carry"),
+            "a/b.txt"
         );
     }
 
