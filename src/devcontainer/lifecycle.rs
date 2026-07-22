@@ -5,6 +5,10 @@ use crate::runtime::{ContainerRuntime, ExecResult};
 
 /// Execute all lifecycle hooks in the devcontainer spec order.
 ///
+/// Container lifecycle hooks are workspace-scoped commands: callers pass the
+/// resolved `workspaceFolder` so a reused container with a stale `WorkingDir`
+/// does not run hooks in an unrelated directory.
+///
 /// Hooks run in order:
 /// 1. onCreateCommand  (feature hooks first, then devcontainer.json)
 /// 2. updateContentCommand
@@ -18,6 +22,7 @@ pub async fn run_lifecycle_hooks<R: ContainerRuntime + ?Sized>(
     container_id: &str,
     config: &DevcontainerConfig,
     user: Option<&str>,
+    workdir: Option<&str>,
     features: Option<&[ResolvedFeature]>,
 ) -> Result<(), DevError> {
     let empty = Vec::new();
@@ -32,17 +37,26 @@ pub async fn run_lifecycle_hooks<R: ContainerRuntime + ?Sized>(
                 &format!("onCreateCommand [{}]", f.id),
                 cmd,
                 user,
+                workdir,
             )
             .await?;
         }
     }
     if let Some(ref cmd) = config.on_create_command {
-        run_hook(runtime, container_id, "onCreateCommand", cmd, user).await?;
+        run_hook(runtime, container_id, "onCreateCommand", cmd, user, workdir).await?;
     }
 
     // updateContentCommand: config only (features don't declare this)
     if let Some(ref cmd) = config.update_content_command {
-        run_hook(runtime, container_id, "updateContentCommand", cmd, user).await?;
+        run_hook(
+            runtime,
+            container_id,
+            "updateContentCommand",
+            cmd,
+            user,
+            workdir,
+        )
+        .await?;
     }
 
     // postCreateCommand: features first, then config
@@ -54,12 +68,21 @@ pub async fn run_lifecycle_hooks<R: ContainerRuntime + ?Sized>(
                 &format!("postCreateCommand [{}]", f.id),
                 cmd,
                 user,
+                workdir,
             )
             .await?;
         }
     }
     if let Some(ref cmd) = config.post_create_command {
-        run_hook(runtime, container_id, "postCreateCommand", cmd, user).await?;
+        run_hook(
+            runtime,
+            container_id,
+            "postCreateCommand",
+            cmd,
+            user,
+            workdir,
+        )
+        .await?;
     }
 
     // postStartCommand: features first, then config
@@ -71,12 +94,21 @@ pub async fn run_lifecycle_hooks<R: ContainerRuntime + ?Sized>(
                 &format!("postStartCommand [{}]", f.id),
                 cmd,
                 user,
+                workdir,
             )
             .await?;
         }
     }
     if let Some(ref cmd) = config.post_start_command {
-        run_hook(runtime, container_id, "postStartCommand", cmd, user).await?;
+        run_hook(
+            runtime,
+            container_id,
+            "postStartCommand",
+            cmd,
+            user,
+            workdir,
+        )
+        .await?;
     }
 
     Ok(())
@@ -92,6 +124,7 @@ pub async fn run_post_attach_hooks<R: ContainerRuntime + ?Sized>(
     container_id: &str,
     config: &DevcontainerConfig,
     user: Option<&str>,
+    workdir: Option<&str>,
     features: Option<&[ResolvedFeature]>,
 ) -> Result<(), DevError> {
     let empty = Vec::new();
@@ -105,12 +138,21 @@ pub async fn run_post_attach_hooks<R: ContainerRuntime + ?Sized>(
                 &format!("postAttachCommand [{}]", f.id),
                 cmd,
                 user,
+                workdir,
             )
             .await?;
         }
     }
     if let Some(ref cmd) = config.post_attach_command {
-        run_hook(runtime, container_id, "postAttachCommand", cmd, user).await?;
+        run_hook(
+            runtime,
+            container_id,
+            "postAttachCommand",
+            cmd,
+            user,
+            workdir,
+        )
+        .await?;
     }
 
     Ok(())
@@ -122,24 +164,25 @@ async fn run_hook<R: ContainerRuntime + ?Sized>(
     name: &str,
     cmd: &LifecycleCommand,
     user: Option<&str>,
+    workdir: Option<&str>,
 ) -> Result<(), DevError> {
     match cmd {
         LifecycleCommand::Single(command) => {
             eprintln!("[lifecycle] Running {name}: {command}");
             let args = vec!["sh".to_string(), "-c".to_string(), command.clone()];
-            let result = runtime.exec(container_id, &args, user).await?;
+            let result = runtime.exec(container_id, &args, user, workdir).await?;
             check_result(name, command, &result)?;
         }
         LifecycleCommand::Multiple(commands) => {
             for command in commands {
                 eprintln!("[lifecycle] Running {name}: {command}");
                 let args = vec!["sh".to_string(), "-c".to_string(), command.clone()];
-                let result = runtime.exec(container_id, &args, user).await?;
+                let result = runtime.exec(container_id, &args, user, workdir).await?;
                 check_result(name, command, &result)?;
             }
         }
         LifecycleCommand::Parallel(commands) => {
-            run_parallel(runtime, container_id, name, commands, user).await?;
+            run_parallel(runtime, container_id, name, commands, user, workdir).await?;
         }
     }
     Ok(())
@@ -152,6 +195,7 @@ async fn run_parallel<R: ContainerRuntime + ?Sized>(
     name: &str,
     commands: &std::collections::HashMap<String, String>,
     user: Option<&str>,
+    workdir: Option<&str>,
 ) -> Result<(), DevError> {
     use futures_util::future::join_all;
 
@@ -163,11 +207,14 @@ async fn run_parallel<R: ContainerRuntime + ?Sized>(
             let container_id = container_id.to_string();
             let name = name.to_string();
             let user = user.map(|u| u.to_string());
+            let workdir = workdir.map(|d| d.to_string());
 
             async move {
                 eprintln!("[lifecycle] Running {name} ({label}): {command}");
                 let args = vec!["sh".to_string(), "-c".to_string(), command.clone()];
-                let result = runtime.exec(&container_id, &args, user.as_deref()).await?;
+                let result = runtime
+                    .exec(&container_id, &args, user.as_deref(), workdir.as_deref())
+                    .await?;
                 check_result(&name, &command, &result)?;
                 Ok::<(), DevError>(())
             }

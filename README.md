@@ -65,6 +65,8 @@ column of `dev list templates`, not a fully qualified OCI reference.
 
 `dev up` resolves the effective config (merging the layers below), builds the derived image if features have changed, creates and starts the container, runs lifecycle hooks, and prints `Container '<name>' is ready.`
 
+For workspace-scoped commands, `dev` uses the effective devcontainer `workspaceFolder` as the working directory. This includes lifecycle hooks, `dev exec`, and `dev shell`, even when `dev up` reuses an existing Docker or Podman container whose own `WorkingDir` was configured differently. If that folder is not usable in the container, the command fails instead of continuing from an unrelated fallback directory. Dotfiles setup, port-forward helper commands, and the existing Compose path keep their own command-specific directory behavior.
+
 ```sh
 dev up                  # build if needed and start
 dev up --rebuild        # rebuild the image even if it exists

@@ -209,7 +209,18 @@ pub trait ContainerRuntime: Send + Sync {
 
     fn remove_container(&self, id: &str) -> BoxFut<'_, ()>;
 
-    fn exec(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, ExecResult>;
+    /// Run a command inside the container.
+    ///
+    /// `workdir` is for callers that have a command-scoped directory such as
+    /// the resolved devcontainer `workspaceFolder`. Leaving it unset preserves
+    /// runtime inheritance for commands with their own target semantics.
+    fn exec(
+        &self,
+        id: &str,
+        cmd: &[String],
+        user: Option<&str>,
+        workdir: Option<&str>,
+    ) -> BoxFut<'_, ExecResult>;
 
     /// Whether an [`Self::exec`] failure means the image has no such
     /// executable, rather than the runtime being unable to run one at all.
@@ -229,8 +240,14 @@ pub trait ContainerRuntime: Send + Sync {
     }
 
     /// Run a command attached to the caller's terminal, returning its exit code
-    /// once it finishes.
-    fn exec_interactive(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, i32>;
+    /// once it finishes. `workdir` has the same meaning as on [`Self::exec`].
+    fn exec_interactive(
+        &self,
+        id: &str,
+        cmd: &[String],
+        user: Option<&str>,
+        workdir: Option<&str>,
+    ) -> BoxFut<'_, i32>;
 
     fn inspect_container(&self, id: &str) -> BoxFut<'_, ContainerInfo>;
 

@@ -391,7 +391,12 @@ async fn run_forwarder(
 async fn find_netcat(runtime: &dyn ContainerRuntime, container_id: &str) -> anyhow::Result<String> {
     for name in &["nc", "ncat", "netcat"] {
         let result = runtime
-            .exec(container_id, &["which".to_string(), name.to_string()], None)
+            .exec(
+                container_id,
+                &["which".to_string(), name.to_string()],
+                None,
+                None,
+            )
             .await?;
         if result.exit_code == 0 {
             return Ok(name.to_string());

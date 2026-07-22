@@ -78,9 +78,10 @@ impl AppleRuntime {
         id: &str,
         cmd: &[String],
         user: Option<&str>,
+        workdir: Option<&str>,
     ) -> Result<ExecResult, DevError> {
         let defaults = self.container_process_defaults(id).await;
-        let proc_config = exec_process_config(cmd, user, false, &defaults);
+        let proc_config = exec_process_config(cmd, user, false, &defaults, workdir);
         run_captured_process(&self.client, id, &proc_config).await
     }
 
@@ -126,11 +127,12 @@ impl AppleRuntime {
         id: &str,
         cmd: &[String],
         user: Option<&str>,
+        workdir: Option<&str>,
     ) -> Result<i32, DevError> {
         // Resolved before raw mode: this can warn, and a raw terminal needs
         // CRLF to keep such output from staircasing.
         let defaults = self.container_process_defaults(id).await;
-        let proc_config = exec_process_config(cmd, user, true, &defaults);
+        let proc_config = exec_process_config(cmd, user, true, &defaults, workdir);
 
         let _raw_guard = RawModeGuard::enter()?;
         let process_id = next_process_id("exec-interactive");
@@ -526,12 +528,13 @@ fn exec_process_config(
     user: Option<&str>,
     terminal: bool,
     defaults: &ProcessDefaults,
+    workdir: Option<&str>,
 ) -> ProcessConfiguration {
     ProcessConfiguration {
         executable: cmd.first().cloned().unwrap_or_default(),
         arguments: cmd.get(1..).map(<[String]>::to_vec).unwrap_or_default(),
         environment: defaults.environment.clone(),
-        working_directory: absolute_or_root([Some(defaults.working_directory.as_str())]),
+        working_directory: absolute_or_root([workdir, Some(defaults.working_directory.as_str())]),
         terminal,
         user: to_apple_user(user),
         supplemental_groups: vec![],
@@ -1387,22 +1390,42 @@ impl ContainerRuntime for AppleRuntime {
         })
     }
 
-    fn exec(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, ExecResult> {
+    fn exec(
+        &self,
+        id: &str,
+        cmd: &[String],
+        user: Option<&str>,
+        workdir: Option<&str>,
+    ) -> BoxFut<'_, ExecResult> {
         let id = id.to_string();
         let cmd = cmd.to_vec();
         let user = user.map(|u| u.to_string());
-        Box::pin(async move { self.exec_impl(&id, &cmd, user.as_deref()).await })
+        let workdir = workdir.map(|d| d.to_string());
+        Box::pin(async move {
+            self.exec_impl(&id, &cmd, user.as_deref(), workdir.as_deref())
+                .await
+        })
     }
 
     fn exec_reports_missing_command(&self, error: &DevError) -> bool {
         is_missing_command_failure(&error.to_string())
     }
 
-    fn exec_interactive(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, i32> {
+    fn exec_interactive(
+        &self,
+        id: &str,
+        cmd: &[String],
+        user: Option<&str>,
+        workdir: Option<&str>,
+    ) -> BoxFut<'_, i32> {
         let id = id.to_string();
         let cmd = cmd.to_vec();
         let user = user.map(|u| u.to_string());
-        Box::pin(async move { self.exec_interactive_impl(&id, &cmd, user.as_deref()).await })
+        let workdir = workdir.map(|d| d.to_string());
+        Box::pin(async move {
+            self.exec_interactive_impl(&id, &cmd, user.as_deref(), workdir.as_deref())
+                .await
+        })
     }
 
     fn inspect_container(&self, id: &str) -> BoxFut<'_, ContainerInfo> {
@@ -1881,6 +1904,7 @@ mod tests {
                 working_directory: "/tmp".to_string(),
                 environment: Vec::new(),
             },
+            None,
         )
     }
 
@@ -2448,13 +2472,14 @@ mod tests {
             None,
             false,
             &defaults_in("/workspaces/demo"),
+            None,
         );
         assert_eq!(config.executable, "sh");
         assert_eq!(config.arguments, vec!["-c", "echo hi"]);
         assert!(!config.terminal);
         assert_eq!(config.working_directory, "/workspaces/demo");
 
-        let empty = exec_process_config(&[], None, true, &defaults_in("/"));
+        let empty = exec_process_config(&[], None, true, &defaults_in("/"), None);
         assert_eq!(empty.executable, "");
         assert!(empty.arguments.is_empty());
         assert!(empty.terminal);
@@ -2482,7 +2507,7 @@ mod tests {
             ],
         };
 
-        let config = exec_process_config(&["npm".to_string()], None, false, &defaults);
+        let config = exec_process_config(&["npm".to_string()], None, false, &defaults, None);
 
         assert_eq!(
             config.environment, defaults.environment,
@@ -2512,7 +2537,7 @@ mod tests {
             working_directory: apple_config.init_process.working_directory.clone(),
             environment: apple_config.init_process.environment.clone(),
         };
-        let exec = exec_process_config(&["sh".to_string()], None, false, &defaults);
+        let exec = exec_process_config(&["sh".to_string()], None, false, &defaults, None);
 
         assert!(
             exec.environment
@@ -2534,6 +2559,7 @@ mod tests {
             None,
             false,
             &defaults_in("/workspaces/project"),
+            None,
         );
         assert_eq!(
             config.working_directory, "/workspaces/project",
@@ -2546,7 +2572,8 @@ mod tests {
     #[test]
     fn unusable_working_directories_fall_back_to_root() {
         for spec in ["", "relative/path"] {
-            let config = exec_process_config(&["sh".to_string()], None, false, &defaults_in(spec));
+            let config =
+                exec_process_config(&["sh".to_string()], None, false, &defaults_in(spec), None);
             assert_eq!(
                 config.working_directory, "/",
                 "{spec:?} must fall back to /"
@@ -3160,7 +3187,7 @@ mod tests {
             let described = cmd.join(" ");
             tokio::time::timeout(
                 std::time::Duration::from_secs(30),
-                runtime.exec(id, &cmd, None),
+                runtime.exec(id, &cmd, None, None),
             )
             .await
             .unwrap_or_else(|_| panic!("exec hung: {described}"))
@@ -3222,6 +3249,7 @@ mod tests {
             None,
             true,
             &defaults,
+            None,
         );
         let (terminal_out, terminal_in) = terminal_pipe();
         let process_id = next_process_id("exec-interactive-smoke");
@@ -3307,13 +3335,14 @@ mod tests {
             environment: Vec::new(),
         };
 
-        let interactive = exec_process_config(&["/bin/sh".to_string()], None, true, &defaults);
+        let interactive =
+            exec_process_config(&["/bin/sh".to_string()], None, true, &defaults, None);
         assert!(
             interactive.terminal,
             "dev shell runs against the caller's terminal"
         );
 
-        let captured = exec_process_config(&["/bin/sh".to_string()], None, false, &defaults);
+        let captured = exec_process_config(&["/bin/sh".to_string()], None, false, &defaults, None);
         assert!(
             !captured.terminal,
             "a captured exec reads its own stdout and stderr and must not ask for a pty"

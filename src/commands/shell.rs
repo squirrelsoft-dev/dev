@@ -36,7 +36,9 @@ pub async fn run(
         let mut found = None;
         for candidate in &candidates {
             let probe = vec!["test".to_string(), "-x".to_string(), candidate.to_string()];
-            let result = runtime.exec(&container.id, &probe, user.as_deref()).await?;
+            let result = runtime
+                .exec(&container.id, &probe, user.as_deref(), None)
+                .await?;
             if result.exit_code == 0 {
                 found = Some(candidate.to_string());
                 break;
@@ -59,12 +61,12 @@ pub async fn run(
         "-c".to_string(),
         format!(
             "cd {quoted_workdir} || \
-             printf 'dev: could not enter %s; starting in the container default\\n' \
-             {quoted_workdir} >&2; exec {quoted_shell} -l"
+             {{ printf 'dev: could not enter %s\\n' {quoted_workdir} >&2; exit 1; }}; \
+             exec {quoted_shell} -l"
         ),
     ];
     let exit_code = runtime
-        .exec_interactive(&container.id, &cmd, user.as_deref())
+        .exec_interactive(&container.id, &cmd, user.as_deref(), Some(&workdir))
         .await?;
 
     if exit_code != 0 {

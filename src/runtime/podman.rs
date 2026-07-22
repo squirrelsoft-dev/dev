@@ -52,6 +52,26 @@ fn podman_socket_path() -> Result<String, DevError> {
     ))
 }
 
+fn podman_exec_args(
+    id: &str,
+    cmd: &[String],
+    user: Option<&str>,
+    workdir: Option<&str>,
+) -> Vec<String> {
+    let mut args = vec!["exec".to_string(), "-it".to_string()];
+    if let Some(u) = user {
+        args.push("--user".to_string());
+        args.push(u.to_string());
+    }
+    if let Some(dir) = workdir {
+        args.push("--workdir".to_string());
+        args.push(dir.to_string());
+    }
+    args.push(id.to_string());
+    args.extend(cmd.iter().cloned());
+    args
+}
+
 impl ContainerRuntime for PodmanRuntime {
     fn runtime_name(&self) -> &'static str {
         "podman"
@@ -90,28 +110,35 @@ impl ContainerRuntime for PodmanRuntime {
         self.0.remove_container(id)
     }
 
-    fn exec(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, ExecResult> {
-        self.0.exec(id, cmd, user)
+    fn exec(
+        &self,
+        id: &str,
+        cmd: &[String],
+        user: Option<&str>,
+        workdir: Option<&str>,
+    ) -> BoxFut<'_, ExecResult> {
+        self.0.exec(id, cmd, user, workdir)
     }
 
     fn exec_reports_missing_command(&self, error: &DevError) -> bool {
         self.0.exec_reports_missing_command(error)
     }
 
-    fn exec_interactive(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, i32> {
+    fn exec_interactive(
+        &self,
+        id: &str,
+        cmd: &[String],
+        user: Option<&str>,
+        workdir: Option<&str>,
+    ) -> BoxFut<'_, i32> {
         // Podman's HTTP API doesn't reliably support interactive TTY exec via
         // bollard. Shell out to `podman exec -it` instead.
         let id = id.to_string();
         let cmd = cmd.to_vec();
         let user = user.map(|u| u.to_string());
+        let workdir = workdir.map(|d| d.to_string());
         Box::pin(async move {
-            let mut args = vec!["exec".to_string(), "-it".to_string()];
-            if let Some(ref u) = user {
-                args.push("--user".to_string());
-                args.push(u.clone());
-            }
-            args.push(id);
-            args.extend(cmd);
+            let args = podman_exec_args(&id, &cmd, user.as_deref(), workdir.as_deref());
 
             let err = std::process::Command::new("podman").args(&args).exec();
             // exec() only returns on error
@@ -276,5 +303,29 @@ mod tests {
     fn request_json_body(request: &str) -> serde_json::Value {
         let (_, body) = request.split_once("\r\n\r\n").unwrap();
         serde_json::from_str(body).unwrap()
+    }
+
+    #[test]
+    fn interactive_exec_args_include_the_requested_workspace_folder() {
+        let args = podman_exec_args(
+            "container-id",
+            &["bash".to_string()],
+            Some("vscode"),
+            Some("/srv/app/packages/api"),
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "exec",
+                "-it",
+                "--user",
+                "vscode",
+                "--workdir",
+                "/srv/app/packages/api",
+                "container-id",
+                "bash",
+            ]
+        );
     }
 }

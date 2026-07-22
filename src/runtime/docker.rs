@@ -486,11 +486,33 @@ impl BollardRuntime {
         Ok(())
     }
 
+    fn create_exec_options(
+        cmd: &[String],
+        user: Option<&str>,
+        workdir: Option<&str>,
+        attach_stdin: bool,
+        attach_stdout: bool,
+        attach_stderr: bool,
+        tty: bool,
+    ) -> CreateExecOptions<String> {
+        CreateExecOptions {
+            cmd: Some(cmd.to_vec()),
+            attach_stdin: Some(attach_stdin),
+            attach_stdout: Some(attach_stdout),
+            attach_stderr: Some(attach_stderr),
+            tty: Some(tty),
+            user: user.map(|u| u.to_string()),
+            working_dir: workdir.map(|d| d.to_string()),
+            ..Default::default()
+        }
+    }
+
     async fn exec_impl(
         &self,
         id: &str,
         cmd: &[String],
         user: Option<&str>,
+        workdir: Option<&str>,
     ) -> Result<ExecResult, DevError> {
         use futures_util::StreamExt;
 
@@ -498,13 +520,11 @@ impl BollardRuntime {
             .client
             .create_exec(
                 id,
-                CreateExecOptions {
-                    cmd: Some(cmd.to_vec()),
-                    attach_stdout: Some(true),
-                    attach_stderr: Some(true),
-                    user: user.map(|u| u.to_string()),
-                    ..Default::default()
-                },
+                Self::create_exec_options(
+                    cmd, user, workdir, /* attach_stdin */ false,
+                    /* attach_stdout */ true, /* attach_stderr */ true,
+                    /* tty */ false,
+                ),
             )
             .await?;
 
@@ -542,6 +562,7 @@ impl BollardRuntime {
         id: &str,
         cmd: &[String],
         user: Option<&str>,
+        workdir: Option<&str>,
     ) -> Result<i32, DevError> {
         use futures_util::StreamExt;
 
@@ -549,15 +570,11 @@ impl BollardRuntime {
             .client
             .create_exec(
                 id,
-                CreateExecOptions {
-                    cmd: Some(cmd.to_vec()),
-                    attach_stdin: Some(true),
-                    attach_stdout: Some(true),
-                    attach_stderr: Some(true),
-                    tty: Some(true),
-                    user: user.map(|u| u.to_string()),
-                    ..Default::default()
-                },
+                Self::create_exec_options(
+                    cmd, user, workdir, /* attach_stdin */ true,
+                    /* attach_stdout */ true, /* attach_stderr */ true,
+                    /* tty */ true,
+                ),
             )
             .await?;
 
@@ -983,22 +1000,42 @@ impl ContainerRuntime for BollardRuntime {
         Box::pin(async move { self.remove_container_impl(&id).await })
     }
 
-    fn exec(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, ExecResult> {
+    fn exec(
+        &self,
+        id: &str,
+        cmd: &[String],
+        user: Option<&str>,
+        workdir: Option<&str>,
+    ) -> BoxFut<'_, ExecResult> {
         let id = id.to_string();
         let cmd = cmd.to_vec();
         let user = user.map(|u| u.to_string());
-        Box::pin(async move { self.exec_impl(&id, &cmd, user.as_deref()).await })
+        let workdir = workdir.map(|d| d.to_string());
+        Box::pin(async move {
+            self.exec_impl(&id, &cmd, user.as_deref(), workdir.as_deref())
+                .await
+        })
     }
 
     fn exec_reports_missing_command(&self, error: &DevError) -> bool {
         reports_missing_command(error)
     }
 
-    fn exec_interactive(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, i32> {
+    fn exec_interactive(
+        &self,
+        id: &str,
+        cmd: &[String],
+        user: Option<&str>,
+        workdir: Option<&str>,
+    ) -> BoxFut<'_, i32> {
         let id = id.to_string();
         let cmd = cmd.to_vec();
         let user = user.map(|u| u.to_string());
-        Box::pin(async move { self.exec_interactive_impl(&id, &cmd, user.as_deref()).await })
+        let workdir = workdir.map(|d| d.to_string());
+        Box::pin(async move {
+            self.exec_interactive_impl(&id, &cmd, user.as_deref(), workdir.as_deref())
+                .await
+        })
     }
 
     fn inspect_container(&self, id: &str) -> BoxFut<'_, ContainerInfo> {
@@ -1100,16 +1137,28 @@ impl ContainerRuntime for DockerRuntime {
         self.0.remove_container(id)
     }
 
-    fn exec(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, ExecResult> {
-        self.0.exec(id, cmd, user)
+    fn exec(
+        &self,
+        id: &str,
+        cmd: &[String],
+        user: Option<&str>,
+        workdir: Option<&str>,
+    ) -> BoxFut<'_, ExecResult> {
+        self.0.exec(id, cmd, user, workdir)
     }
 
     fn exec_reports_missing_command(&self, error: &DevError) -> bool {
         self.0.exec_reports_missing_command(error)
     }
 
-    fn exec_interactive(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, i32> {
-        self.0.exec_interactive(id, cmd, user)
+    fn exec_interactive(
+        &self,
+        id: &str,
+        cmd: &[String],
+        user: Option<&str>,
+        workdir: Option<&str>,
+    ) -> BoxFut<'_, i32> {
+        self.0.exec_interactive(id, cmd, user, workdir)
     }
 
     fn inspect_container(&self, id: &str) -> BoxFut<'_, ContainerInfo> {
@@ -1255,6 +1304,29 @@ mod tests {
         assert_eq!(host.privileged, Some(true));
         assert_eq!(host.init, Some(true));
         assert_eq!(host.userns_mode.as_deref(), Some("keep-id"));
+    }
+
+    /// Reused containers can carry an older or image-provided `WorkingDir`.
+    /// Workspace-scoped execs must therefore name the resolved folder
+    /// explicitly instead of inheriting whatever the stale container has.
+    #[test]
+    fn exec_options_can_override_a_reused_containers_working_dir() {
+        let opts = BollardRuntime::create_exec_options(
+            &["cargo".to_string(), "test".to_string()],
+            Some("vscode"),
+            Some("/srv/app/packages/api"),
+            false,
+            true,
+            true,
+            false,
+        );
+
+        assert_eq!(opts.working_dir.as_deref(), Some("/srv/app/packages/api"));
+        assert_eq!(opts.user.as_deref(), Some("vscode"));
+        assert_eq!(
+            opts.cmd,
+            Some(vec!["cargo".to_string(), "test".to_string()])
+        );
     }
 
     fn server_error(message: &str) -> DevError {
