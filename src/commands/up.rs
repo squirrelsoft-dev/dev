@@ -652,9 +652,9 @@ struct ReadinessPolls {
 }
 
 impl ReadinessPolls {
-    fn new() -> Self {
+    fn until(deadline: tokio::time::Instant) -> Self {
         Self {
-            deadline: tokio::time::Instant::now() + READINESS_BUDGET,
+            deadline,
             next: READINESS_FIRST_POLL,
         }
     }
@@ -703,8 +703,27 @@ async fn verify_container_usable(
     remote_user: Option<&str>,
     workdir: Option<&str>,
 ) -> anyhow::Result<()> {
-    verify_container_discoverable(runtime, container_id, workspace).await?;
-    verify_container_execs(runtime, container_id, remote_user, workdir).await
+    verify_container_usable_until(
+        runtime,
+        container_id,
+        workspace,
+        remote_user,
+        workdir,
+        tokio::time::Instant::now() + READINESS_BUDGET,
+    )
+    .await
+}
+
+async fn verify_container_usable_until(
+    runtime: &dyn ContainerRuntime,
+    container_id: &str,
+    workspace: &Path,
+    remote_user: Option<&str>,
+    workdir: Option<&str>,
+    deadline: tokio::time::Instant,
+) -> anyhow::Result<()> {
+    verify_container_discoverable_until(runtime, container_id, workspace, deadline).await?;
+    verify_container_execs_until(runtime, container_id, remote_user, workdir, deadline).await
 }
 
 /// Run one trivial command in the container, the way every later command does.
@@ -731,14 +750,15 @@ async fn verify_container_usable(
 /// dropped, which leaves the exec awaiting an exit that never comes — so a gate
 /// that only paced its retries would hang on the very failure it exists to
 /// catch, with `dev up` silent after "Starting container...".
-async fn verify_container_execs(
+async fn verify_container_execs_until(
     runtime: &dyn ContainerRuntime,
     container_id: &str,
     remote_user: Option<&str>,
     workdir: Option<&str>,
+    deadline: tokio::time::Instant,
 ) -> anyhow::Result<()> {
     let probe = vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()];
-    let mut polls = ReadinessPolls::new();
+    let mut polls = ReadinessPolls::until(deadline);
     // The last attempt's outcome is the diagnosis, because it describes the
     // state the container is actually in now. An earlier refusal is kept as
     // context rather than as the headline: a runtime that refused while its
@@ -859,17 +879,18 @@ fn warn_probe_command_missing(container_id: &str, reason: &str) {
 /// with no deadline of its own, so a dropped reply here is the same silent hang
 /// issue #4 is about. Pacing the gaps between polls would never reach the next
 /// one, and `dev up` would sit forever after "Starting container...".
-async fn verify_container_discoverable(
+async fn verify_container_discoverable_until(
     runtime: &dyn ContainerRuntime,
     container_id: &str,
     workspace: &Path,
+    deadline: tokio::time::Instant,
 ) -> anyhow::Result<()> {
     let filters: Vec<String> = workspace_labels(workspace, None)
         .iter()
         .map(|(k, v)| format!("{k}={v}"))
         .collect();
 
-    let mut polls = ReadinessPolls::new();
+    let mut polls = ReadinessPolls::until(deadline);
     // Assigned by every poll, so only the final one's outcome is reported.
     let mut last_error;
     let last_state = loop {
@@ -1389,7 +1410,11 @@ async fn run_compose(
     )
     .await?;
 
-    // 12. Run lifecycle hooks with feature hooks and correct remote_user.
+    // 12. Wait until the resolved target service container is usable before
+    //     lifecycle hooks or success reporting can race ahead of Compose.
+    verify_compose_service_ready(runtime, workspace, service, &container_id, remote_user).await?;
+
+    // 13. Run lifecycle hooks with feature hooks and correct remote_user.
     let feature_hooks = if ordered_features.is_empty() {
         None
     } else {
@@ -1405,7 +1430,7 @@ async fn run_compose(
     )
     .await?;
 
-    // 13. Install dotfiles.
+    // 14. Install dotfiles.
     if let Some(ref dotfiles) = config.dotfiles {
         install_dotfiles(runtime, &container_id, dotfiles, remote_user).await?;
     }
@@ -1428,6 +1453,74 @@ async fn run_compose(
     }
 
     Ok(())
+}
+
+/// Confirm the Compose target service container is ready for Dev-controlled
+/// execs before lifecycle hooks or the final success message run.
+///
+/// `docker compose up -d` starts containers and returns once the transition is
+/// initiated. It does not prove the target service container is already a
+/// usable exec target for workspace commands. The image-based path already
+/// gates that claim with [`verify_container_usable`]; Compose uses that same
+/// supported seam after resolving the configured service's container id, with
+/// one shared deadline across inspect, discovery, and exec.
+async fn verify_compose_service_ready(
+    runtime: &dyn ContainerRuntime,
+    workspace: &Path,
+    service: &str,
+    container_id: &str,
+    remote_user: Option<&str>,
+) -> anyhow::Result<()> {
+    let container_id = container_id.trim();
+    if container_id.is_empty() {
+        anyhow::bail!(
+            "Compose service '{service}' did not resolve to a target container id after \
+             compose up; `compose ps -q {service}` returned nothing."
+        );
+    }
+
+    let deadline = tokio::time::Instant::now() + READINESS_BUDGET;
+    let inspected = tokio::time::timeout_at(deadline, runtime.inspect_container(container_id))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Compose service '{service}' container '{container_id}' could not be \
+                 inspected within {:.1}s after compose up.",
+                READINESS_BUDGET.as_secs_f64()
+            )
+        })?
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Compose service '{service}' container '{container_id}' could not be \
+                 inspected after compose up: {e}"
+            )
+        })?;
+
+    if inspected.state != ContainerState::Running {
+        anyhow::bail!(
+            "Compose service '{service}' container '{container_id}' is {:?}, not running. \
+             Check `compose logs {service}` for why the service exited before Dev could \
+             run workspace commands or lifecycle hooks.",
+            inspected.state
+        );
+    }
+
+    verify_container_usable_until(
+        runtime,
+        container_id,
+        workspace,
+        remote_user,
+        None,
+        deadline,
+    )
+    .await
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "Compose service '{service}' container '{container_id}' did not become usable \
+                 within {:.1}s after compose up: {e}",
+            READINESS_BUDGET.as_secs_f64()
+        )
+    })
 }
 
 /// Substitute variables in each mount entry (string or object form) and emit
@@ -2183,6 +2276,17 @@ mod tests {
         fn create_was_attempted(&self) -> bool {
             self.created_config.lock().unwrap().is_some()
         }
+
+        fn compose_target(self, workspace: &Path, state: ContainerState) -> Self {
+            self.containers.lock().unwrap().push(ContainerInfo {
+                id: self.created_id.clone(),
+                name: "dev-app-1".to_string(),
+                state,
+                labels: workspace_labels(workspace, None).into_iter().collect(),
+                image: "ubuntu:24.04".to_string(),
+            });
+            self
+        }
     }
 
     impl ContainerRuntime for UpFakeRuntime {
@@ -2341,8 +2445,18 @@ mod tests {
             unused()
         }
 
-        fn inspect_container(&self, _id: &str) -> BoxFut<'_, ContainerInfo> {
-            unused()
+        fn inspect_container(&self, id: &str) -> BoxFut<'_, ContainerInfo> {
+            let id = id.to_string();
+            let containers = self.containers.clone();
+            Box::pin(async move {
+                containers
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|container| super::same_container(&container.id, &id))
+                    .cloned()
+                    .ok_or_else(|| DevError::ContainerNotFound(id))
+            })
         }
 
         fn list_containers(&self, label_filters: &[String]) -> BoxFut<'_, Vec<ContainerInfo>> {
@@ -3486,6 +3600,184 @@ mod tests {
         assert!(
             msg.contains("Compose") || msg.contains("compose"),
             "error should direct users to compose service configuration: {msg}"
+        );
+    }
+
+    /// Compose `up -d` can return and `compose ps -q <service>` can identify
+    /// the target container while its exec endpoint is still settling. The
+    /// Compose path must wait through the same bounded usability seam as the
+    /// image path, then return immediately once an exec can run.
+    #[tokio::test(start_paused = true)]
+    async fn compose_readiness_waits_until_the_target_service_can_exec() {
+        let workspace = TempDir::new().unwrap();
+        let rt =
+            UpFakeRuntime::execs_after(3).compose_target(workspace.path(), ContainerState::Running);
+
+        super::verify_compose_service_ready(
+            &rt,
+            workspace.path(),
+            "app",
+            "fake-id",
+            Some("vscode"),
+        )
+        .await
+        .expect("a Compose service whose exec endpoint settles must become ready");
+
+        assert_eq!(
+            rt.execs().len(),
+            4,
+            "readiness must retry the transient exec failures and stop after the first success"
+        );
+        assert!(
+            rt.execs()
+                .iter()
+                .all(|(_, user, workdir)| user.as_deref() == Some("vscode")
+                    && workdir.as_deref().is_none()),
+            "Compose readiness must preserve the existing Compose command working-directory behavior"
+        );
+    }
+
+    /// Terminal Compose service states are not startup timing: once the
+    /// resolved service container is known to be stopped, hooks would fail the
+    /// same way and the user needs service/container context immediately.
+    #[tokio::test(start_paused = true)]
+    async fn compose_readiness_fails_terminal_target_service_state_promptly() {
+        let workspace = TempDir::new().unwrap();
+        let rt = UpFakeRuntime::ok().compose_target(workspace.path(), ContainerState::Stopped);
+        let started = tokio::time::Instant::now();
+
+        let err =
+            super::verify_compose_service_ready(&rt, workspace.path(), "app", "fake-id", None)
+                .await
+                .expect_err("a stopped Compose target service must fail readiness");
+        let msg = format!("{err}");
+
+        assert!(msg.contains("Compose service 'app'"), "{msg}");
+        assert!(msg.contains("fake-id"), "{msg}");
+        assert!(msg.contains("not running"), "{msg}");
+        assert!(
+            rt.execs().is_empty(),
+            "terminal service state must fail before probing exec"
+        );
+        assert!(
+            tokio::time::Instant::now().duration_since(started) < super::READINESS_FIRST_POLL,
+            "terminal service state must not spend the readiness retry budget"
+        );
+    }
+
+    /// If Compose reports no target container id after `up`, there is no
+    /// service container for lifecycle hooks or workspace commands to use.
+    #[tokio::test(start_paused = true)]
+    async fn compose_readiness_fails_missing_target_service_promptly() {
+        let workspace = TempDir::new().unwrap();
+        let rt = UpFakeRuntime::ok();
+        let started = tokio::time::Instant::now();
+
+        let err = super::verify_compose_service_ready(&rt, workspace.path(), "app", "", None)
+            .await
+            .expect_err("a missing Compose target service id must fail readiness");
+        let msg = format!("{err}");
+
+        assert!(msg.contains("Compose service 'app'"), "{msg}");
+        assert!(msg.contains("container id"), "{msg}");
+        assert!(rt.execs().is_empty(), "missing service must not be probed");
+        assert!(
+            tokio::time::Instant::now().duration_since(started) < super::READINESS_FIRST_POLL,
+            "missing service must not spend the readiness retry budget"
+        );
+    }
+
+    /// A service that is running and discoverable but never reports an exec
+    /// exit must exhaust the bounded readiness budget, not hang forever or let
+    /// lifecycle hooks run.
+    #[tokio::test(start_paused = true)]
+    async fn compose_readiness_fails_when_target_service_never_becomes_usable() {
+        let workspace = TempDir::new().unwrap();
+        let rt = UpFakeRuntime::execs_never_return()
+            .compose_target(workspace.path(), ContainerState::Running);
+
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(600),
+            super::verify_compose_service_ready(&rt, workspace.path(), "app", "fake-id", None),
+        )
+        .await
+        .expect("Compose readiness must bound the probe rather than wait forever")
+        .expect_err("a never-usable Compose service must fail readiness");
+        let msg = format!("{err}");
+
+        assert!(msg.contains("Compose service 'app'"), "{msg}");
+        assert!(msg.contains("fake-id"), "{msg}");
+        assert!(msg.contains("did not report an exit"), "{msg}");
+    }
+
+    /// Compose readiness is one user-visible 15-second operation, not one
+    /// 15-second budget for discovery followed by another for exec. Both
+    /// phases are slow here; the old stacked-budget implementation succeeded
+    /// after the documented bound instead of failing at the shared deadline.
+    #[tokio::test(start_paused = true)]
+    async fn compose_readiness_shares_one_deadline_across_discovery_and_exec() {
+        let workspace = TempDir::new().unwrap();
+        let rt = UpFakeRuntime {
+            list_errors_before_success: Arc::new(AtomicUsize::new(16)),
+            exec_errors_before_success: Arc::new(AtomicUsize::new(16)),
+            ..UpFakeRuntime::ok()
+        }
+        .compose_target(workspace.path(), ContainerState::Running);
+        rt.start_container("fake-id")
+            .await
+            .expect("fake start marks the compose target as in the post-up window");
+
+        let started = tokio::time::Instant::now();
+        let err =
+            super::verify_compose_service_ready(&rt, workspace.path(), "app", "fake-id", None)
+                .await
+                .expect_err("compose readiness must fail at the one shared deadline");
+        let elapsed = tokio::time::Instant::now().duration_since(started);
+        let msg = format!("{err}");
+
+        assert!(
+            elapsed <= super::READINESS_BUDGET,
+            "readiness must not exceed the shared budget; elapsed {elapsed:?}"
+        );
+        assert!(msg.contains("Compose service 'app'"), "{msg}");
+        assert!(msg.contains("fake-id"), "{msg}");
+        assert!(msg.contains("15.0s"), "{msg}");
+        assert!(
+            msg.contains("did not report an exit") || msg.contains("exec failed (test-injected)"),
+            "the timeout should retain the exec-side last cause after discovery consumed budget: {msg}"
+        );
+    }
+
+    /// Lifecycle hooks are the visible race: without a readiness gate the
+    /// first postStartCommand is the first exec and fails. The bounded helper
+    /// must finish before hooks run, so the hook is after the successful probe.
+    #[tokio::test(start_paused = true)]
+    async fn compose_lifecycle_hooks_run_only_after_readiness_probe_succeeds() {
+        let workspace = TempDir::new().unwrap();
+        let config: DevcontainerConfig = serde_json::from_str(
+            r#"{"dockerComposeFile":"compose.yml","service":"app","postStartCommand":"touch ready"}"#,
+        )
+        .unwrap();
+        let rt =
+            UpFakeRuntime::execs_after(2).compose_target(workspace.path(), ContainerState::Running);
+
+        super::verify_compose_service_ready(&rt, workspace.path(), "app", "fake-id", None)
+            .await
+            .expect("readiness should wait for the target service to become usable");
+        crate::devcontainer::run_lifecycle_hooks(&rt, "fake-id", &config, None, None, None)
+            .await
+            .expect("lifecycle hook should run after readiness");
+
+        let execs = rt.execs();
+        assert_eq!(
+            execs.len(),
+            4,
+            "two transient probe failures, one successful probe, then the lifecycle hook"
+        );
+        assert_eq!(
+            execs.last().map(|(cmd, _, _)| cmd.join(" ")),
+            Some("sh -c touch ready".to_string()),
+            "the lifecycle hook must not race ahead of the successful readiness probe"
         );
     }
 
