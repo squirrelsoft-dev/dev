@@ -231,6 +231,18 @@ dev up --runtime apple
 
 Docker Compose (`dockerComposeFile`) is supported for the full lifecycle — build, up, down, shell, exec, features, UID remapping — and uses `docker compose` or `podman compose` depending on the selected runtime.
 
+After Compose starts services and `dev` resolves the configured `service`
+container, `dev up` waits up to 15 seconds for that target container to become
+usable for Dev-controlled execs before it runs lifecycle hooks or reports
+success. It returns as soon as the target container is running, discoverable by
+the workspace labels `dev exec` uses, and able to start and report a trivial
+command. A stopped/exited target service, missing service container id, or
+inspect failure fails promptly with the Compose service and container context;
+a service that keeps running but never accepts usable execs fails with the
+bounded readiness timeout. This is not an application-health gate: Compose
+healthchecks and `depends_on` remain the project's mechanism for waiting on
+databases, web servers, or other service-level readiness.
+
 ## runArgs support
 
 `devcontainer.json`'s `runArgs` is a list of Docker/Podman `run` flags. `dev`
