@@ -132,5 +132,5 @@ pub async fn config(action: Option<ConfigAction>, verbose: u8) -> anyhow::Result
         eprintln!("Created base config at {}", config_path.display());
     }
 
-    super::config::run(&config_path, action, verbose).await
+    super::config::run_base(&config_path, action, verbose).await
 }

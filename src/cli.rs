@@ -297,3 +297,51 @@ pub enum ConfigAction {
     /// Show current configuration summary
     List,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parsed_runtime(args: &[&str]) -> Option<String> {
+        Cli::try_parse_from(args).unwrap().runtime
+    }
+
+    #[test]
+    fn runtime_override_parses_before_and_after_runtime_consuming_commands() {
+        for command in [
+            vec!["dev", "--runtime", "apple", "build"],
+            vec!["dev", "build", "--runtime", "apple"],
+            vec!["dev", "--runtime", "apple", "up"],
+            vec!["dev", "up", "--runtime", "apple"],
+            vec!["dev", "--runtime", "apple", "down"],
+            vec!["dev", "down", "--runtime", "apple"],
+            vec!["dev", "--runtime", "apple", "exec", "true"],
+            vec!["dev", "exec", "--runtime", "apple", "true"],
+            vec!["dev", "--runtime", "apple", "forward", "8080"],
+            vec!["dev", "forward", "--runtime", "apple", "8080"],
+            vec!["dev", "--runtime", "apple", "shell"],
+            vec!["dev", "shell", "--runtime", "apple"],
+            vec!["dev", "--runtime", "apple", "open"],
+            vec!["dev", "open", "--runtime", "apple"],
+            vec!["dev", "--runtime", "apple", "status"],
+            vec!["dev", "status", "--runtime", "apple"],
+        ] {
+            assert_eq!(
+                parsed_runtime(&command),
+                Some("apple".to_string()),
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_cli_runtime_values_are_rejected_before_selection() {
+        let err = Cli::try_parse_from(["dev", "--runtime", "containerd", "status"]).unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("containerd"), "{message}");
+        assert!(message.contains("docker"), "{message}");
+        assert!(message.contains("podman"), "{message}");
+        assert!(message.contains("apple"), "{message}");
+    }
+}

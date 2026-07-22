@@ -122,11 +122,15 @@ A project with its own `.devcontainer/devcontainer.json` merges just the base co
 dev base edit                                       # open in $EDITOR
 dev base new                                        # interactive, with feature selection
 dev base config set remoteUser vscode
+dev base config set defaultRuntime apple            # docker, podman, or apple
 dev base config add features ghcr.io/devcontainers/features/common-utils:2
 dev base config add remoteEnv EDITOR=vim
+dev base config unset defaultRuntime                # return runtime selection to auto-detect
 ```
 
-If no base config exists, the layer is skipped. Pass `--no-base` to `dev up`/`dev build` to skip it for one run. The base layer is merged in memory only — it is never written into the project's own config, and features it contributes are kept out of the project's `devcontainer-lock.json`.
+If no base config exists, the layer is skipped. Pass `--no-base` to `dev up`/`dev build` to skip the devcontainer settings in this layer for one run. The base layer is merged in memory only — it is never written into the project's own config, and features it contributes are kept out of the project's `devcontainer-lock.json`.
+
+`defaultRuntime` is a `dev` preference stored in this same base config file, not a separate runtime config. It accepts `docker`, `podman`, or `apple` and applies to every command that selects a container runtime (`up`, `build`, `shell`, `exec`, `status`, `down`, `forward`, `open`, and recipe-project `config`). Removing it leaves no stale state and restores the same automatic runtime selection used by a fresh install. `--no-base` skips base devcontainer settings for `up` and `build`; it does not disable `defaultRuntime`, because runtime selection happens before the effective devcontainer config is loaded.
 
 ### Global templates
 
@@ -190,7 +194,26 @@ dev up --runtime podman      # force a runtime
 dev up --runtime docker
 ```
 
-**Apple Containers** is an opt-in, macOS-only runtime that talks to the native container stack over XPC rather than the Docker API. It is **not** auto-detected: you must build with the `apple` feature and pass `--runtime apple` explicitly. It is still evolving — compose-based configs and some flows route through the Docker/Podman compose CLI and are not available under it.
+Runtime selection precedence is:
+
+1. `--runtime <docker|podman|apple>` on the command line.
+2. `defaultRuntime` in `~/.dev/base/devcontainer.json`.
+3. Automatic Docker/Podman detection.
+
+The global `--runtime` flag can be placed before or after the subcommand, and it always overrides the configured default for that one invocation.
+
+```sh
+dev base config set defaultRuntime apple
+dev up                         # uses Apple Containers
+dev status                     # uses the same configured default
+dev up --runtime docker        # one-command override
+dev base config unset defaultRuntime
+dev up                         # back to Docker/Podman auto-detection
+```
+
+Invalid configured values name the bad value and the accepted values (`docker`, `podman`, `apple`) and tell you to change or unset `defaultRuntime`. If the configured runtime is valid but unavailable on the host, `dev` reports that it came from `defaultRuntime` and tells you how to start that runtime, choose another one, or unset the preference. If the configured runtime is not compiled into the binary, `dev` reports that separately; for Apple Containers, build on macOS with `--features apple`, choose another runtime, or unset the preference.
+
+**Apple Containers** is an opt-in, macOS-only runtime that talks to the native container stack over XPC rather than the Docker API. It is **not** auto-detected: you must build with the `apple` feature and select it with `--runtime apple` or `dev base config set defaultRuntime apple`. It is still evolving — compose-based configs and some flows route through the Docker/Podman compose CLI and are not available under it.
 
 ```sh
 # build with Apple Containers support (macOS, needs protoc on PATH)

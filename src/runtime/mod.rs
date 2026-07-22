@@ -6,10 +6,56 @@ pub mod podman;
 
 use crate::error::DevError;
 use std::collections::HashMap;
+use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncWrite};
+
+use crate::devcontainer::jsonc::parse_jsonc;
+use crate::util::paths::DevHome;
+
+pub(crate) const DEFAULT_RUNTIME_PROPERTY: &str = "defaultRuntime";
+pub(crate) const ACCEPTED_RUNTIME_VALUES: &str = "docker, podman, apple";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeName {
+    Docker,
+    Podman,
+    Apple,
+}
+
+impl RuntimeName {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "docker" => Some(Self::Docker),
+            "podman" => Some(Self::Podman),
+            "apple" => Some(Self::Apple),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Docker => "docker",
+            Self::Podman => "podman",
+            Self::Apple => "apple",
+        }
+    }
+}
+
+impl std::fmt::Display for RuntimeName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeSelection {
+    Explicit(RuntimeName),
+    Configured(RuntimeName),
+    Auto,
+}
 
 /// Container state as reported by the runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,26 +261,153 @@ pub async fn resolve_remote_user(
 pub async fn detect_runtime(
     override_runtime: Option<&str>,
 ) -> Result<Box<dyn ContainerRuntime>, DevError> {
+    let selection = select_runtime_in(&DevHome::current(), override_runtime)?;
+    match selection {
+        RuntimeSelection::Explicit(name) => connect_explicit_runtime(name).await,
+        RuntimeSelection::Configured(name) => connect_configured_runtime(name).await,
+        RuntimeSelection::Auto => detect_auto_runtime().await,
+    }
+}
+
+pub(crate) fn select_runtime_in(
+    dev_home: &DevHome,
+    override_runtime: Option<&str>,
+) -> Result<RuntimeSelection, DevError> {
     if let Some(name) = override_runtime {
-        return match name {
-            "docker" => {
-                let rt = docker::DockerRuntime::connect()?;
-                Ok(Box::new(rt))
-            }
-            "podman" => {
-                let rt = podman::PodmanRuntime::connect()?;
-                Ok(Box::new(rt))
-            }
-            #[cfg(all(target_os = "macos", feature = "apple"))]
-            "apple" => {
-                let rt = apple::AppleRuntime::connect()?;
-                rt.ping().await?;
-                Ok(Box::new(rt))
-            }
-            other => Err(DevError::Runtime(format!("Unknown runtime: {other}"))),
-        };
+        return RuntimeName::parse(name)
+            .map(RuntimeSelection::Explicit)
+            .ok_or_else(|| DevError::Runtime(format!("Unknown runtime: {name}")));
     }
 
+    let base_path = dev_home.base_config();
+    if !base_path.is_file() {
+        return Ok(RuntimeSelection::Auto);
+    }
+
+    let Ok(raw) = fs::read_to_string(&base_path) else {
+        return Ok(RuntimeSelection::Auto);
+    };
+    let Ok(json) = parse_jsonc::<serde_json::Value>(&raw) else {
+        return Ok(RuntimeSelection::Auto);
+    };
+    let Some(value) = json.get(DEFAULT_RUNTIME_PROPERTY) else {
+        return Ok(RuntimeSelection::Auto);
+    };
+    let Some(value) = value.as_str() else {
+        return Err(DevError::InvalidConfig(format!(
+            "{DEFAULT_RUNTIME_PROPERTY} in {} must be a string. Accepted values: {ACCEPTED_RUNTIME_VALUES}. \
+             Run `dev base config set {DEFAULT_RUNTIME_PROPERTY} <value>` to change it or \
+             `dev base config unset {DEFAULT_RUNTIME_PROPERTY}` to return to automatic detection.",
+            base_path.display()
+        )));
+    };
+
+    RuntimeName::parse(value)
+        .map(RuntimeSelection::Configured)
+        .ok_or_else(|| invalid_configured_runtime_error(value, &base_path))
+}
+
+async fn connect_explicit_runtime(
+    runtime_name: RuntimeName,
+) -> Result<Box<dyn ContainerRuntime>, DevError> {
+    match runtime_name {
+        RuntimeName::Docker => {
+            let rt = docker::DockerRuntime::connect()?;
+            Ok(Box::new(rt))
+        }
+        RuntimeName::Podman => {
+            let rt = podman::PodmanRuntime::connect()?;
+            Ok(Box::new(rt))
+        }
+        RuntimeName::Apple => connect_explicit_apple_runtime().await,
+    }
+}
+
+async fn connect_configured_runtime(
+    runtime_name: RuntimeName,
+) -> Result<Box<dyn ContainerRuntime>, DevError> {
+    match runtime_name {
+        RuntimeName::Docker => {
+            let rt = docker::DockerRuntime::connect()
+                .map_err(|err| configured_runtime_unavailable_error(runtime_name, err))?;
+            Ok(Box::new(rt))
+        }
+        RuntimeName::Podman => {
+            let rt = podman::PodmanRuntime::connect()
+                .map_err(|err| configured_runtime_unavailable_error(runtime_name, err))?;
+            Ok(Box::new(rt))
+        }
+        RuntimeName::Apple => connect_configured_apple_runtime().await,
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "apple"))]
+async fn connect_explicit_apple_runtime() -> Result<Box<dyn ContainerRuntime>, DevError> {
+    let rt = apple::AppleRuntime::connect()?;
+    rt.ping().await?;
+    Ok(Box::new(rt))
+}
+
+#[cfg(not(all(target_os = "macos", feature = "apple")))]
+async fn connect_explicit_apple_runtime() -> Result<Box<dyn ContainerRuntime>, DevError> {
+    Err(DevError::Runtime("Unknown runtime: apple".to_string()))
+}
+
+#[cfg(all(target_os = "macos", feature = "apple"))]
+async fn connect_configured_apple_runtime() -> Result<Box<dyn ContainerRuntime>, DevError> {
+    let rt = apple::AppleRuntime::connect()
+        .map_err(|err| configured_runtime_unavailable_error(RuntimeName::Apple, err))?;
+    rt.ping()
+        .await
+        .map_err(|err| configured_runtime_unavailable_error(RuntimeName::Apple, err))?;
+    Ok(Box::new(rt))
+}
+
+#[cfg(not(all(target_os = "macos", feature = "apple")))]
+async fn connect_configured_apple_runtime() -> Result<Box<dyn ContainerRuntime>, DevError> {
+    Err(configured_runtime_not_compiled_error(RuntimeName::Apple))
+}
+
+fn invalid_configured_runtime_error(value: &str, path: &Path) -> DevError {
+    DevError::InvalidConfig(format!(
+        "Invalid {DEFAULT_RUNTIME_PROPERTY} value in {}: '{value}'. Accepted values: {ACCEPTED_RUNTIME_VALUES}. \
+         Run `dev base config set {DEFAULT_RUNTIME_PROPERTY} <value>` to change it or \
+         `dev base config unset {DEFAULT_RUNTIME_PROPERTY}` to return to automatic detection.",
+        path.display()
+    ))
+}
+
+fn configured_runtime_unavailable_error(runtime_name: RuntimeName, err: DevError) -> DevError {
+    let remediation = match runtime_name {
+        RuntimeName::Docker => "Start Docker Desktop or the Docker daemon",
+        RuntimeName::Podman => "Start Podman (`podman machine start` on macOS)",
+        RuntimeName::Apple => "Start Apple Containers and make sure its service is running",
+    };
+    DevError::NoRuntime(format!(
+        "Configured {DEFAULT_RUNTIME_PROPERTY} '{runtime_name}' is unavailable on this host: {err}\n\n\
+         {remediation}, or run `dev base config set {DEFAULT_RUNTIME_PROPERTY} <docker|podman|apple>` \
+         to choose another runtime. Run `dev base config unset {DEFAULT_RUNTIME_PROPERTY}` to return to automatic detection."
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", feature = "apple")))]
+fn configured_runtime_not_compiled_error(runtime_name: RuntimeName) -> DevError {
+    let detail = match runtime_name {
+        RuntimeName::Apple => {
+            "The Apple runtime requires a dev binary built on macOS with the apple feature."
+        }
+        RuntimeName::Docker | RuntimeName::Podman => {
+            "This runtime is not available in the current dev binary."
+        }
+    };
+    DevError::NoRuntime(format!(
+        "Configured {DEFAULT_RUNTIME_PROPERTY} '{runtime_name}' is not available in this dev binary. {detail}\n\n\
+         Run `dev base config set {DEFAULT_RUNTIME_PROPERTY} <docker|podman|apple>` to choose another runtime, \
+         or `dev base config unset {DEFAULT_RUNTIME_PROPERTY}` to return to automatic detection."
+    ))
+}
+
+async fn detect_auto_runtime() -> Result<Box<dyn ContainerRuntime>, DevError> {
     // Auto-detect: check which runtimes are actually running.
     // Apple Containers disabled for now — use --runtime apple to opt in.
     let docker_running = {
@@ -341,5 +514,171 @@ async fn diagnose_no_runtime() -> DevError {
         (None, None) => {
             DevError::NoRuntime("No container runtime found. Install Docker or Podman.".to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::paths::DevHome;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn dev_home_with_base_config(content: Option<&str>) -> (TempDir, DevHome) {
+        let dir = TempDir::new().unwrap();
+        let home = DevHome::at(dir.path());
+        if let Some(content) = content {
+            let path = home.base_config();
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        }
+        (dir, home)
+    }
+
+    #[test]
+    fn missing_default_runtime_keeps_auto_detection_behavior() {
+        let (_dir, home) = dev_home_with_base_config(None);
+
+        assert_eq!(
+            select_runtime_in(&home, None).unwrap(),
+            RuntimeSelection::Auto
+        );
+    }
+
+    #[test]
+    fn configured_default_runtime_is_loaded_from_base_config() {
+        for runtime in ["docker", "podman", "apple"] {
+            let (_dir, home) =
+                dev_home_with_base_config(Some(&format!(r#"{{"defaultRuntime":"{runtime}"}}"#)));
+
+            assert_eq!(
+                select_runtime_in(&home, None).unwrap(),
+                RuntimeSelection::Configured(RuntimeName::parse(runtime).unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_runtime_override_wins_over_configured_default() {
+        let (_dir, home) = dev_home_with_base_config(Some(r#"{"defaultRuntime":"apple"}"#));
+
+        assert_eq!(
+            select_runtime_in(&home, Some("docker")).unwrap(),
+            RuntimeSelection::Explicit(RuntimeName::Docker)
+        );
+    }
+
+    #[test]
+    fn invalid_configured_default_runtime_names_value_and_accepted_values() {
+        let (_dir, home) = dev_home_with_base_config(Some(r#"{"defaultRuntime":"containerd"}"#));
+
+        let err = select_runtime_in(&home, None).unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("containerd"), "{message}");
+        assert!(message.contains("defaultRuntime"), "{message}");
+        assert!(message.contains("docker, podman, apple"), "{message}");
+        assert!(
+            message.contains("dev base config set defaultRuntime"),
+            "{message}"
+        );
+        assert!(
+            message.contains("dev base config unset defaultRuntime"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn malformed_base_config_degrades_runtime_selection_to_auto() {
+        let (_dir, home) = dev_home_with_base_config(Some(r#"{"remoteUser":"vscode","#));
+
+        assert_eq!(
+            select_runtime_in(&home, None).unwrap(),
+            RuntimeSelection::Auto
+        );
+    }
+
+    #[test]
+    fn unreadable_base_config_contents_degrade_runtime_selection_to_auto() {
+        let dir = TempDir::new().unwrap();
+        let home = DevHome::at(dir.path());
+        let path = home.base_config();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, [0xff, 0xfe, 0xfd]).unwrap();
+
+        assert_eq!(
+            select_runtime_in(&home, None).unwrap(),
+            RuntimeSelection::Auto
+        );
+    }
+
+    #[test]
+    fn explicit_runtime_override_bypasses_malformed_base_config() {
+        let (_dir, home) = dev_home_with_base_config(Some(r#"{"defaultRuntime":"#));
+
+        assert_eq!(
+            select_runtime_in(&home, Some("podman")).unwrap(),
+            RuntimeSelection::Explicit(RuntimeName::Podman)
+        );
+    }
+
+    #[test]
+    fn configured_unavailable_runtime_error_is_distinct_and_actionable_for_every_runtime() {
+        for (runtime_name, remediation) in [
+            (RuntimeName::Docker, "Start Docker"),
+            (RuntimeName::Podman, "Start Podman"),
+            (RuntimeName::Apple, "Start Apple Containers"),
+        ] {
+            let err = configured_runtime_unavailable_error(
+                runtime_name,
+                DevError::Runtime(format!("cannot connect to {runtime_name}")),
+            );
+            let message = err.to_string();
+
+            assert!(
+                message.contains(&format!(
+                    "Configured defaultRuntime '{runtime_name}' is unavailable"
+                )),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!("cannot connect to {runtime_name}")),
+                "{message}"
+            );
+            assert!(message.contains(remediation), "{message}");
+            assert!(
+                message.contains("dev base config set defaultRuntime"),
+                "{message}"
+            );
+            assert!(
+                message.contains("dev base config unset defaultRuntime"),
+                "{message}"
+            );
+            assert!(!message.contains("Unknown runtime"), "{message}");
+        }
+    }
+
+    #[cfg(not(all(target_os = "macos", feature = "apple")))]
+    #[test]
+    fn configured_not_compiled_runtime_error_is_distinct_and_actionable() {
+        let err = configured_runtime_not_compiled_error(RuntimeName::Apple);
+        let message = err.to_string();
+
+        assert!(
+            message
+                .contains("Configured defaultRuntime 'apple' is not available in this dev binary"),
+            "{message}"
+        );
+        assert!(message.contains("macOS"), "{message}");
+        assert!(message.contains("apple feature"), "{message}");
+        assert!(
+            message.contains("dev base config set defaultRuntime"),
+            "{message}"
+        );
+        assert!(
+            message.contains("dev base config unset defaultRuntime"),
+            "{message}"
+        );
+        assert!(!message.contains("Unknown runtime"), "{message}");
     }
 }

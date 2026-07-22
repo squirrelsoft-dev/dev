@@ -8,7 +8,9 @@ use crate::cli::ConfigAction;
 use crate::collection::{fetch_all_features, fetch_collection_index};
 use crate::devcontainer::compose::compose_recipe_config;
 use crate::devcontainer::recipe::Recipe;
-use crate::runtime::detect_runtime;
+use crate::runtime::{
+    ACCEPTED_RUNTIME_VALUES, DEFAULT_RUNTIME_PROPERTY, RuntimeName, detect_runtime,
+};
 use crate::tui::prompts;
 use crate::util::workspace::{ConfigSource, find_config_source};
 
@@ -20,6 +22,13 @@ struct ConfigTarget<'a> {
     config_value: Option<Value>,
     /// If present, persist changes to recipe.json customizations.
     recipe_path: Option<&'a Path>,
+    kind: ConfigTargetKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConfigTargetKind {
+    Base,
+    Devcontainer,
 }
 
 /// Entry point for `dev config` (workspace-scoped).
@@ -38,6 +47,7 @@ pub async fn run_workspace(
                 config_path: None,
                 config_value: Some(composed.value),
                 recipe_path: Some(&recipe_path),
+                kind: ConfigTargetKind::Devcontainer,
             };
             run_with_target(&target, action, verbose).await
         }
@@ -63,10 +73,29 @@ pub async fn run(
     action: Option<ConfigAction>,
     verbose: u8,
 ) -> anyhow::Result<()> {
+    run_with_kind(config_path, action, verbose, ConfigTargetKind::Devcontainer).await
+}
+
+/// Core config logic for the base dev configuration.
+pub async fn run_base(
+    config_path: &Path,
+    action: Option<ConfigAction>,
+    verbose: u8,
+) -> anyhow::Result<()> {
+    run_with_kind(config_path, action, verbose, ConfigTargetKind::Base).await
+}
+
+async fn run_with_kind(
+    config_path: &Path,
+    action: Option<ConfigAction>,
+    verbose: u8,
+    kind: ConfigTargetKind,
+) -> anyhow::Result<()> {
     let target = ConfigTarget {
         config_path: Some(config_path),
         config_value: None,
         recipe_path: None,
+        kind,
     };
     run_with_target(&target, action, verbose).await
 }
@@ -372,6 +401,19 @@ fn persist_to_recipe(
 // --- Action handlers (read file, apply mutation, write file, optionally persist to recipe) ---
 
 fn config_set(target: &ConfigTarget<'_>, property: &str, value: &str) -> anyhow::Result<()> {
+    if property == DEFAULT_RUNTIME_PROPERTY {
+        if target.kind != ConfigTargetKind::Base {
+            anyhow::bail!(
+                "{DEFAULT_RUNTIME_PROPERTY} is a user-wide dev preference. Use `dev base config set {DEFAULT_RUNTIME_PROPERTY} <docker|podman|apple>`."
+            );
+        }
+        if RuntimeName::parse(value).is_none() {
+            anyhow::bail!(
+                "Invalid {DEFAULT_RUNTIME_PROPERTY} value '{value}'. Accepted values: {ACCEPTED_RUNTIME_VALUES}."
+            );
+        }
+    }
+
     let mut json = read_target_config(target)?;
     let obj = json
         .as_object_mut()
@@ -449,7 +491,18 @@ fn config_list(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("devcontainer.json is not a JSON object"))?;
 
-    let scalar_keys = ["name", "image", "remoteUser", "shutdownAction", "waitFor"];
+    let scalar_keys: Vec<&str> = if target.kind == ConfigTargetKind::Base {
+        vec![
+            "name",
+            "image",
+            "remoteUser",
+            "shutdownAction",
+            "waitFor",
+            DEFAULT_RUNTIME_PROPERTY,
+        ]
+    } else {
+        vec!["name", "image", "remoteUser", "shutdownAction", "waitFor"]
+    };
     // Scalars
     for key in &scalar_keys {
         if let Some(val) = obj.get(*key) {
@@ -893,7 +946,16 @@ fn interactive_lifecycle(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
 }
 
 fn interactive_other(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
-    let properties = ["remoteUser", "shutdownAction", "waitFor"];
+    let properties: Vec<&str> = if target.kind == ConfigTargetKind::Base {
+        vec![
+            "remoteUser",
+            "shutdownAction",
+            "waitFor",
+            DEFAULT_RUNTIME_PROPERTY,
+        ]
+    } else {
+        vec!["remoteUser", "shutdownAction", "waitFor"]
+    };
 
     let sel = Select::new()
         .with_prompt("Which property?")
@@ -947,6 +1009,16 @@ mod tests {
             config_path: Some(path),
             config_value: None,
             recipe_path: None,
+            kind: ConfigTargetKind::Devcontainer,
+        }
+    }
+
+    fn base_target_for(path: &Path) -> ConfigTarget<'_> {
+        ConfigTarget {
+            config_path: Some(path),
+            config_value: None,
+            recipe_path: None,
+            kind: ConfigTargetKind::Base,
         }
     }
 
@@ -981,6 +1053,50 @@ mod tests {
         let json = read_config(&path).unwrap();
         assert!(json.get("image").is_none());
         assert_eq!(json["remoteUser"], "vscode");
+    }
+
+    #[test]
+    fn default_runtime_can_be_persisted_and_reset_with_scalar_config_actions() {
+        for runtime in ["docker", "podman", "apple"] {
+            let (_dir, path) = setup_config(r#"{"features":{}}"#);
+
+            config_set(&base_target_for(&path), "defaultRuntime", runtime).unwrap();
+            let json = read_config(&path).unwrap();
+            assert_eq!(json["defaultRuntime"], runtime);
+
+            config_unset(&base_target_for(&path), "defaultRuntime").unwrap();
+            let json = read_config(&path).unwrap();
+            assert!(json.get("defaultRuntime").is_none());
+        }
+    }
+
+    #[test]
+    fn setting_invalid_default_runtime_is_rejected_without_writing_stale_state() {
+        let (_dir, path) = setup_config(r#"{"defaultRuntime":"docker"}"#);
+
+        let err = config_set(&base_target_for(&path), "defaultRuntime", "containerd").unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("containerd"), "{message}");
+        assert!(message.contains("docker, podman, apple"), "{message}");
+        let json = read_config(&path).unwrap();
+        assert_eq!(json["defaultRuntime"], "docker");
+    }
+
+    #[test]
+    fn default_runtime_is_only_written_to_base_config() {
+        let (_dir, path) = setup_config(r#"{}"#);
+
+        let err = config_set(&target_for(&path), "defaultRuntime", "apple").unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("user-wide dev preference"), "{message}");
+        assert!(
+            message.contains("dev base config set defaultRuntime"),
+            "{message}"
+        );
+        let json = read_config(&path).unwrap();
+        assert!(json.get("defaultRuntime").is_none());
     }
 
     #[test]
@@ -1279,6 +1395,7 @@ mod tests {
             config_path: None,
             config_value: Some(config_value),
             recipe_path: Some(recipe_path),
+            kind: ConfigTargetKind::Devcontainer,
         }
     }
 
