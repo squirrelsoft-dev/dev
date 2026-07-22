@@ -416,6 +416,7 @@ impl BollardRuntime {
             } else {
                 Some(config.security_opt.clone())
             },
+            userns_mode: config.userns_mode.clone(),
             ..Default::default()
         };
 
@@ -1162,6 +1163,7 @@ mod tests {
             privileged: false,
             cap_add: vec![],
             security_opt: vec![],
+            userns_mode: None,
         }
     }
 
@@ -1234,6 +1236,7 @@ mod tests {
         ];
         cfg.privileged = true;
         cfg.init = true;
+        cfg.userns_mode = Some("keep-id".to_string());
 
         let body = BollardRuntime::to_create_body(&cfg);
         let host = body.host_config.expect("host config should be set");
@@ -1251,6 +1254,7 @@ mod tests {
         );
         assert_eq!(host.privileged, Some(true));
         assert_eq!(host.init, Some(true));
+        assert_eq!(host.userns_mode.as_deref(), Some("keep-id"));
     }
 
     fn server_error(message: &str) -> DevError {

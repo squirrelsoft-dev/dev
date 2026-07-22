@@ -71,16 +71,25 @@ pub(crate) async fn run_with_runtime(
     port_overrides: &[String],
     no_base: bool,
 ) -> anyhow::Result<()> {
-    let (config_path, recipe_config) = match find_config_source(workspace)? {
-        ConfigSource::Direct(path) => (path, None),
-        ConfigSource::Recipe(recipe_path) => {
-            let recipe = Recipe::from_path(&recipe_path)?;
-            materialize_recipe_directory(&recipe_path, &recipe)?;
-            let composed =
-                compose_recipe_config(&recipe_path, &recipe, runtime.runtime_name(), !no_base)?;
-            (composed.config_path.clone(), Some(composed))
-        }
-    };
+    let (config_path, recipe_config, project_declared_run_args) =
+        match find_config_source(workspace)? {
+            ConfigSource::Direct(path) => {
+                let project_declared_run_args = config_file_declares_run_args(&path)?;
+                (path, None, project_declared_run_args)
+            }
+            ConfigSource::Recipe(recipe_path) => {
+                let recipe = Recipe::from_path(&recipe_path)?;
+                let project_declared_run_args = project_declares_run_args(&recipe.customizations);
+                materialize_recipe_directory(&recipe_path, &recipe)?;
+                let composed =
+                    compose_recipe_config(&recipe_path, &recipe, runtime.runtime_name(), !no_base)?;
+                (
+                    composed.config_path.clone(),
+                    Some(composed),
+                    project_declared_run_args,
+                )
+            }
+        };
     // Recipe configs resolve their own layers, base included, so the runtime base
     // layer would be a second application whose prune can discard a base selector
     // the recipe deliberately kept.
@@ -94,18 +103,9 @@ pub(crate) async fn run_with_runtime(
     let mut config = effective.config;
     apply_cli_overrides(&mut config, port_overrides)?;
 
-    let run_args_present = config
-        .run_args
-        .as_ref()
-        .is_some_and(|args| !args.is_empty());
-
     // Docker Compose configs take a completely separate code path.
     if config.is_compose() {
-        if run_args_present {
-            anyhow::bail!(
-                "`runArgs` is not supported for Docker Compose devcontainers in `dev`; put equivalent options on the Compose service definition instead"
-            );
-        }
+        reject_project_run_args_for_compose(&config, project_declared_run_args)?;
         return run_compose(
             workspace,
             &config,
@@ -123,6 +123,10 @@ pub(crate) async fn run_with_runtime(
     // Validate and translate runArgs before any host-visible side effects:
     // initializeCommand, existing-container reuse, lockfile writes, image
     // builds, and container creation must all see the same decision.
+    //
+    // This intentionally uses config/default-user substitution here, before
+    // image inspection. User-dependent HOME expansion can therefore differ
+    // from the later mount/workspace substitution that uses image metadata.
     let run_args: Vec<String> = config
         .run_args
         .as_deref()
@@ -131,6 +135,7 @@ pub(crate) async fn run_with_runtime(
         .map(|s| substitute_variables_with_user(s, workspace, config.remote_user.as_deref()))
         .collect();
     let resolved_run_args = crate::devcontainer::run_args::resolve_run_args(&run_args, workspace)?;
+    reject_run_args_unsupported_by_runtime(runtime.runtime_name(), &resolved_run_args)?;
 
     // Run initializeCommand on the host before anything else (Gap 9).
     if let Some(ref init_cmd) = config.initialize_command {
@@ -361,11 +366,7 @@ pub(crate) async fn run_with_runtime(
     let mut caps =
         resolve_container_capabilities(runtime, &final_image, &ordered_features, has_features)
             .await?;
-    caps.init |= resolved_run_args.init;
-    caps.privileged |= resolved_run_args.privileged;
-    caps.cap_add.extend(resolved_run_args.cap_add.clone());
-    caps.security_opt
-        .extend(resolved_run_args.security_opt.clone());
+    apply_run_args_capabilities(&mut caps, &resolved_run_args);
 
     // Build container config
     let name = container_name(workspace);
@@ -443,8 +444,8 @@ pub(crate) async fn run_with_runtime(
     // effective create-time env map. `run_args::resolve_run_args` already
     // matches Docker CLI precedence by loading all env-files before all
     // explicit --env/-e entries.
-    for (k, v) in resolved_run_args.env {
-        env.insert(k, v);
+    for (k, v) in &resolved_run_args.env {
+        env.insert(k.clone(), v.clone());
     }
 
     let container_config = ContainerConfig {
@@ -466,6 +467,7 @@ pub(crate) async fn run_with_runtime(
         privileged: caps.privileged,
         cap_add: caps.cap_add,
         security_opt: caps.security_opt,
+        userns_mode: resolved_run_args.userns_mode.clone(),
     };
 
     if !container_config.mounts.is_empty() {
@@ -504,6 +506,87 @@ pub(crate) async fn run_with_runtime(
     }
 
     Ok(())
+}
+
+fn config_file_declares_run_args(config_path: &Path) -> anyhow::Result<bool> {
+    let raw = std::fs::read_to_string(config_path)?;
+    let value = crate::devcontainer::jsonc::parse_jsonc(&raw)?;
+    Ok(project_declares_run_args(&value))
+}
+
+fn project_declares_run_args(value: &serde_json::Value) -> bool {
+    value
+        .get("runArgs")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|args| !args.is_empty())
+}
+
+fn reject_project_run_args_for_compose(
+    config: &DevcontainerConfig,
+    project_declared_run_args: bool,
+) -> anyhow::Result<()> {
+    let has_effective_run_args = config
+        .run_args
+        .as_ref()
+        .is_some_and(|args| !args.is_empty());
+    if config.is_compose() && project_declared_run_args && has_effective_run_args {
+        anyhow::bail!(
+            "`runArgs` is not supported for Docker Compose devcontainers in `dev`; Compose has no global container-create argument channel. Put equivalent options on the configured Compose service definition instead."
+        );
+    }
+    Ok(())
+}
+
+fn reject_run_args_unsupported_by_runtime(
+    runtime_name: &str,
+    resolved: &crate::devcontainer::run_args::ResolvedRunArgs,
+) -> anyhow::Result<()> {
+    if runtime_name != "apple" {
+        return Ok(());
+    }
+
+    let mut unsupported = Vec::new();
+    if !resolved.cap_add.is_empty() {
+        unsupported.push("--cap-add");
+    }
+    if !resolved.security_opt.is_empty() {
+        unsupported.push("--security-opt");
+    }
+    if resolved.userns_mode.is_some() {
+        unsupported.push("--userns");
+    }
+    if resolved.privileged {
+        unsupported.push("--privileged");
+    }
+    if resolved.init {
+        unsupported.push("--init");
+    }
+
+    if !unsupported.is_empty() {
+        anyhow::bail!(
+            "`runArgs` flag(s) {} are not supported when the selected runtime is Apple Containers; Apple currently supports only the environment `runArgs` subset (`--env-file`, `--env`, and `-e`). Remove these flags or use runtime-supported devcontainer settings.",
+            unsupported.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn apply_run_args_capabilities(
+    caps: &mut MergedCapabilities,
+    resolved: &crate::devcontainer::run_args::ResolvedRunArgs,
+) {
+    caps.init |= resolved.init;
+    caps.privileged |= resolved.privileged;
+    extend_unique(&mut caps.cap_add, &resolved.cap_add);
+    extend_unique(&mut caps.security_opt, &resolved.security_opt);
+}
+
+fn extend_unique(out: &mut Vec<String>, additions: &[String]) {
+    for value in additions {
+        if !out.contains(value) {
+            out.push(value.clone());
+        }
+    }
 }
 
 /// How long to give the runtime to report a just-started container as running.
@@ -1436,11 +1519,13 @@ fn parse_volumes(volume_strings: &[String]) -> Vec<VolumeMount> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_cli_overrides, ensure_image_present, parse_mounts, parse_single_mount,
+        apply_cli_overrides, apply_run_args_capabilities, ensure_image_present, parse_mounts,
+        parse_single_mount, project_declares_run_args, reject_project_run_args_for_compose,
         substitute_mounts,
     };
     use crate::devcontainer::config::{DevcontainerConfig, MountObject, MountSpec};
     use crate::devcontainer::effective::load_effective_config_value;
+    use crate::devcontainer::features::MergedCapabilities;
     use crate::error::DevError;
     use crate::runtime::{
         AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ContainerState,
@@ -1505,6 +1590,48 @@ mod tests {
         assert_eq!(ports[0].container, 90);
         assert_eq!(ports[1].host, 7070);
         assert_eq!(ports[1].container, 7070);
+    }
+
+    #[test]
+    fn compose_runargs_from_inherited_layers_are_not_rejected_as_project_declared() {
+        let mut config: DevcontainerConfig = serde_json::from_str(
+            r#"{"dockerComposeFile":"compose.yml","service":"app","runArgs":["--init"]}"#,
+        )
+        .unwrap();
+
+        reject_project_run_args_for_compose(&config, false)
+            .expect("inherited runArgs are ignored on the Compose path");
+
+        config.run_args = Some(vec![]);
+        reject_project_run_args_for_compose(&config, true)
+            .expect("an empty project runArgs array is not actionable");
+    }
+
+    #[test]
+    fn compose_runargs_declared_by_project_are_rejected_with_service_guidance() {
+        let config: DevcontainerConfig = serde_json::from_str(
+            r#"{"dockerComposeFile":"compose.yml","service":"app","runArgs":["--init"]}"#,
+        )
+        .unwrap();
+
+        let err = reject_project_run_args_for_compose(&config, true).unwrap_err();
+        let msg = format!("{err}");
+
+        assert!(msg.contains("runArgs"), "{msg}");
+        assert!(msg.contains("Compose service"), "{msg}");
+    }
+
+    #[test]
+    fn value_declares_project_run_args_only_for_non_empty_arrays() {
+        assert!(project_declares_run_args(
+            &serde_json::json!({"runArgs": ["--init"]})
+        ));
+        assert!(!project_declares_run_args(
+            &serde_json::json!({"runArgs": []})
+        ));
+        assert!(!project_declares_run_args(
+            &serde_json::json!({"image": "ubuntu"})
+        ));
     }
 
     /// Minimal fake runtime: records `pull_image` calls and returns a fixed
@@ -1751,6 +1878,7 @@ mod tests {
     /// existing but being invisible to the label query `dev status`/`dev exec`
     /// use (which is what an undecodable `containerList` reply looks like).
     struct UpFakeRuntime {
+        runtime_name: &'static str,
         image_exists: bool,
         create_fails: bool,
         start_fails: bool,
@@ -1798,6 +1926,7 @@ mod tests {
     impl UpFakeRuntime {
         fn ok() -> Self {
             Self {
+                runtime_name: "fake",
                 image_exists: true,
                 create_fails: false,
                 start_fails: false,
@@ -1819,6 +1948,11 @@ mod tests {
                 started_id: Arc::new(Mutex::new(None)),
                 containers: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        fn named_runtime(mut self, runtime_name: &'static str) -> Self {
+            self.runtime_name = runtime_name;
+            self
         }
 
         /// Create, start and discovery all succeed, but no command can be run
@@ -1980,7 +2114,7 @@ mod tests {
 
     impl ContainerRuntime for UpFakeRuntime {
         fn runtime_name(&self) -> &'static str {
-            "fake"
+            self.runtime_name
         }
 
         fn pull_image(&self, _image: &str) -> BoxFut<'_, ()> {
@@ -2905,6 +3039,87 @@ mod tests {
         );
         assert!(created.privileged);
         assert!(created.init);
+    }
+
+    #[tokio::test]
+    async fn up_userns_runarg_reaches_container_config() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","runArgs":["--userns=keep-id"]}"#,
+        );
+        let rt = UpFakeRuntime::ok();
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("supported userns runArg should create successfully");
+
+        assert_eq!(rt.created_config().userns_mode.as_deref(), Some("keep-id"));
+    }
+
+    #[tokio::test]
+    async fn apple_runtime_rejects_non_environment_runargs_before_initialize_command() {
+        let workspace = TempDir::new().unwrap();
+        let marker = workspace.path().join("initialized");
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","initializeCommand":"touch initialized","runArgs":["--cap-add","SYS_PTRACE"]}"#,
+        );
+        let rt = UpFakeRuntime::ok().named_runtime("apple");
+        let err = run_up_with_fake(&rt, &workspace)
+            .await
+            .expect_err("Apple must reject runtime option runArgs before side effects");
+        let msg = format!("{err}");
+        assert!(msg.contains("Apple"), "{msg}");
+        assert!(msg.contains("--cap-add"), "{msg}");
+        assert!(!marker.exists(), "initializeCommand must not run");
+        assert!(
+            !rt.create_was_attempted(),
+            "container creation must not run"
+        );
+    }
+
+    #[tokio::test]
+    async fn apple_runtime_accepts_environment_runargs() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","runArgs":["--env","A=1"]}"#,
+        );
+        let rt = UpFakeRuntime::ok().named_runtime("apple");
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("Apple keeps create-time environment runArgs support");
+
+        assert_eq!(
+            rt.created_config().env.get("A").map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn runargs_capabilities_are_deduplicated_after_feature_capabilities() {
+        let mut caps = MergedCapabilities {
+            init: false,
+            privileged: false,
+            cap_add: vec!["SYS_PTRACE".to_string()],
+            security_opt: vec!["seccomp=unconfined".to_string()],
+        };
+        let run_args = crate::devcontainer::run_args::ResolvedRunArgs {
+            cap_add: vec!["SYS_PTRACE".to_string(), "NET_ADMIN".to_string()],
+            security_opt: vec![
+                "seccomp=unconfined".to_string(),
+                "label=disable".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        apply_run_args_capabilities(&mut caps, &run_args);
+
+        assert_eq!(caps.cap_add, vec!["SYS_PTRACE", "NET_ADMIN"]);
+        assert_eq!(
+            caps.security_opt,
+            vec!["seccomp=unconfined", "label=disable"]
+        );
     }
 
     /// Repeated env files apply left-to-right; the last file's value for a key

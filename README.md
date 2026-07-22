@@ -234,11 +234,14 @@ Docker Compose (`dockerComposeFile`) is supported for the full lifecycle — bui
 `devcontainer.json`'s `runArgs` is a list of Docker/Podman `run` flags. `dev`
 does not shell out to `docker run`, so it cannot pass arbitrary CLI flags
 through to the daemon. Instead it translates a supported subset of `runArgs`
-into existing container-create fields, and rejects every other flag *before*
-host lifecycle commands, image builds, lockfile writes, existing-container
-reuse, or container creation with an actionable error. Docker Compose
-(`dockerComposeFile`) projects use Compose service configuration instead, so
-non-empty `runArgs` fails with Compose-specific guidance. (See
+into existing container-create fields for the image-based Docker/Podman path,
+and rejects every other flag *before* host lifecycle commands, image builds,
+lockfile writes, existing-container reuse, or container creation with an
+actionable error. Docker Compose (`dockerComposeFile`) has no global
+container-create argument channel. If a project declares non-empty `runArgs`,
+`dev` fails with Compose service-definition guidance; inherited base/runtime
+`runArgs` are ignored on Compose so lower-layer Docker/Podman defaults do not
+break unrelated Compose projects. (See
 [issue #5](https://github.com/squirrelsoft-dev/dev/issues/5):
 previously every `runArg` was parsed and then dropped.)
 
@@ -251,12 +254,21 @@ previously every `runArg` was parsed and then dropped.)
 | `-e` | `-e KEY=VALUE`, `-eKEY=VALUE` | a `KEY=VALUE` env entry |
 | `--cap-add` | `--cap-add VALUE`, `--cap-add=VALUE` | HostConfig `CapAdd` entries |
 | `--security-opt` | `--security-opt VALUE`, `--security-opt=VALUE` | HostConfig `SecurityOpt` entries |
+| `--userns` | `--userns VALUE`, `--userns=VALUE` | HostConfig `UsernsMode`; last value wins |
 | `--privileged` | `--privileged` only | HostConfig `Privileged=true` |
 | `--init` | `--init` only | HostConfig `Init=true` |
 
 Repeated env files, env flags, capabilities, and security options are
-preserved. Boolean assignments such as `--init=true` and `--privileged=false`
-are rejected; use the bare flag.
+preserved; repeated duplicate capabilities/security options are sent once in
+stable order after feature-contributed values. Boolean assignments such as
+`--init=true` and `--privileged=false` are rejected; use the bare flag. For
+value-taking two-token forms, the next token must be a non-empty value, not
+another flag.
+
+Apple Containers supports only the environment subset (`--env-file`, `--env`,
+and `-e`). Runtime options such as `--cap-add`, `--security-opt`, `--userns`,
+`--privileged`, and `--init` fail before side effects when `--runtime apple` or
+`defaultRuntime: "apple"` selects Apple.
 
 ### The reporter's configuration
 
@@ -331,10 +343,16 @@ first-class devcontainer property where one exists. Common mappings:
 | `--add-host` | (no equivalent yet — file an issue) |
 | `--cap-add` | supported directly in `runArgs` |
 | `--security-opt` | supported directly in `runArgs` |
+| `--userns` | supported directly in `runArgs` on Docker/Podman image-based containers |
 | `--privileged` | supported directly in `runArgs` |
 | `--init` | supported directly in `runArgs` |
 | `--publish` | `forwardPorts` |
 | `--volume` / `--mount` | `mounts` / `volumes` |
+
+For Docker Compose projects, put equivalents directly on the configured
+Compose service, for example `init: true`, `privileged: true`, `cap_add`,
+`security_opt`, or service-specific namespace/network settings where your
+Compose implementation supports them.
 
 ## Local `.test` domains
 

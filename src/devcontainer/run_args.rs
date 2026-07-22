@@ -14,6 +14,7 @@
 //! - `--env KEY=VALUE`, `--env=KEY=VALUE`, `-e KEY=VALUE`, and `-eKEY=VALUE`
 //! - `--cap-add VALUE`, `--cap-add=VALUE`
 //! - `--security-opt VALUE`, `--security-opt=VALUE`
+//! - `--userns VALUE`, `--userns=VALUE`
 //! - bare `--privileged` and `--init`
 //!
 //! ## Environment precedence (last value for a key wins)
@@ -57,6 +58,7 @@ pub struct ResolvedRunArgs {
     pub security_opt: Vec<String>,
     pub privileged: bool,
     pub init: bool,
+    pub userns_mode: Option<String>,
 }
 
 /// Validate and translate the supported `runArgs` subset into the existing
@@ -76,7 +78,6 @@ pub fn resolve_run_args(args: &[String], workspace: &Path) -> Result<ResolvedRun
             )?;
         } else if arg == "--env-file" {
             let path = next_value(args, &mut i, arg, "--env-file")?;
-            reject_empty_value(arg, &path, "--env-file")?;
             read_env_file_into(
                 &mut env_file_entries,
                 &resolve_env_file_path(&path, workspace),
@@ -102,7 +103,6 @@ pub fn resolve_run_args(args: &[String], workspace: &Path) -> Result<ResolvedRun
                 .push(non_empty_inline_value(arg, value, "--cap-add")?.to_string());
         } else if arg == "--cap-add" {
             let value = next_value(args, &mut i, arg, "--cap-add")?;
-            reject_empty_value(arg, &value, "--cap-add")?;
             resolved.cap_add.push(value);
         } else if let Some(value) = arg.strip_prefix("--security-opt=") {
             resolved
@@ -110,8 +110,13 @@ pub fn resolve_run_args(args: &[String], workspace: &Path) -> Result<ResolvedRun
                 .push(non_empty_inline_value(arg, value, "--security-opt")?.to_string());
         } else if arg == "--security-opt" {
             let value = next_value(args, &mut i, arg, "--security-opt")?;
-            reject_empty_value(arg, &value, "--security-opt")?;
             resolved.security_opt.push(value);
+        } else if let Some(value) = arg.strip_prefix("--userns=") {
+            resolved.userns_mode =
+                Some(non_empty_inline_value(arg, value, "--userns")?.to_string());
+        } else if arg == "--userns" {
+            let value = next_value(args, &mut i, arg, "--userns")?;
+            resolved.userns_mode = Some(value);
         } else if arg == "--privileged" {
             resolved.privileged = true;
         } else if arg.starts_with("--privileged=") {
@@ -142,11 +147,22 @@ fn next_value(
     flag_name: &str,
 ) -> Result<String, DevError> {
     *i += 1;
-    args.get(*i)
-        .cloned()
-        .ok_or_else(|| DevError::InvalidConfig(format!(
+    let Some(value) = args.get(*i) else {
+        return Err(DevError::InvalidConfig(format!(
             "`runArgs` flag `{flag}` is missing its value; `{flag_name}` expects a value as the next argument"
-        )))
+        )));
+    };
+    if value.is_empty() {
+        return Err(DevError::InvalidConfig(format!(
+            "`runArgs` flag `{flag}` is missing its value; `{flag_name}` expects a non-empty value"
+        )));
+    }
+    if value.starts_with('-') {
+        return Err(DevError::InvalidConfig(format!(
+            "`runArgs` flag `{flag}` is missing its value; `{flag_name}` expects a value as the next argument, but the next token `{value}` is another flag"
+        )));
+    }
+    Ok(value.clone())
 }
 
 fn non_empty_inline_value<'a>(
@@ -160,15 +176,6 @@ fn non_empty_inline_value<'a>(
         )));
     }
     Ok(value)
-}
-
-fn reject_empty_value(flag: &str, value: &str, flag_name: &str) -> Result<(), DevError> {
-    if value.is_empty() {
-        return Err(DevError::InvalidConfig(format!(
-            "`runArgs` flag `{flag}` is missing its value; `{flag_name}` expects a non-empty value"
-        )));
-    }
-    Ok(())
 }
 
 /// Resolve an env-file path: absolute paths are used as-is; relative paths
@@ -344,7 +351,7 @@ fn unsupported_flag_error(flag: &str) -> DevError {
     DevError::InvalidConfig(format!(
         "unsupported `runArgs` flag `{name}`: `dev` translates only the documented \
          `runArgs` subset into the container create request: `--env-file`, `--env`, `-e`, \
-         `--cap-add`, `--security-opt`, `--privileged`, and `--init`. \
+         `--cap-add`, `--security-opt`, `--userns`, `--privileged`, and `--init`. \
          Other Docker/Podman CLI flags have no direct daemon-API equivalent here; use the \
          equivalent first-class devcontainer property where Dev implements one (for example \
          `forwardPorts`, `mounts`, or `containerEnv`). See the README `runArgs` support matrix."
@@ -560,6 +567,45 @@ mod tests {
         );
         assert!(resolved.privileged);
         assert!(resolved.init);
+    }
+
+    #[test]
+    fn userns_flag_accepts_space_and_equals_forms_with_last_value_winning() {
+        let ws = PathBuf::from("/ws");
+        let args: Vec<String> = ["--userns", "host", "--userns=keep-id"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let resolved = super::resolve_run_args(&args, &ws).unwrap();
+
+        assert_eq!(resolved.userns_mode.as_deref(), Some("keep-id"));
+    }
+
+    #[test]
+    fn value_taking_flags_reject_another_flag_as_their_missing_value() {
+        let ws = PathBuf::from("/ws");
+        for (flag, next) in [
+            ("--env-file", "--env"),
+            ("--env", "--init"),
+            ("-e", "--init"),
+            ("--cap-add", "--init"),
+            ("--security-opt", "--init"),
+            ("--userns", "--init"),
+        ] {
+            let err =
+                super::resolve_run_args(&[flag.to_string(), next.to_string()], &ws).unwrap_err();
+            let msg = format!("{err}");
+            assert!(msg.contains(flag), "error should name {flag}: {msg}");
+            assert!(
+                msg.contains("missing its value"),
+                "error should explain a missing value, got: {msg}"
+            );
+            assert!(
+                msg.contains(next),
+                "error should include the flag-like next token as safe context: {msg}"
+            );
+        }
     }
 
     #[test]

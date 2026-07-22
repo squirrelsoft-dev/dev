@@ -97,6 +97,8 @@ pub struct ContainerConfig {
     pub cap_add: Vec<String>,
     /// Security options (--security-opt).
     pub security_opt: Vec<String>,
+    /// User namespace mode (--userns).
+    pub userns_mode: Option<String>,
 }
 
 #[derive(Debug, Clone)]
