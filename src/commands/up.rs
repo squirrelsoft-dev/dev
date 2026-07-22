@@ -412,13 +412,24 @@ pub(crate) async fn run_with_runtime(
         .collect();
     let volumes = parse_volumes(&volume_strings);
 
-    let extra_args: Vec<String> = config
+    // Substitute devcontainer variables in runArgs (e.g. `${localWorkspaceFolder}`)
+    // *before* parsing, so env-file paths resolve against the workspace. The
+    // environment subset of runArgs is translated into container env entries
+    // here; anything outside that subset is rejected before container creation
+    // rather than silently dropped (issue #5: every runArg used to be ignored).
+    let run_args: Vec<String> = config
         .run_args
         .as_deref()
         .unwrap_or(&[])
         .iter()
         .map(|s| substitute_variables_with_user(s, workspace, remote_user))
         .collect();
+    let run_args_env = crate::devcontainer::run_args::resolve_env(&run_args, workspace)?;
+    // runArgs env applies after the effective create-time env map, in runArgs order, with
+    // the last value for a key winning — matching Docker CLI intent.
+    for (k, v) in run_args_env {
+        env.insert(k, v);
+    }
 
     let container_config = ContainerConfig {
         image: final_image,
@@ -433,7 +444,7 @@ pub(crate) async fn run_with_runtime(
             target: config.workspace_mount_target(workspace, remote_user)?,
         }),
         workspace_folder: Some(config.workspace_folder_path(workspace, remote_user)?),
-        extra_args,
+        extra_args: vec![],
         entrypoint: None,
         init: caps.init,
         privileged: caps.privileged,
@@ -1945,6 +1956,10 @@ mod tests {
                 .clone()
                 .expect("create_container was not called")
         }
+
+        fn create_was_attempted(&self) -> bool {
+            self.created_config.lock().unwrap().is_some()
+        }
     }
 
     impl ContainerRuntime for UpFakeRuntime {
@@ -2705,6 +2720,252 @@ mod tests {
         run_up_with_fake(&rt, &workspace)
             .await
             .expect("a missing shell must be reported, not fail readiness");
+    }
+
+    /// Write a `.env` file inside the workspace's `.devcontainer` dir and
+    /// return its path string.
+    fn write_env_file(workspace: &TempDir, body: &str) -> std::path::PathBuf {
+        let dir = workspace.path().join(".devcontainer");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".env");
+        fs::write(&path, body).unwrap();
+        path
+    }
+
+    /// Issue #5's exact reporter configuration: `--env-file` with
+    /// `${localWorkspaceFolder}` substitution. The env-file's variables must
+    /// reach the container-create request rather than being silently dropped.
+    #[tokio::test]
+    async fn up_env_file_substitutes_local_workspace_folder() {
+        let workspace = TempDir::new().unwrap();
+        write_env_file(&workspace, "FROM_FILE=true\nGREETING=hello\n");
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","runArgs":["--env-file","${localWorkspaceFolder}/.devcontainer/.env"]}"#,
+        );
+        let rt = UpFakeRuntime::ok();
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("up should succeed with an env-file runArg");
+
+        let env = rt.created_config().env;
+        assert_eq!(env.get("FROM_FILE").map(String::as_str), Some("true"));
+        assert_eq!(env.get("GREETING").map(String::as_str), Some("hello"));
+    }
+
+    /// The `--env-file=PATH` equals-attached form must be accepted too.
+    #[tokio::test]
+    async fn up_env_file_equals_form() {
+        let workspace = TempDir::new().unwrap();
+        write_env_file(&workspace, "EQ_FORM=yes\n");
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","runArgs":["--env-file=${localWorkspaceFolder}/.devcontainer/.env"]}"#,
+        );
+        let rt = UpFakeRuntime::ok();
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("up should succeed with --env-file= form");
+
+        assert_eq!(
+            rt.created_config().env.get("EQ_FORM").map(String::as_str),
+            Some("yes")
+        );
+    }
+
+    /// `--env KEY=VALUE`, `--env=KEY=VALUE`, `-e KEY=VALUE`, and `-eKEY=VALUE`
+    /// must all translate into container env entries.
+    #[tokio::test]
+    async fn up_env_flag_all_syntaxes() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","runArgs":["--env","A=1","--env=B=2","-e","C=3","-eD=4"]}"#,
+        );
+        let rt = UpFakeRuntime::ok();
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("up should succeed with --env/-e flags");
+
+        let env = rt.created_config().env;
+        assert_eq!(env.get("A").map(String::as_str), Some("1"));
+        assert_eq!(env.get("B").map(String::as_str), Some("2"));
+        assert_eq!(env.get("C").map(String::as_str), Some("3"));
+        assert_eq!(env.get("D").map(String::as_str), Some("4"));
+    }
+
+    /// Bare env tokens pass through from the host when set and are omitted
+    /// when unset; they must never invent an empty value.
+    #[tokio::test]
+    async fn up_env_host_passthrough_matches_docker_intent() {
+        let workspace = TempDir::new().unwrap();
+        unsafe { std::env::set_var("DEV_RUNARGS_UP_HOST_SET", "host-value") };
+        unsafe { std::env::remove_var("DEV_RUNARGS_UP_HOST_UNSET") };
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","runArgs":["--env","DEV_RUNARGS_UP_HOST_SET","--env","DEV_RUNARGS_UP_HOST_UNSET"]}"#,
+        );
+        let rt = UpFakeRuntime::ok();
+        let result = run_up_with_fake(&rt, &workspace).await;
+        unsafe { std::env::remove_var("DEV_RUNARGS_UP_HOST_SET") };
+        result.expect("up should succeed with host pass-through env tokens");
+
+        let env = rt.created_config().env;
+        assert_eq!(
+            env.get("DEV_RUNARGS_UP_HOST_SET").map(String::as_str),
+            Some("host-value")
+        );
+        assert!(
+            !env.contains_key("DEV_RUNARGS_UP_HOST_UNSET"),
+            "unset pass-through must be omitted, not invented as empty"
+        );
+    }
+
+    /// Precedence: `containerEnv` overlays image env, and `runArgs` env entries
+    /// apply left-to-right with the last value for a key winning. A later
+    /// `--env` must override an earlier env-file entry and `containerEnv`.
+    #[tokio::test]
+    async fn up_env_precedence_last_value_wins() {
+        let workspace = TempDir::new().unwrap();
+        write_env_file(&workspace, "KEY=from_file\nOTHER=file\n");
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","containerEnv":{"KEY":"from_container_env"},"runArgs":["--env-file","${localWorkspaceFolder}/.devcontainer/.env","--env","KEY=from_flag"]}"#,
+        );
+        let rt = UpFakeRuntime::ok();
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("up should succeed with overlapping env sources");
+
+        let env = rt.created_config().env;
+        // runArgs --env is last, so it wins over both the env-file and containerEnv.
+        assert_eq!(env.get("KEY").map(String::as_str), Some("from_flag"));
+        assert_eq!(env.get("OTHER").map(String::as_str), Some("file"));
+    }
+
+    /// Repeated env files apply left-to-right; the last file's value for a key
+    /// wins.
+    #[tokio::test]
+    async fn up_repeated_env_files_last_wins() {
+        let workspace = TempDir::new().unwrap();
+        write_env_file(&workspace, "SHARED=first\n");
+        let second = workspace.path().join(".devcontainer").join("second.env");
+        fs::write(&second, "SHARED=second\n").unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","runArgs":["--env-file","${localWorkspaceFolder}/.devcontainer/.env","--env-file","${localWorkspaceFolder}/.devcontainer/second.env"]}"#,
+        );
+        let rt = UpFakeRuntime::ok();
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("up should succeed with two env files");
+
+        assert_eq!(
+            rt.created_config().env.get("SHARED").map(String::as_str),
+            Some("second")
+        );
+    }
+
+    /// A missing env-file must fail before container creation with an error
+    /// naming the path, not silently drop the flag.
+    #[tokio::test]
+    async fn up_missing_env_file_fails() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","runArgs":["--env-file","${localWorkspaceFolder}/.devcontainer/missing.env"]}"#,
+        );
+        let rt = UpFakeRuntime::ok();
+        let err = run_up_with_fake(&rt, &workspace)
+            .await
+            .expect_err("a missing env-file must fail before container creation");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("missing.env"),
+            "error should name the missing env-file path, got: {msg}"
+        );
+        assert!(
+            !rt.create_was_attempted(),
+            "missing env-file must fail before container creation"
+        );
+    }
+
+    /// A malformed env-file must fail before container creation with path and
+    /// line context, without printing the secret-adjacent value.
+    #[tokio::test]
+    async fn up_malformed_env_file_fails_before_create_without_leaking_value() {
+        let workspace = TempDir::new().unwrap();
+        write_env_file(&workspace, "GOOD=1\n=secret-value\n");
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","runArgs":["--env-file","${localWorkspaceFolder}/.devcontainer/.env"]}"#,
+        );
+        let rt = UpFakeRuntime::ok();
+        let err = run_up_with_fake(&rt, &workspace)
+            .await
+            .expect_err("a malformed env-file must fail before container creation");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(".env"),
+            "error should name the env-file: {msg}"
+        );
+        assert!(msg.contains("line 2"), "error should name the line: {msg}");
+        assert!(
+            !msg.contains("secret-value"),
+            "error must not leak env-file values: {msg}"
+        );
+        assert!(
+            !rt.create_was_attempted(),
+            "malformed env-file must fail before container creation"
+        );
+    }
+
+    /// A non-UTF-8 env-file must fail before container creation without
+    /// printing its bytes.
+    #[tokio::test]
+    async fn up_non_utf8_env_file_fails_before_create_without_leaking_bytes() {
+        let workspace = TempDir::new().unwrap();
+        let path = write_env_file(&workspace, "");
+        fs::write(&path, b"OK=1\n\xff\xfeBAD\n").unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","runArgs":["--env-file","${localWorkspaceFolder}/.devcontainer/.env"]}"#,
+        );
+        let rt = UpFakeRuntime::ok();
+        let err = run_up_with_fake(&rt, &workspace)
+            .await
+            .expect_err("a non-UTF-8 env-file must fail before container creation");
+        let msg = format!("{err}");
+        assert!(msg.contains("UTF-8"), "error should say UTF-8: {msg}");
+        assert!(
+            !rt.create_was_attempted(),
+            "non-UTF-8 env-file must fail before container creation"
+        );
+    }
+
+    /// A runArg outside the supported environment subset must fail before
+    /// container creation with an error naming the unsupported flag, rather
+    /// than being silently ignored (issue #5: every runArg was dropped).
+    #[tokio::test]
+    async fn up_unsupported_runarg_fails() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","runArgs":["--network","host"]}"#,
+        );
+        let rt = UpFakeRuntime::ok();
+        let err = run_up_with_fake(&rt, &workspace)
+            .await
+            .expect_err("an unsupported runArg must fail before container creation");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--network"),
+            "error should name the unsupported flag, got: {msg}"
+        );
+        assert!(
+            !rt.create_was_attempted(),
+            "unsupported runArg must fail before container creation"
+        );
     }
 
     /// A runtime that shortens ids (as Apple Containers does, to fit its

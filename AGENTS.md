@@ -20,6 +20,16 @@
 - Anything that reads `~/.dev` has an `*_in` variant taking a `&DevHome` (defined in
   `src/util/paths.rs`); test against those with `DevHome::at(tmp)` rather than the
   `current()`-based wrappers.
+- In `src/devcontainer/merge.rs`, array merge strategy is split: `forwardPorts`/`mounts`
+  concatenate with dedup (`merge_array`), but `runArgs` concatenates **without** dedup
+  (`merge_array_concat`) because repeated flags like `--env-file` are legitimate and
+  order matters. Don't move `runArgs` back into the dedup path.
+- `runArgs` is translated in `src/devcontainer/run_args.rs` (env subset only:
+  `--env-file`/`--env`/`-e`) and merged into `ContainerConfig.env` in `src/commands/up.rs`
+  after `containerEnv`; every other flag is rejected before container creation. Both Docker
+  and Podman send the same bollard create body (`BollardRuntime::to_create_body`); Podman
+  wraps `BollardRuntime`. `extra_args` on `ContainerConfig` is now always empty (kept for
+  struct compatibility).
 
 ## Maintaining this file
 

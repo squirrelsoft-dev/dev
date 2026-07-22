@@ -1192,6 +1192,35 @@ mod tests {
         assert_eq!(body.working_dir, None);
     }
 
+    /// The env map `dev up` assembles — `containerEnv` plus the `runArgs`
+    /// environment subset (env-file/`--env`/`-e`) — must reach the daemon create
+    /// request as `KEY=VALUE` strings. This is the bollard body both the Docker
+    /// and Podman runtimes send (Podman wraps `BollardRuntime`), so it pins the
+    /// issue #5 fix at the daemon seam for both paths.
+    #[test]
+    fn create_body_carries_env_entries_as_key_value_strings() {
+        let mut cfg = container_config(None);
+        cfg.env.insert("FROM_FILE".to_string(), "true".to_string());
+        cfg.env.insert("FROM_FLAG".to_string(), "yes".to_string());
+        cfg.env.insert("EMPTY".to_string(), String::new());
+
+        let body = BollardRuntime::to_create_body(&cfg);
+        let env = body.env.expect("env should be set on the create body");
+
+        assert!(
+            env.iter().any(|e| e == "FROM_FILE=true"),
+            "env-file entry must reach the daemon body, got {env:?}"
+        );
+        assert!(
+            env.iter().any(|e| e == "FROM_FLAG=yes"),
+            "--env flag entry must reach the daemon body, got {env:?}"
+        );
+        assert!(
+            env.iter().any(|e| e == "EMPTY="),
+            "empty-valued env entry must reach the daemon body, got {env:?}"
+        );
+    }
+
     fn server_error(message: &str) -> DevError {
         DevError::Bollard(bollard::errors::Error::DockerResponseServerError {
             status_code: 404,

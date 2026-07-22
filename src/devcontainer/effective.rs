@@ -1074,6 +1074,32 @@ mod tests {
         );
     }
 
+    /// `runArgs` must preserve repeated flags (e.g. `--env-file`) through the
+    /// production `merge_layers` path — the merge must not deduplicate within a
+    /// single layer, or repeated env-file flags get silently dropped (issue #5).
+    #[test]
+    fn run_args_preserve_repeated_flags_through_effective_load() {
+        let dir = TempDir::new().unwrap();
+        let base = write_base_config(&dir, r#"{}"#);
+        let project = write_project_config(
+            &dir,
+            r#"{"image":"ubuntu:24.04","runArgs":["--env-file","a.env","--env-file","b.env"]}"#,
+        );
+
+        let merged = effective_value(&project, true, &base);
+        let run_args = merged["runArgs"]
+            .as_array()
+            .expect("runArgs should survive effective load");
+        assert_eq!(
+            run_args
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["--env-file", "a.env", "--env-file", "b.env"],
+            "repeated --env-file flags must not be deduplicated by the merge"
+        );
+    }
+
     #[test]
     fn workspace_mount_and_workspace_folder_merge_as_independent_keys() {
         let dir = TempDir::new().unwrap();

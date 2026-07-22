@@ -162,10 +162,15 @@ Higher-priority layers override lower ones, with behavior depending on the field
 | Field type | Merge strategy | Examples |
 |-----------|----------------|----------|
 | Scalar | Higher priority wins | `image`, `remoteUser`, `name` |
-| Array | Concatenate (deduplicated) | `mounts`, `forwardPorts`, `runArgs` |
+| Array | Concatenate (deduplicated) | `mounts`, `forwardPorts` |
+| Array | Concatenate (order preserved, not deduplicated) | `runArgs` |
 | Map | Merge (higher priority keys win) | `remoteEnv`, `containerEnv` |
 | Features | Union (all features combined) | `features` |
 | Lifecycle commands | Named-command objects union (higher priority wins per name); string and array forms follow scalar rules | `postCreateCommand`, `onCreateCommand` |
+
+`runArgs` is not deduplicated because repeated flags such as `--env-file` are
+legitimate and their left-to-right order is semantically meaningful (see
+[runArgs support](#runargs-support) below).
 
 **Selector precedence.** Whichever of `image`, `build`, or `dockerComposeFile` a project's own `.devcontainer/devcontainer.json` declares is authoritative: competing selectors from lower layers are dropped, not merged — so a base config `image` cannot turn a `build`- or compose-based project into an image-based one. A recipe project has no `devcontainer.json`, so the same rule applies to the highest layer that declares a selector (recipe overrides, then runtime, then base). `dev config set image` on a recipe therefore drops a `build` inherited from the global template.
 
@@ -223,6 +228,89 @@ dev up --runtime apple
 ```
 
 Docker Compose (`dockerComposeFile`) is supported for the full lifecycle — build, up, down, shell, exec, features, UID remapping — and uses `docker compose` or `podman compose` depending on the selected runtime.
+
+## runArgs support
+
+`devcontainer.json`'s `runArgs` is a list of Docker/Podman `run` flags. `dev`
+does not shell out to `docker run`, so it cannot pass arbitrary CLI flags
+through to the daemon. Instead it translates a **supported environment subset**
+of `runArgs` into the container-create request, and rejects every other flag
+*before* container creation with an actionable error — no `runArg` is ever
+silently ignored. (See [issue #5](https://github.com/squirrelsoft-dev/dev/issues/5):
+previously every `runArg` was parsed and then dropped.)
+
+### Supported flags
+
+| Flag | Forms accepted | Translates to |
+|------|----------------|---------------|
+| `--env-file` | `--env-file PATH`, `--env-file=PATH` | env entries read from the file |
+| `--env` | `--env KEY=VALUE`, `--env=KEY=VALUE` | a `KEY=VALUE` env entry |
+| `-e` | `-e KEY=VALUE`, `-eKEY=VALUE` | a `KEY=VALUE` env entry |
+
+Repeated env files and env flags are processed left-to-right. Anything outside
+this subset fails before the container is created, naming the unsupported flag
+and pointing at the first-class devcontainer property to use instead (for
+example `forwardPorts`, `mounts`, `containerEnv`, or `capAdd`).
+
+### The reporter's configuration
+
+This is the exact configuration from issue #5, and it now works on both Docker
+and Podman:
+
+```json
+"runArgs": ["--env-file", "${localWorkspaceFolder}/.devcontainer/.env"]
+```
+
+`${localWorkspaceFolder}` is substituted *before* the file is opened, so the
+path resolves against the workspace just as it does in your editor.
+
+### Env-file format
+
+Env files are parsed with Docker-compatible behavior (matching `docker/cli`'s
+`pkg/kvfile`):
+
+- the file must be valid UTF-8 (a leading UTF-8 BOM is tolerated);
+- leading whitespace is trimmed on each line; **trailing whitespace is part of
+  the value** and kept;
+- blank lines and lines whose first non-blank character is `#` are ignored;
+- `KEY=VALUE` keeps the value verbatim — there is **no quoting, interpolation,
+  or escaping** (quotes are part of the value);
+- a bare `KEY` (no `=`) passes the host environment variable through: if it is
+  set on the host it becomes `KEY=value`, and if it is unset the key is
+  **omitted** rather than invented as an empty value;
+- a key may not be empty or contain whitespace.
+
+Relative env-file paths resolve against the workspace folder — the `dev`
+equivalent of the directory `docker run` is invoked from.
+
+### Precedence
+
+Environment is applied in this order, with the last value for a key winning
+(matching Docker CLI intent):
+
+1. the image's own environment (lowest);
+2. `dev`'s effective `containerEnv` overlays it;
+3. env-file and `--env`/`-e` entries from `runArgs`, in `runArgs` order.
+
+### Failure behavior
+
+A missing, unreadable, malformed, or non-UTF-8 env file fails before container
+creation with an error naming the file path and the offending line number. The
+error never includes env-file contents or secret values — only the variable
+**name** (which is not a secret) and the line number.
+
+### Workaround for unsupported flags
+
+If you need a flag `dev` does not yet translate, use the equivalent
+first-class devcontainer property. Common mappings:
+
+| `runArgs` flag | First-class devcontainer property |
+|----------------|-----------------------------------|
+| `--network` | (no equivalent yet — file an issue) |
+| `--add-host` | (no equivalent yet — file an issue) |
+| `--cap-add` | `capAdd` / `containerEnv`-adjacent capabilities config |
+| `--publish` | `forwardPorts` |
+| `--volume` / `--mount` | `mounts` / `volumes` |
 
 ## Local `.test` domains
 

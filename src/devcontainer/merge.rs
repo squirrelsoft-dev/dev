@@ -14,8 +14,15 @@ const LIFECYCLE_FIELDS: &[&str] = &[
     "postAttachCommand",
 ];
 
-/// Fields that are arrays and should be concatenated (base appended to template).
-const ARRAY_FIELDS: &[&str] = &["forwardPorts", "mounts", "runArgs"];
+/// Fields that are arrays and should be concatenated (base appended to template),
+/// deduplicating entries that appear in both layers.
+const ARRAY_FIELDS: &[&str] = &["forwardPorts", "mounts"];
+
+/// Array fields that concatenate without deduplication. `runArgs` is here
+/// because repeated flags (e.g. `--env-file`) are legitimate and order matters
+/// for left-to-right precedence — deduping would silently drop the second
+/// `--env-file` and break env-file loading (issue #5).
+const ARRAY_CONCAT_FIELDS: &[&str] = &["runArgs"];
 
 /// Fields that are key-value maps and should be merged (base keys override template keys).
 const MAP_FIELDS: &[&str] = &["remoteEnv", "containerEnv"];
@@ -49,6 +56,8 @@ pub fn merge_layer(base: &mut Value, overlay: &Value) {
             merge_lifecycle_command(base_obj, key, overlay_val);
         } else if FEATURE_FIELDS.contains(&key.as_str()) {
             merge_feature_map(base_obj, key, overlay_val);
+        } else if ARRAY_CONCAT_FIELDS.contains(&key.as_str()) {
+            merge_array_concat(base_obj, key, overlay_val);
         } else if ARRAY_FIELDS.contains(&key.as_str()) {
             merge_array(base_obj, key, overlay_val);
         } else if MAP_FIELDS.contains(&key.as_str()) {
@@ -131,6 +140,25 @@ fn merge_array(dest_obj: &mut serde_json::Map<String, Value>, key: &str, base_va
     }
 }
 
+/// Concatenate arrays without deduplication. Used for `runArgs`, where repeated
+/// flags are legitimate and the left-to-right order is semantically meaningful.
+fn merge_array_concat(dest_obj: &mut serde_json::Map<String, Value>, key: &str, base_val: &Value) {
+    let base_arr = match base_val.as_array() {
+        Some(arr) => arr,
+        None => return,
+    };
+
+    let dest_arr = dest_obj
+        .entry(key)
+        .or_insert_with(|| Value::Array(Vec::new()));
+
+    if let Some(dest_vec) = dest_arr.as_array_mut() {
+        for item in base_arr {
+            dest_vec.push(item.clone());
+        }
+    }
+}
+
 /// Merge maps: base keys override template keys.
 fn merge_map(dest_obj: &mut serde_json::Map<String, Value>, key: &str, base_val: &Value) {
     let base_map = match base_val.as_object() {
@@ -203,6 +231,8 @@ mod tests {
                 dest_obj.insert(key.clone(), base_val.clone());
             } else if FEATURE_FIELDS.contains(&key.as_str()) {
                 merge_feature_map(dest_obj, key, base_val);
+            } else if ARRAY_CONCAT_FIELDS.contains(&key.as_str()) {
+                merge_array_concat(dest_obj, key, base_val);
             } else if ARRAY_FIELDS.contains(&key.as_str()) {
                 merge_array(dest_obj, key, base_val);
             } else if MAP_FIELDS.contains(&key.as_str()) {
@@ -324,6 +354,60 @@ mod tests {
         assert_eq!(ports[0], 3000);
         assert_eq!(ports[1], 8080);
         assert_eq!(ports[2], 9090);
+    }
+
+    /// `runArgs` must concatenate without deduplicating: repeated flags such as
+    /// `--env-file` are legitimate and order matters (left-to-right precedence).
+    /// A single project layer repeating `--env-file` must keep every occurrence.
+    #[test]
+    fn test_merge_run_args_preserves_repeated_flags() {
+        let dest_dir = TempDir::new().unwrap();
+        let devcontainer_dir = dest_dir.path().join(".devcontainer");
+        fs::create_dir_all(&devcontainer_dir).unwrap();
+        let dest_config = devcontainer_dir.join("devcontainer.json");
+        fs::write(
+            &dest_config,
+            r#"{"image":"ubuntu","runArgs":["--env-file","a.env","--env-file","b.env"]}"#,
+        )
+        .unwrap();
+        let base_dir = TempDir::new().unwrap();
+
+        let _ = merge_with_base(base_dir.path(), dest_dir.path()).unwrap();
+
+        let json: Value = serde_json::from_str(&fs::read_to_string(&dest_config).unwrap()).unwrap();
+        let run_args = json["runArgs"].as_array().unwrap();
+        assert_eq!(
+            run_args
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["--env-file", "a.env", "--env-file", "b.env"],
+            "repeated --env-file flags must survive the merge"
+        );
+    }
+
+    /// Across base + project layers, `runArgs` concatenate in order without
+    /// dedup, so a flag repeated in both layers is preserved.
+    #[test]
+    fn test_merge_run_args_concatenates_layers_without_dedup() {
+        let (base_dir, dest_dir, dest_config) = setup_merge_test(
+            r#"{"runArgs":["--env","BASE=1"]}"#,
+            r#"{"runArgs":["--env-file","project.env"]}"#,
+        );
+
+        let result = merge_with_base(base_dir.path(), dest_dir.path()).unwrap();
+        assert!(result);
+
+        let json: Value = serde_json::from_str(&fs::read_to_string(&dest_config).unwrap()).unwrap();
+        let run_args = json["runArgs"].as_array().unwrap();
+        assert_eq!(
+            run_args
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["--env-file", "project.env", "--env", "BASE=1"],
+            "project runArgs come first, base appended, no dedup"
+        );
     }
 
     #[test]
