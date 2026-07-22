@@ -158,6 +158,10 @@ impl AppleContainerClient {
     }
 
     /// Create and start a new process inside a running container.
+    ///
+    /// `stderr` may be `None` when `config.terminal` is true: Apple's daemon
+    /// rejects a separate stderr fd on a terminal session. Nonterminal sessions
+    /// still require and carry all three fds unchanged.
     pub async fn create_process(
         &self,
         container_id: &str,
@@ -165,7 +169,7 @@ impl AppleContainerClient {
         config: &ProcessConfiguration,
         stdin: RawFd,
         stdout: RawFd,
-        stderr: RawFd,
+        stderr: Option<RawFd>,
     ) -> Result<(), AppleContainerError> {
         let msg = XpcMessage::with_route(XpcRoute::ContainerCreateProcess.as_str());
         msg.set_string(XpcKey::ID, container_id);
@@ -175,7 +179,14 @@ impl AppleContainerClient {
         msg.set_data(XpcKey::PROCESS_CONFIG, &config_json);
         msg.set_fd(XpcKey::STDIN, stdin);
         msg.set_fd(XpcKey::STDOUT, stdout);
-        msg.set_fd(XpcKey::STDERR, stderr);
+        if !config.terminal {
+            let stderr = stderr.ok_or_else(|| {
+                AppleContainerError::XpcError(
+                    "nonterminal process configuration requires stderr".to_string(),
+                )
+            })?;
+            msg.set_fd(XpcKey::STDERR, stderr);
+        }
 
         let reply = self.connection.send_async(&msg).await?;
         reply.check_error()?;

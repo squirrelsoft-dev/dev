@@ -136,6 +136,8 @@ impl AppleRuntime {
         let process_id = next_process_id("exec-interactive");
 
         // Hand the real terminal descriptors to the daemon; it drives the pty.
+        // Apple's daemon rejects a separate stderr fd when `terminal=true`, so
+        // the interactive path omits stderr (stdin/stdout remain).
         self.client
             .create_process(
                 id,
@@ -143,7 +145,7 @@ impl AppleRuntime {
                 &proc_config,
                 std::io::stdin().as_raw_fd(),
                 std::io::stdout().as_raw_fd(),
-                std::io::stderr().as_raw_fd(),
+                None,
             )
             .await
             .map_err(|e| DevError::Runtime(format!("exec_interactive failed: {e}")))?;
@@ -594,7 +596,7 @@ trait ExecDaemon: Send + Sync {
         config: &'a ProcessConfiguration,
         stdin: std::os::fd::RawFd,
         stdout: std::os::fd::RawFd,
-        stderr: std::os::fd::RawFd,
+        stderr: Option<std::os::fd::RawFd>,
     ) -> DaemonFut<'a, ()>;
 
     fn start_process<'a>(&'a self, container_id: &'a str, process_id: &'a str)
@@ -627,7 +629,7 @@ impl ExecDaemon for AppleContainerClient {
         config: &'a ProcessConfiguration,
         stdin: std::os::fd::RawFd,
         stdout: std::os::fd::RawFd,
-        stderr: std::os::fd::RawFd,
+        stderr: Option<std::os::fd::RawFd>,
     ) -> DaemonFut<'a, ()> {
         Box::pin(AppleContainerClient::create_process(
             self,
@@ -875,7 +877,7 @@ async fn run_captured_process(
             proc_config,
             stdin_read.as_raw_fd(),
             stdout_write.as_raw_fd(),
-            stderr_write.as_raw_fd(),
+            Some(stderr_write.as_raw_fd()),
         )
         .await
         .map_err(|e| DevError::Runtime(format!("exec failed: {e}")))?;
@@ -1557,6 +1559,8 @@ mod tests {
         exit_code: i32,
         /// What `start_process` refuses with, if it refuses at all.
         start_refusal: Option<&'static str>,
+        created_terminal: AtomicBool,
+        created_stderr: AtomicBool,
         wait_fails: bool,
         /// Refuse the wait only once the process is running, so the failure
         /// lands on the caller's exit wait instead of on its start. The
@@ -1691,16 +1695,20 @@ mod tests {
             &'a self,
             _container_id: &'a str,
             _process_id: &'a str,
-            _config: &'a ProcessConfiguration,
+            config: &'a ProcessConfiguration,
             stdin: RawFd,
             stdout: RawFd,
-            stderr: RawFd,
+            stderr: Option<RawFd>,
         ) -> DaemonFut<'a, ()> {
             self.record("create");
+            self.created_terminal
+                .store(config.terminal, Ordering::SeqCst);
+            self.created_stderr
+                .store(stderr.is_some(), Ordering::SeqCst);
             *self.held.lock().unwrap() = Some(HeldStdio {
                 stdin: dup_fd(stdin),
                 stdout: Some(dup_fd(stdout)),
-                stderr: Some(dup_fd(stderr)),
+                stderr: stderr.map(dup_fd),
             });
             Box::pin(async { Ok(()) })
         }
@@ -1721,8 +1729,12 @@ mod tests {
                 {
                     let held = self.held.lock().unwrap();
                     let held = held.as_ref().expect("start without create");
-                    write_fd(held.stdout.as_ref().expect("stdout"), &self.stdout);
-                    write_fd(held.stderr.as_ref().expect("stderr"), &self.stderr);
+                    if let Some(stdout) = held.stdout.as_ref() {
+                        write_fd(stdout, &self.stdout);
+                    }
+                    if let Some(stderr) = held.stderr.as_ref() {
+                        write_fd(stderr, &self.stderr);
+                    }
                 }
                 self.started.store(true, Ordering::SeqCst);
                 if self.wait_fails_after_the_start {
@@ -3077,7 +3089,11 @@ mod tests {
             .create(&config, &kernel)
             .await
             .expect("create failed");
-        let devnull = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let devnull = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .expect("open /dev/null");
         let fd = devnull.as_raw_fd();
         runtime
             .client
@@ -3138,16 +3154,129 @@ mod tests {
         assert_eq!(piped.exit_code, 0, "cat must exit once stdin reaches EOF");
         assert!(piped.stdout.is_empty());
 
-        // Clean up.
+        // Live smoke for Apple's terminal exec contract: `terminal=true`
+        // starts with stdin/stdout and no separate stderr fd, then reports its
+        // exit.
+        let defaults = ProcessDefaults {
+            working_directory: "/tmp".to_string(),
+            environment: Vec::new(),
+        };
+        let proc_config = exec_process_config(
+            &[
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "exit 0".to_string(),
+            ],
+            None,
+            true,
+            &defaults,
+        );
+        let process_id = next_process_id("exec-interactive-smoke");
         runtime
             .client
-            .stop(container_id)
+            .create_process(container_id, &process_id, &proc_config, fd, fd, None)
             .await
-            .expect("stop failed");
+            .expect("terminal create_process failed");
+
+        let (issued, on_the_wire) = tokio::sync::oneshot::channel();
+        let exit_wait = runtime
+            .client
+            .wait_process_issuing(container_id, &process_id, issued);
+        tokio::pin!(exit_wait);
+        start_with_registered_exit_wait(
+            "exec_interactive",
+            &proc_config.executable,
+            &mut exit_wait,
+            on_the_wire,
+            runtime.client.start_process(container_id, &process_id),
+        )
+        .await
+        .expect("terminal start_process failed");
+
+        let exit_code = tokio::time::timeout(std::time::Duration::from_secs(30), exit_wait)
+            .await
+            .expect("terminal exec wait hung")
+            .expect("terminal exec wait failed");
+        assert_eq!(exit_code, 0);
+
+        // Clean up. The daemon can report a stop timeout after the container
+        // has stopped, so deletion is the authoritative cleanup check.
+        let _ = stop_past_stale_process_records(&runtime.client, container_id).await;
+        for _ in 0..20 {
+            if runtime
+                .client
+                .get(container_id)
+                .await
+                .map(|snapshot| snapshot.status != RuntimeStatus::Running)
+                .unwrap_or(true)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
         runtime
             .client
             .delete(container_id, true)
             .await
             .expect("delete failed");
+    }
+
+    // ---- Apple interactive-shell regression: stderr omitted when terminal=true
+
+    #[tokio::test]
+    async fn terminal_process_creation_omits_stderr_fd() {
+        let daemon = FakeExecDaemon::default();
+        let config = exec_process_config(
+            &["/bin/sh".to_string()],
+            None,
+            true,
+            &ProcessDefaults {
+                working_directory: "/tmp".to_string(),
+                environment: Vec::new(),
+            },
+        );
+
+        daemon
+            .create_process("cid", "pid", &config, 0, 1, None)
+            .await
+            .expect("terminal process creation should be recorded");
+
+        assert!(
+            daemon.created_terminal.load(Ordering::SeqCst),
+            "the regression must cover terminal=true process creation"
+        );
+        assert!(
+            !daemon.created_stderr.load(Ordering::SeqCst),
+            "terminal=true must omit the stderr fd"
+        );
+        assert!(
+            daemon
+                .held
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .stderr
+                .is_none(),
+            "terminal=true must not hand stderr to the daemon"
+        );
+    }
+
+    /// Guard against an over-broad fix that drops stderr everywhere: noninteractive
+    /// exec must still carry all three fds and return its captured output.
+    #[tokio::test]
+    async fn exec_noninteractive_retains_all_three_fds() {
+        let daemon = FakeExecDaemon::producing("hello\n", "oops\n", 0);
+        let result = bounded_exec(&daemon)
+            .await
+            .expect("exec must produce a result");
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "hello\n");
+        assert_eq!(result.stderr, "oops\n");
+        assert!(
+            daemon.created_stderr.load(Ordering::SeqCst),
+            "noninteractive must retain stderr"
+        );
     }
 }
