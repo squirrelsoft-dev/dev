@@ -31,6 +31,10 @@ pub struct ContainerConfig {
     pub volumes: Vec<VolumeMount>,
     pub ports: Vec<PortMapping>,
     pub workspace_mount: Option<WorkspaceMount>,
+    /// Resolved `workspaceFolder`: where commands run inside the container.
+    /// Equal to the workspace mount target unless the config selects a
+    /// subdirectory of it.
+    pub workspace_folder: Option<String>,
     #[allow(dead_code)]
     pub extra_args: Vec<String>,
     pub entrypoint: Option<String>,
@@ -113,6 +117,19 @@ pub struct AttachedExec {
 /// A boxed future that is Send.
 pub(crate) type BoxFut<'a, T> = Pin<Box<dyn Future<Output = Result<T, DevError>> + Send + 'a>>;
 
+/// Current terminal size as (columns, rows), or None when stdout is not a tty.
+pub(crate) fn terminal_size() -> Option<(u16, u16)> {
+    use std::os::fd::AsRawFd;
+    let fd = std::io::stdout().as_raw_fd();
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0 && ws.ws_row > 0
+    {
+        Some((ws.ws_col, ws.ws_row))
+    } else {
+        None
+    }
+}
+
 /// Trait abstracting over container runtimes (Docker, Podman, Apple Containers).
 #[allow(dead_code)]
 pub trait ContainerRuntime: Send + Sync {
@@ -141,7 +158,26 @@ pub trait ContainerRuntime: Send + Sync {
 
     fn exec(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, ExecResult>;
 
-    fn exec_interactive(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, ()>;
+    /// Whether an [`Self::exec`] failure means the image has no such
+    /// executable, rather than the runtime being unable to run one at all.
+    ///
+    /// Only the runtime knows the difference, because only it knows which of
+    /// its own failures can carry that meaning: docker declines to start the
+    /// exec and answers with a server error, while Apple's daemon fails the
+    /// start step. Callers use this to tell an image without a shell — which is
+    /// the image's business — from a container they cannot run anything in.
+    ///
+    /// A process that ran and exited is not this: whatever status it reported,
+    /// the runtime created, started and waited for it. Implementations must
+    /// answer `false` for anything they cannot attribute to the command itself,
+    /// so a transport, start or wait failure stays fatal to readiness.
+    fn exec_reports_missing_command(&self, _error: &DevError) -> bool {
+        false
+    }
+
+    /// Run a command attached to the caller's terminal, returning its exit code
+    /// once it finishes.
+    fn exec_interactive(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, i32>;
 
     fn inspect_container(&self, id: &str) -> BoxFut<'_, ContainerInfo>;
 

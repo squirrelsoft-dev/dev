@@ -257,6 +257,24 @@ impl DevcontainerConfig {
 
         Ok(default)
     }
+
+    /// Returns the directory commands run in inside the container.
+    ///
+    /// `workspaceMount` decides where the source tree is attached;
+    /// `workspaceFolder` decides where work happens inside it, which may be the
+    /// mount root or a subdirectory such as one project of a monorepo. When the
+    /// config names no folder this is the mount destination, so a config with
+    /// only a `workspaceMount` still lands in the source tree.
+    pub fn workspace_folder_path(
+        &self,
+        host: &Path,
+        remote_user: Option<&str>,
+    ) -> Result<String, DevError> {
+        if let Some(folder) = &self.workspace_folder {
+            return Ok(substitute_variables_with_user(folder, host, remote_user));
+        }
+        self.workspace_mount_target(host, remote_user)
+    }
 }
 
 /// Extracts the destination value from a Docker `--mount` string.
@@ -362,6 +380,66 @@ mod workspace_mount_tests {
             .workspace_mount_target(&host, None)
             .unwrap();
         assert_eq!(resolved, "/srv/app");
+    }
+
+    /// The mount decides where the source tree lands; the folder decides where
+    /// commands run. A monorepo config points `workspaceFolder` at one project
+    /// inside the mount, and that subdirectory — not the mount root — is the
+    /// working directory.
+    #[test]
+    fn workspace_folder_selects_a_subdirectory_of_the_mount() {
+        let host = PathBuf::from("/home/user/monorepo");
+        let mount = "source=/home/user/monorepo,target=/srv/app,type=bind";
+        let config = cfg(Some("/srv/app/packages/api"), Some(mount));
+
+        assert_eq!(
+            config.workspace_mount_target(&host, None).unwrap(),
+            "/srv/app",
+            "the bind mount still lands at the mount target"
+        );
+        assert_eq!(
+            config.workspace_folder_path(&host, None).unwrap(),
+            "/srv/app/packages/api",
+            "commands must run in the configured workspace folder"
+        );
+    }
+
+    /// With a `workspaceMount` but no `workspaceFolder`, work happens at the
+    /// mount root — the folder defaults to where the source tree was attached.
+    #[test]
+    fn workspace_folder_defaults_to_the_mount_target() {
+        let host = PathBuf::from("/home/user/my-project");
+        let mount = "source=/home/user/my-project,target=/srv/app,type=bind";
+        let resolved = cfg(None, Some(mount))
+            .workspace_folder_path(&host, None)
+            .unwrap();
+        assert_eq!(resolved, "/srv/app");
+    }
+
+    /// With neither field, both the mount and the folder are the conventional
+    /// `/workspaces/{name}`.
+    #[test]
+    fn workspace_folder_defaults_to_the_conventional_path() {
+        let host = PathBuf::from("/home/user/my-project");
+        let config = cfg(None, None);
+        assert_eq!(
+            config.workspace_folder_path(&host, None).unwrap(),
+            "/workspaces/my-project"
+        );
+        assert_eq!(
+            config.workspace_folder_path(&host, None).unwrap(),
+            config.workspace_mount_target(&host, None).unwrap()
+        );
+    }
+
+    /// A `workspaceFolder` alone is honoured even though no mount names it.
+    #[test]
+    fn workspace_folder_alone_is_the_working_directory() {
+        let host = PathBuf::from("/home/user/my-project");
+        let resolved = cfg(Some("/workspace"), None)
+            .workspace_folder_path(&host, None)
+            .unwrap();
+        assert_eq!(resolved, "/workspace");
     }
 
     #[test]

@@ -337,8 +337,8 @@ mod tests {
             _id: &str,
             _cmd: &[String],
             _user: Option<&str>,
-        ) -> BoxFut<'static, ()> {
-            as_fut(Ok(()))
+        ) -> BoxFut<'static, i32> {
+            as_fut(Ok(0))
         }
 
         fn inspect_container(&self, id: &str) -> BoxFut<'static, ContainerInfo> {

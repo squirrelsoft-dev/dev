@@ -1,5 +1,92 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
+
+/// Container ids already reported as undecodable, so the warning stays a
+/// warning instead of becoming noise.
+static REPORTED_UNDECODABLE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+/// Whether this container's decode failure has not been reported yet.
+///
+/// `list` runs many times per command — the `dev up` readiness gate alone polls
+/// repeatedly — so an unreadable container would otherwise print the same line
+/// a dozen times per invocation.
+fn first_report_for(id: &str) -> bool {
+    let reported = REPORTED_UNDECODABLE.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut reported = reported.lock().unwrap_or_else(|e| e.into_inner());
+    reported.insert(id.to_string())
+}
+
+/// A `containerList` entry these models could not decode.
+///
+/// The identity fields are read straight out of the raw JSON so a caller can
+/// still tell whether the entry was the container it was looking for.
+#[derive(Debug, Clone)]
+pub struct UndecodableSnapshot {
+    pub id: String,
+    pub labels: HashMap<String, String>,
+    pub error: String,
+}
+
+/// Everything one `containerList` reply carried: what decoded, and what did not.
+#[derive(Debug, Default)]
+pub struct ContainerListing {
+    pub snapshots: Vec<ContainerSnapshot>,
+    pub undecodable: Vec<UndecodableSnapshot>,
+}
+
+/// Decode a `containerList` payload one entry at a time.
+///
+/// The daemon returns every container it knows about in a single array, so an
+/// all-or-nothing decode lets one container the models cannot represent hide
+/// all the others — which is how `dev status`/`dev exec`/`dev up` discovery
+/// broke in issue #4. Entries that fail to decode are reported on stderr (once
+/// per container per process) and returned separately, so the remaining
+/// containers stay discoverable while a caller looking for one of the skipped
+/// entries can still say why it is missing rather than treating it as absent.
+pub fn decode_snapshots(data: &[u8]) -> Result<ContainerListing, serde_json::Error> {
+    let entries: Vec<serde_json::Value> = serde_json::from_slice(data)?;
+    let mut listing = ContainerListing {
+        snapshots: Vec::with_capacity(entries.len()),
+        undecodable: Vec::new(),
+    };
+    for entry in entries {
+        let configuration = entry.get("configuration");
+        let id = configuration
+            .and_then(|c| c.get("id"))
+            .and_then(|id| id.as_str())
+            .unwrap_or("<unknown>")
+            .to_string();
+        let labels = configuration
+            .and_then(|c| c.get("labels"))
+            .and_then(|l| l.as_object())
+            .map(|labels| {
+                labels
+                    .iter()
+                    .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        match serde_json::from_value::<ContainerSnapshot>(entry) {
+            Ok(snapshot) => listing.snapshots.push(snapshot),
+            Err(e) => {
+                if first_report_for(&id) {
+                    eprintln!(
+                        "Warning: ignoring container '{id}': the daemon returned a record this \
+                         version cannot read ({e})"
+                    );
+                }
+                listing.undecodable.push(UndecodableSnapshot {
+                    id,
+                    labels,
+                    error: e.to_string(),
+                });
+            }
+        }
+    }
+    Ok(listing)
+}
 
 /// Snapshot of a container's full state, returned by list/get operations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,17 +211,51 @@ pub struct Filesystem {
 
 /// Filesystem attachment type, matching Apple's `FSType` enum.
 ///
-/// Swift's Codable encodes each case as `{"<caseName>": {}}`.
+/// Swift's Codable encodes each case as `{"<caseName>": {}}` (for empty
+/// cases) or `{"<caseName>": {…associated values…}}`.
+///
+/// `Volume` covers named volumes created by `container volume`/`container
+/// run --volume`, which the daemon attaches as a block-backed filesystem.
+/// `list`/`inspect` must deserialize these or `dev status`/`dev exec`/`dev up`
+/// discovery fails whenever any container in the daemon uses a named volume
+/// (issue #4).
+///
+/// `Other` keeps that class of failure from recurring: any case a newer daemon
+/// adds is retained verbatim instead of failing the whole reply. It round-trips
+/// unchanged because it is `untagged`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FSType {
     Virtiofs(Empty),
     Tmpfs(Empty),
+    Volume(VolumeFilesystem),
+    #[serde(untagged)]
+    Other(serde_json::Value),
 }
 
 /// Empty unit struct used for Swift-compatible enum case encoding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Empty {}
+
+/// Associated values for the `Volume` case of [`FSType`].
+///
+/// `cache` and `sync` are themselves Swift enums encoded as single-key
+/// objects (e.g. `{"on":{}}`, `{"fsync":{}}`). They are captured opaquely so
+/// new modes the daemon adds do not break deserialization of `list`/`inspect`
+/// output. Unknown fields are likewise tolerated (serde ignores them by
+/// default), so adding fields here is forward-compatible.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VolumeFilesystem {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub format: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<serde_json::Value>,
+}
 
 /// A published port mapping.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -303,4 +424,227 @@ pub struct ContainerStats {
     pub memory_usage: u64,
     #[serde(default)]
     pub disk_usage: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `list`/`inspect` reply must deserialize even when a container in the
+    /// daemon uses a named volume filesystem. Before the `Volume` variant was
+    /// added, `FSType` rejected `"volume"` and `container ls`/`container inspect`
+    /// — and therefore `dev status`/`dev exec`/`dev up` discovery — failed for
+    /// every container whenever any one container had a volume mount (issue #4).
+    #[test]
+    fn filesystem_with_volume_mount_deserializes() {
+        let json = r#"{
+            "type": {"volume": {"name": "move-pg-data", "cache": {"on": {}}, "sync": {"fsync": {}}, "format": "ext4"}},
+            "source": "/Users/u/Library/Application Support/com.apple.container/volumes/move-pg-data/volume.img",
+            "destination": "/var/lib/postgresql/data",
+            "options": []
+        }"#;
+        let fs: Filesystem =
+            serde_json::from_str(json).expect("volume filesystem must deserialize");
+        match fs.fs_type {
+            FSType::Volume(v) => {
+                assert_eq!(v.name, "move-pg-data");
+                assert_eq!(v.format, "ext4");
+            }
+            other => panic!("expected Volume, got {other:?}"),
+        }
+    }
+
+    /// A complete `containerList` snapshot containing a volume mount and the
+    /// extra configuration fields the daemon emits (`rosetta`, `ssh`,
+    /// `useInit`, `publishedSockets`, `sysctls`, `readOnly`, `virtualization`)
+    /// must deserialize. This is the shape that broke `dev status` on a daemon
+    /// that also hosted a postgres container with a named volume.
+    #[test]
+    fn container_snapshot_with_volume_and_extra_fields_deserializes() {
+        let json = r#"{
+            "configuration": {
+                "id": "move-pg",
+                "image": {"reference": "docker.io/library/postgres:16"},
+                "mounts": [{
+                    "type": {"volume": {"name": "move-pg-data", "cache": {"on": {}}, "sync": {"fsync": {}}, "format": "ext4"}},
+                    "source": "/v.img",
+                    "destination": "/data",
+                    "options": []
+                }],
+                "publishedPorts": [],
+                "labels": {},
+                "initProcess": {"executable": "postgres", "arguments": [], "environment": [], "workingDirectory": "/", "terminal": false},
+                "resources": {"cpus": 4, "memoryInBytes": 1073741824},
+                "runtimeHandler": "container-runtime-linux",
+                "platform": {"architecture": "arm64", "os": "linux"},
+                "networks": [{"network": "default", "options": {"hostname": "move-pg"}}],
+                "rosetta": false,
+                "virtualization": false,
+                "readOnly": false,
+                "useInit": false,
+                "publishedSockets": [],
+                "ssh": false,
+                "sysctls": {}
+            },
+            "status": "running",
+            "networks": [],
+            "startedDate": 806283546.523321
+        }"#;
+        let snap: ContainerSnapshot =
+            serde_json::from_str(json).expect("snapshot with volume mount must deserialize");
+        assert_eq!(snap.configuration.id, "move-pg");
+        assert!(matches!(
+            snap.configuration.mounts[0].fs_type,
+            FSType::Volume(_)
+        ));
+        assert_eq!(snap.status, RuntimeStatus::Running);
+    }
+
+    /// A mount case this version does not model must still deserialize, and must
+    /// survive a round-trip unchanged — otherwise the next filesystem type the
+    /// daemon adds reproduces the issue #4 discovery break.
+    #[test]
+    fn filesystem_with_unknown_type_falls_back_to_other() {
+        let json = r#"{
+            "type": {"blockDevice": {"path": "/dev/disk4", "readOnly": true}},
+            "source": "/dev/disk4",
+            "destination": "/mnt/data",
+            "options": []
+        }"#;
+        let fs: Filesystem =
+            serde_json::from_str(json).expect("unknown filesystem type must deserialize");
+        match &fs.fs_type {
+            FSType::Other(value) => assert_eq!(
+                value.get("blockDevice").and_then(|b| b.get("path")),
+                Some(&serde_json::Value::from("/dev/disk4"))
+            ),
+            other => panic!("expected Other, got {other:?}"),
+        }
+
+        let reencoded = serde_json::to_value(&fs).expect("re-encode");
+        assert_eq!(
+            reencoded.get("type"),
+            serde_json::from_str::<serde_json::Value>(json)
+                .unwrap()
+                .get("type"),
+            "an unmodelled mount type must round-trip verbatim"
+        );
+    }
+
+    fn snapshot_json(id: &str, mount_type: &str) -> String {
+        format!(
+            r#"{{
+                "configuration": {{
+                    "id": "{id}",
+                    "image": {{"reference": "docker.io/library/alpine:latest"}},
+                    "mounts": [{{
+                        "type": {mount_type},
+                        "source": "/src",
+                        "destination": "/dst",
+                        "options": []
+                    }}],
+                    "labels": {{"devcontainer.local_folder": "/w/{id}"}}
+                }},
+                "status": "running"
+            }}"#
+        )
+    }
+
+    /// One container the models cannot represent must not hide the rest of the
+    /// list. This is the issue #4 failure mode: an unrelated container in the
+    /// daemon made `dev status`/`dev exec`/`dev up` discovery fail for *every*
+    /// workspace, because `containerList` was decoded all-or-nothing.
+    #[test]
+    fn decode_snapshots_skips_unreadable_entries() {
+        // `status` is required, so an entry missing it cannot be decoded at all
+        // — it stands in for whatever the next unmodelled daemon field is.
+        let payload = format!(
+            "[{},{},{}]",
+            snapshot_json("good-one", r#"{"virtiofs": {}}"#),
+            r#"{"configuration": {"id": "unreadable"}}"#,
+            snapshot_json("good-two", r#"{"volume": {"name": "v", "format": "ext4"}}"#),
+        );
+
+        let listing = decode_snapshots(payload.as_bytes()).expect("list payload must decode");
+
+        let ids: Vec<&str> = listing
+            .snapshots
+            .iter()
+            .map(|s| s.configuration.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["good-one", "good-two"],
+            "readable containers must stay discoverable when a sibling entry cannot be decoded"
+        );
+    }
+
+    /// Skipping an entry keeps its siblings visible, but a caller searching for
+    /// the skipped container must be able to tell "cannot read this record"
+    /// apart from "no such container" — otherwise `dev up` sees an empty list
+    /// and creates a duplicate the daemon then rejects.
+    #[test]
+    fn undecodable_entries_are_returned_with_their_identity_and_cause() {
+        let payload = format!(
+            "[{},{}]",
+            snapshot_json("good-one", r#"{"virtiofs": {}}"#),
+            r#"{"configuration": {"id": "unreadable",
+                "labels": {"devcontainer.local_folder": "/w/unreadable"}}}"#,
+        );
+
+        let listing = decode_snapshots(payload.as_bytes()).expect("list payload must decode");
+
+        assert_eq!(listing.snapshots.len(), 1);
+        assert_eq!(listing.undecodable.len(), 1);
+        let skipped = &listing.undecodable[0];
+        assert_eq!(skipped.id, "unreadable");
+        assert_eq!(
+            skipped
+                .labels
+                .get("devcontainer.local_folder")
+                .map(String::as_str),
+            Some("/w/unreadable"),
+            "the labels a caller filters on must survive a failed decode"
+        );
+        assert!(
+            !skipped.error.is_empty(),
+            "the decode failure must be reportable"
+        );
+    }
+
+    /// An entry whose `configuration` is unreadable too still has to be
+    /// reported rather than dropped silently.
+    #[test]
+    fn an_undecodable_entry_without_labels_is_still_reported() {
+        let listing = decode_snapshots(b"[{\"nothing\": true}]").expect("list payload must decode");
+        assert!(listing.snapshots.is_empty());
+        assert_eq!(listing.undecodable.len(), 1);
+        assert_eq!(listing.undecodable[0].id, "<unknown>");
+        assert!(listing.undecodable[0].labels.is_empty());
+    }
+
+    /// The undecodable-container warning is reported once per container, not
+    /// once per `list` call — `dev up` alone polls the list a dozen times, and
+    /// a repeated line buries the signal it is meant to carry.
+    #[test]
+    fn undecodable_container_is_reported_once() {
+        let payload = br#"[{"configuration": {"id": "noisy-container"}}]"#;
+
+        for round in 0..5 {
+            let listing = decode_snapshots(payload).expect("list payload must decode");
+            assert!(listing.snapshots.is_empty());
+            assert!(
+                !first_report_for("noisy-container"),
+                "round {round} must not re-report an already reported container"
+            );
+        }
+    }
+
+    /// A payload that is not a JSON array at all is still a hard error — the
+    /// per-entry tolerance must not turn a malformed reply into "no containers".
+    #[test]
+    fn decode_snapshots_rejects_non_array_payload() {
+        decode_snapshots(b"{\"containers\": []}")
+            .expect_err("a non-array containerList payload must surface as an error");
+    }
 }

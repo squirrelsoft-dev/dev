@@ -15,8 +15,31 @@ use clap::Parser;
 
 use cli::{BaseAction, Cli, Command, GlobalAction, VscodeAction};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// How long a blocking task may hold the process up once the command is done.
+///
+/// Nothing legitimate is outstanding by then: every blocking task this CLI
+/// spawns is awaited by the command that spawned it. What can still be parked
+/// is a synchronous XPC send whose reply the daemon dropped — the readiness
+/// gate and the exec probe bound their *awaits*, but dropping the future only
+/// detaches the thread, it cannot cancel the send.
+///
+/// That thread must not decide whether the user sees anything. A dropped
+/// runtime waits for its blocking pool, and `#[tokio::main]` drops it as a
+/// temporary *before* `main`'s `Result` reaches anyhow's `Termination` — so a
+/// parked send would hold the process at exit with nothing printed, which is
+/// the silent hang of issue #4 wearing the gate's error message.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::ZERO;
+
+fn main() -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(run());
+    runtime.shutdown_timeout(SHUTDOWN_GRACE);
+    result
+}
+
+async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let workspace = cli

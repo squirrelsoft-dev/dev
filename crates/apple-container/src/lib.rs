@@ -1,5 +1,7 @@
 pub mod build;
+pub mod content;
 pub mod error;
+pub mod fssync;
 pub mod models;
 pub mod routes;
 pub mod xpc;
@@ -9,8 +11,8 @@ use std::path::Path;
 
 use error::AppleContainerError;
 use models::{
-    ContainerConfiguration, ContainerSnapshot, ContainerStats, ImageDescription,
-    ProcessConfiguration,
+    ContainerConfiguration, ContainerListing, ContainerSnapshot, ContainerStats, ImageDescription,
+    ProcessConfiguration, decode_snapshots,
 };
 use routes::{IMAGE_SERVICE_NAME, ImageRoute, SERVICE_NAME, XpcKey, XpcRoute};
 use xpc::connection::XpcConnection;
@@ -38,16 +40,24 @@ impl AppleContainerClient {
 
     /// List all containers, optionally filtered.
     pub async fn list(&self) -> Result<Vec<ContainerSnapshot>, AppleContainerError> {
+        Ok(self.list_all().await?.snapshots)
+    }
+
+    /// List all containers, keeping the entries that could not be decoded.
+    ///
+    /// A caller that knows which container it is looking for can then tell an
+    /// unreadable record apart from an absent one instead of silently seeing
+    /// nothing.
+    pub async fn list_all(&self) -> Result<ContainerListing, AppleContainerError> {
         let msg = XpcMessage::with_route(XpcRoute::ContainerList.as_str());
         let reply = self.connection.send_async(&msg).await?;
         reply.check_error()?;
 
         let data = reply.get_data(XpcKey::CONTAINERS).unwrap_or_default();
         if data.is_empty() {
-            return Ok(Vec::new());
+            return Ok(ContainerListing::default());
         }
-        let snapshots: Vec<ContainerSnapshot> = serde_json::from_slice(&data)?;
-        Ok(snapshots)
+        Ok(decode_snapshots(&data)?)
     }
 
     /// Get a single container by ID.
@@ -55,11 +65,24 @@ impl AppleContainerClient {
     /// Uses `containerList` and filters, since `containerGet` does not return
     /// snapshot data under a discoverable key in the XPC reply.
     pub async fn get(&self, id: &str) -> Result<ContainerSnapshot, AppleContainerError> {
-        let containers = self.list().await?;
-        containers
+        let listing = self.list_all().await?;
+        if let Some(snapshot) = listing
+            .snapshots
             .into_iter()
             .find(|s| s.configuration.id == id)
-            .ok_or_else(|| AppleContainerError::NotFound(id.to_string()))
+        {
+            return Ok(snapshot);
+        }
+        // The container is in the reply but unreadable: saying "not found"
+        // here would send the caller off to create a duplicate.
+        match listing.undecodable.iter().find(|entry| entry.id == id) {
+            Some(entry) => Err(AppleContainerError::XpcError(format!(
+                "container '{id}' exists but the daemon returned a record this version \
+                 cannot read ({})",
+                entry.error
+            ))),
+            None => Err(AppleContainerError::NotFound(id.to_string())),
+        }
     }
 
     /// Fetch the default kernel from the daemon for the given platform.
@@ -135,6 +158,11 @@ impl AppleContainerClient {
     }
 
     /// Create and start a new process inside a running container.
+    ///
+    /// `stderr` must be `None` when `config.terminal` is true: Apple's daemon
+    /// rejects a separate stderr fd on a terminal session, whose stderr reaches
+    /// the caller through the pty instead. Nonterminal sessions still require
+    /// and carry all three fds unchanged.
     pub async fn create_process(
         &self,
         container_id: &str,
@@ -142,26 +170,16 @@ impl AppleContainerClient {
         config: &ProcessConfiguration,
         stdin: RawFd,
         stdout: RawFd,
-        stderr: RawFd,
+        stderr: Option<RawFd>,
     ) -> Result<(), AppleContainerError> {
-        let msg = XpcMessage::with_route(XpcRoute::ContainerCreateProcess.as_str());
-        msg.set_string(XpcKey::ID, container_id);
-        msg.set_string(XpcKey::PROCESS_IDENTIFIER, process_id);
-
-        let config_json = serde_json::to_vec(config)?;
-        msg.set_data(XpcKey::PROCESS_CONFIG, &config_json);
-        msg.set_fd(XpcKey::STDIN, stdin);
-        msg.set_fd(XpcKey::STDOUT, stdout);
-        msg.set_fd(XpcKey::STDERR, stderr);
+        let msg = create_process_message(container_id, process_id, config, stdin, stdout, stderr)?;
 
         let reply = self.connection.send_async(&msg).await?;
         reply.check_error()?;
         Ok(())
     }
 
-    /// Wait for a process to exit and return its exit code.
-    /// The exit code is returned in the create_process reply when the process exits.
-    /// For long-running processes, this polls the container state.
+    /// Read the exit code out of a reply that carries one.
     pub fn get_exit_code(reply: &XpcMessage) -> i32 {
         reply.get_int64(XpcKey::EXIT_CODE) as i32
     }
@@ -181,10 +199,80 @@ impl AppleContainerClient {
         Ok(())
     }
 
-    /// Send a signal to a container.
+    /// Block until a process inside a container exits, returning its exit code.
+    ///
+    /// Mirrors the daemon's `wait(id:processID:)` handler: the reply is only
+    /// sent once the process has exited, and carries `exitCode`. Callers that
+    /// also read the process's stdout/stderr should drive this concurrently
+    /// with those reads.
+    pub async fn wait_process(
+        &self,
+        id: &str,
+        process_id: &str,
+    ) -> Result<i32, AppleContainerError> {
+        let (issued, _) = tokio::sync::oneshot::channel();
+        self.wait_process_issuing(id, process_id, issued).await
+    }
+
+    /// Wait for a process to exit, signalling `issued` as the request goes out.
+    ///
+    /// The daemon never answers a wait that reaches it while it is recording
+    /// that process's exit, so a caller that starts the process must know the
+    /// wait is already on its way — see [`XpcConnection::send_issuing`].
+    pub async fn wait_process_issuing(
+        &self,
+        id: &str,
+        process_id: &str,
+        issued: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<i32, AppleContainerError> {
+        let msg = XpcMessage::with_route(XpcRoute::ContainerWait.as_str());
+        msg.set_string(XpcKey::ID, id);
+        msg.set_string(XpcKey::PROCESS_IDENTIFIER, process_id);
+
+        let reply = self.connection.send_issuing(&msg, issued).await?;
+        reply.check_error()?;
+        Ok(Self::get_exit_code(&reply))
+    }
+
+    /// Tell a process's pseudo-terminal about a new window size.
+    ///
+    /// Only meaningful for processes created with `terminal: true`.
+    pub async fn resize_process(
+        &self,
+        id: &str,
+        process_id: &str,
+        columns: u16,
+        rows: u16,
+    ) -> Result<(), AppleContainerError> {
+        let msg = XpcMessage::with_route(XpcRoute::ContainerResize.as_str());
+        msg.set_string(XpcKey::ID, id);
+        msg.set_string(XpcKey::PROCESS_IDENTIFIER, process_id);
+        msg.set_uint64(XpcKey::WIDTH, columns as u64);
+        msg.set_uint64(XpcKey::HEIGHT, rows as u64);
+
+        let reply = self.connection.send_async(&msg).await?;
+        reply.check_error()?;
+        Ok(())
+    }
+
+    /// Send a signal to a container's init process.
     pub async fn kill(&self, id: &str, signal: i32) -> Result<(), AppleContainerError> {
+        self.kill_process(id, id, signal).await
+    }
+
+    /// Send a signal to a specific process inside a container.
+    ///
+    /// The daemon's handler is `kill(id:processID:signal:)`; omitting the
+    /// process identifier targets the container's init process.
+    pub async fn kill_process(
+        &self,
+        id: &str,
+        process_id: &str,
+        signal: i32,
+    ) -> Result<(), AppleContainerError> {
         let msg = XpcMessage::with_route(XpcRoute::ContainerKill.as_str());
         msg.set_string(XpcKey::ID, id);
+        msg.set_string(XpcKey::PROCESS_IDENTIFIER, process_id);
         msg.set_int64(XpcKey::SIGNAL, signal as i64);
 
         let reply = self.connection.send_async(&msg).await?;
@@ -304,5 +392,163 @@ impl AppleContainerClient {
         platform: &[u8],
     ) -> Result<Vec<u8>, AppleContainerError> {
         build::pull_image(reference, platform).await
+    }
+}
+
+/// Build the `createProcess` request, deciding which stdio keys it carries.
+///
+/// Separate from the send so the decision can be checked against the message
+/// itself: whether the STDERR key is present is the whole contract with the
+/// daemon, and it is unobservable once the message has gone out over XPC.
+///
+/// A terminal session's stderr reaches the caller through the pty, so a caller
+/// that supplies one is refused rather than having it silently dropped — the fd
+/// it expected to collect output on would never see a byte, with nothing said.
+fn create_process_message(
+    container_id: &str,
+    process_id: &str,
+    config: &ProcessConfiguration,
+    stdin: RawFd,
+    stdout: RawFd,
+    stderr: Option<RawFd>,
+) -> Result<XpcMessage, AppleContainerError> {
+    let msg = XpcMessage::with_route(XpcRoute::ContainerCreateProcess.as_str());
+    msg.set_string(XpcKey::ID, container_id);
+    msg.set_string(XpcKey::PROCESS_IDENTIFIER, process_id);
+
+    let config_json = serde_json::to_vec(config)?;
+    msg.set_data(XpcKey::PROCESS_CONFIG, &config_json);
+    msg.set_fd(XpcKey::STDIN, stdin);
+    msg.set_fd(XpcKey::STDOUT, stdout);
+    match config.terminal {
+        true if stderr.is_some() => {
+            return Err(AppleContainerError::XpcError(
+                "a terminal process configuration carries no separate stderr; its stderr \
+                 arrives on the terminal"
+                    .to_string(),
+            ));
+        }
+        true => {}
+        false => {
+            let stderr = stderr.ok_or_else(|| {
+                AppleContainerError::XpcError(
+                    "nonterminal process configuration requires stderr".to_string(),
+                )
+            })?;
+            msg.set_fd(XpcKey::STDERR, stderr);
+        }
+    }
+    Ok(msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use models::{User, UserString};
+    use std::os::fd::AsRawFd;
+
+    fn process_config(terminal: bool) -> ProcessConfiguration {
+        ProcessConfiguration {
+            executable: "/bin/sh".to_string(),
+            arguments: vec!["-l".to_string()],
+            environment: vec![],
+            working_directory: "/workspaces/repo".to_string(),
+            terminal,
+            user: User::Raw {
+                raw: UserString {
+                    user_string: "root".to_string(),
+                },
+            },
+            supplemental_groups: vec![],
+            rlimits: vec![],
+        }
+    }
+
+    /// A real descriptor, since `set_fd` hands the number to libxpc.
+    fn devnull() -> std::fs::File {
+        std::fs::File::open("/dev/null").expect("open /dev/null")
+    }
+
+    /// The interactive-shell regression: Apple's daemon refuses to create a
+    /// `terminal: true` process that also carries a separate stderr fd, so
+    /// `dev shell` failed outright. Asserted against the message the client
+    /// actually sends, so restoring the key fails here.
+    #[test]
+    fn a_terminal_process_request_carries_no_stderr_key() {
+        let null = devnull();
+        let msg = create_process_message(
+            "cid",
+            "pid",
+            &process_config(true),
+            null.as_raw_fd(),
+            null.as_raw_fd(),
+            None,
+        )
+        .expect("a terminal request with no stderr must be built");
+
+        assert!(
+            !msg.has_key(XpcKey::STDERR),
+            "a terminal session's stderr arrives on the pty; the key must be absent"
+        );
+        assert!(
+            msg.has_key(XpcKey::STDIN),
+            "stdin must still be handed over"
+        );
+        assert!(
+            msg.has_key(XpcKey::STDOUT),
+            "stdout must still be handed over"
+        );
+    }
+
+    /// The other half of the same contract: the fix must not drop stderr
+    /// everywhere. A captured `dev exec` reads the process's stderr off its own
+    /// descriptor, so all three keys stay.
+    #[test]
+    fn a_nonterminal_process_request_carries_all_three_stdio_keys() {
+        let null = devnull();
+        let msg = create_process_message(
+            "cid",
+            "pid",
+            &process_config(false),
+            null.as_raw_fd(),
+            null.as_raw_fd(),
+            Some(null.as_raw_fd()),
+        )
+        .expect("a nonterminal request with all three fds must be built");
+
+        assert!(msg.has_key(XpcKey::STDIN));
+        assert!(msg.has_key(XpcKey::STDOUT));
+        assert!(
+            msg.has_key(XpcKey::STDERR),
+            "a nonterminal session's stderr has nowhere else to go"
+        );
+    }
+
+    /// Neither shape may be built from stdio it cannot honour: a nonterminal
+    /// request without stderr would lose the output the caller is waiting for,
+    /// and a terminal request with one would have the caller watching a
+    /// descriptor the daemon was never told about.
+    #[test]
+    fn stdio_that_does_not_match_the_configuration_is_refused() {
+        let null = devnull();
+        let refusal = |terminal: bool, stderr: Option<RawFd>| {
+            create_process_message(
+                "cid",
+                "pid",
+                &process_config(terminal),
+                null.as_raw_fd(),
+                null.as_raw_fd(),
+                stderr,
+            )
+            .err()
+            .map(|e| e.to_string())
+        };
+
+        let error = refusal(false, None).expect("a nonterminal request without stderr");
+        assert!(error.contains("requires stderr"), "{error}");
+
+        let error = refusal(true, Some(null.as_raw_fd()))
+            .expect("a terminal request with stderr must be refused, not silently stripped");
+        assert!(error.contains("no separate stderr"), "{error}");
     }
 }

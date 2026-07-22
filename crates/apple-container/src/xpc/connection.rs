@@ -73,6 +73,26 @@ impl XpcConnection {
 
     /// Send a message asynchronously by wrapping the synchronous call in `spawn_blocking`.
     pub async fn send_async(&self, msg: &XpcMessage) -> Result<XpcMessage, AppleContainerError> {
+        let (issued, _) = tokio::sync::oneshot::channel();
+        self.send_issuing(msg, issued).await
+    }
+
+    /// Send a message, signalling `issued` from the sending thread the moment
+    /// before the request leaves for the daemon.
+    ///
+    /// [`Self::send_async`] only *queues* the blocking send when its future is
+    /// first polled, so a caller that polls it once has ordered nothing: the
+    /// synchronous send runs on a pool thread whose scheduling the caller
+    /// cannot observe, and under contention a later request can reach the
+    /// daemon first. A caller that must get one request in ahead of another —
+    /// `containerWait` before `containerStart`, because the daemon drops a wait
+    /// that arrives after it has recorded the exit — waits for this signal
+    /// rather than for a yield that proves nothing.
+    pub async fn send_issuing(
+        &self,
+        msg: &XpcMessage,
+        issued: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<XpcMessage, AppleContainerError> {
         // Cast raw pointers to usize so the closure is Send.
         // Both xpc_connection_t and xpc_object_t are thread-safe on macOS.
         let conn_addr = self.conn as usize;
@@ -85,6 +105,9 @@ impl XpcConnection {
             let conn_ptr = conn_addr as *mut std::ffi::c_void;
             let msg_ptr = msg_addr as *mut std::ffi::c_void;
 
+            // The send blocks until the daemon replies, so this is the last
+            // point at which the caller can be told the request is going out.
+            let _ = issued.send(());
             let reply =
                 unsafe { ffi::xpc_connection_send_message_with_reply_sync(conn_ptr, msg_ptr) };
             // Release our retained copy of the message.

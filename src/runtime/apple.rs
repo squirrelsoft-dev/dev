@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use apple_container::AppleContainerClient;
+use apple_container::error::AppleContainerError;
 use apple_container::models::{
     ContainerConfiguration, Empty, FSType, Filesystem, ImageDescription, ProcessConfiguration,
     PublishPort, Resources, RuntimeStatus, User, UserId, UserString,
@@ -11,19 +13,55 @@ use apple_container::models::{
 use crate::error::DevError;
 use crate::runtime::{
     AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ContainerState,
-    ExecResult, ImageMetadata,
+    ExecResult, ImageMetadata, WorkspaceMount, terminal_size,
 };
+
+/// What a container's own processes run with.
+///
+/// Docker and Podman let an exec inherit both of these from the container.
+/// Apple's daemon has no such inheritance — it runs an exec with exactly the
+/// process configuration it is handed — so an exec that omits them runs with no
+/// `PATH` and from `/`, and `postCreateCommand: "npm install"` fails with
+/// command-not-found where docker succeeds.
+#[derive(Debug, Clone, Default)]
+struct ProcessDefaults {
+    working_directory: String,
+    environment: Vec<String>,
+}
 
 /// Apple Containers runtime using native XPC.
 pub struct AppleRuntime {
     client: AppleContainerClient,
+    /// What each container's processes run with, so repeated execs do not each
+    /// pay for a daemon round trip. Populated directly when this process
+    /// creates the container, and by one lookup otherwise.
+    process_defaults: std::sync::Mutex<HashMap<String, ProcessDefaults>>,
 }
 
 impl AppleRuntime {
     pub fn connect() -> Result<Self, DevError> {
         let client = AppleContainerClient::connect()
             .map_err(|e| DevError::Runtime(format!("Apple Containers: {e}")))?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            process_defaults: std::sync::Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn remembered_defaults(&self, id: &str) -> Option<ProcessDefaults> {
+        let cache = self
+            .process_defaults
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cache.get(id).cloned()
+    }
+
+    fn remember_defaults(&self, id: &str, defaults: ProcessDefaults) {
+        let mut cache = self
+            .process_defaults
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cache.insert(id.to_string(), defaults);
     }
 
     pub async fn ping(&self) -> Result<(), DevError> {
@@ -32,6 +70,209 @@ impl AppleRuntime {
             .await
             .map_err(|e| DevError::Runtime(format!("Apple Containers ping failed: {e}")))?;
         Ok(())
+    }
+
+    /// Run a command in the container, capturing its output and exit code.
+    async fn exec_impl(
+        &self,
+        id: &str,
+        cmd: &[String],
+        user: Option<&str>,
+    ) -> Result<ExecResult, DevError> {
+        let defaults = self.container_process_defaults(id).await;
+        let proc_config = exec_process_config(cmd, user, false, &defaults);
+        run_captured_process(&self.client, id, &proc_config).await
+    }
+
+    /// The environment and working directory the container's own processes use.
+    ///
+    /// Resolved at most once per container: `create_container` records what it
+    /// configured, and any other invocation (`dev exec`, `dev shell`) reads it
+    /// back from the daemon once. A lookup failure is reported and degrades to
+    /// an empty environment in `/` for that command only — it is never cached,
+    /// so a transient daemon error cannot pin the rest of the invocation to the
+    /// wrong directory or strip `PATH` from every later command.
+    async fn container_process_defaults(&self, id: &str) -> ProcessDefaults {
+        if let Some(known) = self.remembered_defaults(id) {
+            return known;
+        }
+
+        match self.client.get(id).await {
+            Ok(snapshot) => {
+                let init = snapshot.configuration.init_process;
+                let defaults = ProcessDefaults {
+                    working_directory: absolute_or_root([Some(init.working_directory.as_str())]),
+                    environment: init.environment,
+                };
+                self.remember_defaults(id, defaults.clone());
+                defaults
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: could not read the process configuration of container '{id}' \
+                     ({e}); running this command from / with no environment"
+                );
+                ProcessDefaults {
+                    working_directory: "/".to_string(),
+                    environment: Vec::new(),
+                }
+            }
+        }
+    }
+
+    /// Run a command against the caller's terminal and wait for it to exit.
+    async fn exec_interactive_impl(
+        &self,
+        id: &str,
+        cmd: &[String],
+        user: Option<&str>,
+    ) -> Result<i32, DevError> {
+        // Resolved before raw mode: this can warn, and a raw terminal needs
+        // CRLF to keep such output from staircasing.
+        let defaults = self.container_process_defaults(id).await;
+        let proc_config = exec_process_config(cmd, user, true, &defaults);
+
+        let _raw_guard = RawModeGuard::enter()?;
+        let process_id = next_process_id("exec-interactive");
+
+        // Hand the real terminal descriptors to the daemon; it drives the pty.
+        // Apple's daemon rejects a separate stderr fd when `terminal=true`, so
+        // the interactive path omits stderr (stdin/stdout remain).
+        self.client
+            .create_process(
+                id,
+                &process_id,
+                &proc_config,
+                std::io::stdin().as_raw_fd(),
+                std::io::stdout().as_raw_fd(),
+                None,
+            )
+            .await
+            .map_err(|e| DevError::Runtime(format!("exec_interactive failed: {e}")))?;
+
+        // Registered before the start for the same reason a captured exec does
+        // it: see `start_with_registered_exit_wait`.
+        let (issued, on_the_wire) = tokio::sync::oneshot::channel();
+        let exit_wait = self.client.wait_process_issuing(id, &process_id, issued);
+        tokio::pin!(exit_wait);
+        if let Err(e) = start_with_registered_exit_wait(
+            "exec_interactive",
+            &proc_config.executable,
+            &mut exit_wait,
+            on_the_wire,
+            self.client.start_process(id, &process_id),
+        )
+        .await
+        {
+            let _ = self
+                .client
+                .kill_process(id, &process_id, libc::SIGKILL)
+                .await;
+            return Err(e);
+        }
+
+        self.resize_to_terminal(id, &process_id).await;
+        let exit_code = self
+            .attend_interactive_process(id, &process_id, exit_wait)
+            .await?;
+
+        // _raw_guard is dropped here, restoring the terminal.
+        Ok(exit_code)
+    }
+
+    /// Forward window-size changes and signals until the process exits.
+    ///
+    /// The daemon copies terminal bytes itself, so the only host-side work left
+    /// is keeping the guest pty's window size in sync and relaying signals
+    /// aimed at this CLI (the raw-mode terminal delivers Ctrl-C to the guest as
+    /// a byte, not as a host SIGINT).
+    async fn attend_interactive_process<W>(
+        &self,
+        id: &str,
+        process_id: &str,
+        mut wait: std::pin::Pin<&mut W>,
+    ) -> Result<i32, DevError>
+    where
+        W: std::future::Future<Output = Result<i32, AppleContainerError>>,
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let watch = |kind: SignalKind, name: &str| {
+            signal(kind).map_err(|e| DevError::Runtime(format!("watch {name}: {e}")))
+        };
+        let mut window_change = watch(SignalKind::window_change(), "SIGWINCH")?;
+        let mut interrupt = watch(SignalKind::interrupt(), "SIGINT")?;
+        let mut terminate = watch(SignalKind::terminate(), "SIGTERM")?;
+
+        loop {
+            tokio::select! {
+                exited = &mut wait => {
+                    return exited.map_err(|e| {
+                        DevError::Runtime(format!("exec_interactive wait failed: {e}"))
+                    });
+                }
+                _ = window_change.recv() => self.resize_to_terminal(id, process_id).await,
+                _ = interrupt.recv() => self.forward_signal(id, process_id, libc::SIGINT).await,
+                // A SIGTERM aimed at `dev` must also end `dev`.
+                _ = terminate.recv() => {
+                    self.forward_signal(id, process_id, libc::SIGTERM).await;
+                    return self.stop_attending(id, process_id, wait).await;
+                }
+            }
+        }
+    }
+
+    /// How long a signalled process has to exit before this stops waiting.
+    const TERMINATION_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Wait out a terminated process, then give up on it and return.
+    ///
+    /// `dev shell` must not outlive a SIGTERM sent to it: an interactive shell
+    /// that ignores the signal (bash does) would otherwise leave the CLI
+    /// killable only with SIGKILL, which skips `RawModeGuard`'s restore and
+    /// leaves the user's terminal in raw mode. A supervisor or script stopping
+    /// `dev shell` would simply hang.
+    async fn stop_attending<W>(
+        &self,
+        id: &str,
+        process_id: &str,
+        wait: std::pin::Pin<&mut W>,
+    ) -> Result<i32, DevError>
+    where
+        W: std::future::Future<Output = Result<i32, AppleContainerError>>,
+    {
+        match tokio::time::timeout(Self::TERMINATION_GRACE, wait).await {
+            Ok(exited) => {
+                exited.map_err(|e| DevError::Runtime(format!("exec_interactive wait failed: {e}")))
+            }
+            Err(_) => {
+                self.forward_signal(id, process_id, libc::SIGKILL).await;
+                // The shell conventionally reports a signalled child this way.
+                Ok(128 + libc::SIGTERM)
+            }
+        }
+    }
+
+    /// Best-effort sync of the guest pty's window size with the host terminal.
+    async fn resize_to_terminal(&self, id: &str, process_id: &str) {
+        let Some((columns, rows)) = terminal_size() else {
+            return;
+        };
+        if let Err(e) = self
+            .client
+            .resize_process(id, process_id, columns, rows)
+            .await
+        {
+            // Written with CRLF: the terminal is in raw mode here.
+            eprint!("\r\nWarning: could not resize container terminal: {e}\r\n");
+        }
+    }
+
+    /// Best-effort relay of a host signal to the process inside the container.
+    async fn forward_signal(&self, id: &str, process_id: &str, signal: i32) {
+        if let Err(e) = self.client.kill_process(id, process_id, signal).await {
+            eprint!("\r\nWarning: could not deliver signal {signal} to container: {e}\r\n");
+        }
     }
 
     /// Search the Apple Container local image store for a reference.
@@ -72,7 +313,7 @@ fn cache_key(reference: &str) -> String {
 }
 
 /// Cached OCI image config fields we care about.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct CachedImageConfig {
     env: Vec<String>,
     user: Option<String>,
@@ -150,38 +391,52 @@ async fn fetch_and_cache_oci_config(reference: &str) -> Result<CachedImageConfig
     let config_json: serde_json::Value = serde_json::from_slice(&config_data)
         .map_err(|e| DevError::Runtime(format!("parse image config JSON: {e}")))?;
 
-    let env = config_json
-        .get("config")
-        .and_then(|c| c.get("Env"))
-        .and_then(|e| e.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    let user = config_json
-        .get("config")
-        .and_then(|c| c.get("User"))
-        .and_then(|u| u.as_str())
-        .map(|s| s.to_string());
-
-    let working_dir = config_json
-        .get("config")
-        .and_then(|c| c.get("WorkingDir"))
-        .and_then(|w| w.as_str())
-        .map(|s| s.to_string());
-
-    let cached = CachedImageConfig {
-        env,
-        user,
-        working_dir,
-    };
+    let cached = CachedImageConfig::from_oci_config(&config_json);
     if let Err(e) = write_cached_config(reference, &cached) {
         eprintln!("Warning: failed to cache OCI config: {e}");
     }
     Ok(cached)
+}
+
+impl CachedImageConfig {
+    /// Read the runtime fields out of an OCI image config document.
+    fn from_oci_config(config_json: &serde_json::Value) -> Self {
+        let section = config_json.get("config");
+        let string_field = |name: &str| {
+            section
+                .and_then(|c| c.get(name))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
+
+        Self {
+            env: section
+                .and_then(|c| c.get("Env"))
+                .and_then(|e| e.as_array())
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            user: string_field("User"),
+            working_dir: string_field("WorkingDir"),
+        }
+    }
+}
+
+/// Read an image's config from the daemon's own content store.
+///
+/// An image `dev` just built has no registry to query, and for a pulled image
+/// the local blob is the exact config the container will run with, so this is
+/// both the only source in one case and the more accurate one in the other.
+fn read_local_image_config(image: &ImageDescription) -> Option<CachedImageConfig> {
+    // Apple Containers runs Linux guests on Apple silicon only, matching the
+    // platform every other request in this runtime asks for.
+    let config_json =
+        apple_container::content::read_image_config(&image.descriptor.digest, "linux", "arm64")?;
+    Some(CachedImageConfig::from_oci_config(&config_json))
 }
 
 /// RAII guard that puts the terminal into raw mode and restores it on drop.
@@ -212,6 +467,554 @@ impl Drop for RawModeGuard {
     fn drop(&mut self) {
         unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) };
     }
+}
+
+/// Serial number making every exec process identifier unique within this process.
+static EXEC_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Build a process identifier that is unique per exec call.
+///
+/// The daemon keys processes by this identifier within a container, so two
+/// execs sharing one identifier collide. `dev up` runs lifecycle hooks
+/// concurrently, so a host-PID-only identifier is not enough.
+fn next_process_id(prefix: &str) -> String {
+    let seq = EXEC_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}-{}-{seq}", std::process::id())
+}
+
+/// Map a devcontainer user spec onto Apple's process user model.
+///
+/// `remoteUser` is normally a name (`vscode`), which only `User::Raw` can
+/// carry — the daemon resolves it against the image's `/etc/passwd`. Numeric
+/// `uid` and `uid:gid` specs map onto `User::Id`.
+fn to_apple_user(user: Option<&str>) -> User {
+    let Some(spec) = user.map(str::trim).filter(|u| !u.is_empty()) else {
+        return User::Id {
+            id: UserId { uid: 0, gid: 0 },
+        };
+    };
+    match parse_numeric_user(spec) {
+        Some(id) => User::Id { id },
+        None => User::Raw {
+            raw: UserString {
+                user_string: spec.to_string(),
+            },
+        },
+    }
+}
+
+/// Parse `uid` or `uid:gid`, returning None for anything non-numeric.
+fn parse_numeric_user(spec: &str) -> Option<UserId> {
+    match spec.split_once(':') {
+        Some((uid, gid)) => Some(UserId {
+            uid: uid.parse().ok()?,
+            gid: gid.parse().ok()?,
+        }),
+        None => {
+            let uid = spec.parse().ok()?;
+            Some(UserId { uid, gid: uid })
+        }
+    }
+}
+
+/// Build the process configuration for an exec'd command.
+///
+/// The container's own environment and working directory are applied here
+/// because Apple's daemon gives an exec neither: see [`ProcessDefaults`].
+fn exec_process_config(
+    cmd: &[String],
+    user: Option<&str>,
+    terminal: bool,
+    defaults: &ProcessDefaults,
+) -> ProcessConfiguration {
+    ProcessConfiguration {
+        executable: cmd.first().cloned().unwrap_or_default(),
+        arguments: cmd.get(1..).map(<[String]>::to_vec).unwrap_or_default(),
+        environment: defaults.environment.clone(),
+        working_directory: absolute_or_root([Some(defaults.working_directory.as_str())]),
+        terminal,
+        user: to_apple_user(user),
+        supplemental_groups: vec![],
+        rlimits: vec![],
+    }
+}
+
+/// First absolute candidate, or `/` when none is usable.
+///
+/// The daemon has no "unset" working directory: it chdirs into whatever string
+/// it is given, so a relative or empty value would fail the process outright.
+fn absolute_or_root<'a>(candidates: impl IntoIterator<Item = Option<&'a str>>) -> String {
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|dir| dir.starts_with('/'))
+        .unwrap_or("/")
+        .to_string()
+}
+
+/// The directory a container's processes run in.
+///
+/// Docker and Podman leave the exec working directory unset so it inherits the
+/// container's, which comes from the image's `WorkingDir`. Apple's daemon has
+/// no such inheritance, so the directory is resolved once here and applied to
+/// both the init process and every exec.
+///
+/// The resolved `workspaceFolder` comes first: that is where the devcontainer
+/// spec runs lifecycle commands, and it may be a subdirectory of the workspace
+/// mount (one project of a monorepo). The mount destination is the fallback for
+/// a container without a resolved folder, and the image's `WorkingDir` for one
+/// without a workspace at all.
+fn container_working_directory(
+    workspace_folder: Option<&str>,
+    workspace_mount: Option<&WorkspaceMount>,
+    image_working_dir: Option<&str>,
+) -> String {
+    absolute_or_root([
+        workspace_folder,
+        workspace_mount.map(|ws| ws.target.as_str()),
+        image_working_dir,
+    ])
+}
+
+/// A boxed daemon future.
+type DaemonFut<'a, T> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<T, AppleContainerError>> + Send + 'a>,
+>;
+
+/// The daemon calls a captured exec drives, behind a seam.
+///
+/// `create_process` only registers a process; only `start_process` runs it, and
+/// only `wait_process` reports its real status. Issue #4 was that sequence
+/// collapsing to a bare create with a hardcoded exit code, which no test can
+/// observe through a concrete XPC client — so the sequence is expressed against
+/// this trait and a stand-in stands in for the daemon in tests.
+trait ExecDaemon: Send + Sync {
+    fn create_process<'a>(
+        &'a self,
+        container_id: &'a str,
+        process_id: &'a str,
+        config: &'a ProcessConfiguration,
+        stdin: std::os::fd::RawFd,
+        stdout: std::os::fd::RawFd,
+        stderr: Option<std::os::fd::RawFd>,
+    ) -> DaemonFut<'a, ()>;
+
+    fn start_process<'a>(&'a self, container_id: &'a str, process_id: &'a str)
+    -> DaemonFut<'a, ()>;
+
+    /// Wait for a process's exit, signalling `issued` as the request goes out.
+    ///
+    /// The signal is what orders the wait ahead of the start; see
+    /// [`start_with_registered_exit_wait`].
+    fn wait_process<'a>(
+        &'a self,
+        container_id: &'a str,
+        process_id: &'a str,
+        issued: tokio::sync::oneshot::Sender<()>,
+    ) -> DaemonFut<'a, i32>;
+
+    fn kill_process<'a>(
+        &'a self,
+        container_id: &'a str,
+        process_id: &'a str,
+        signal: i32,
+    ) -> DaemonFut<'a, ()>;
+}
+
+impl ExecDaemon for AppleContainerClient {
+    fn create_process<'a>(
+        &'a self,
+        container_id: &'a str,
+        process_id: &'a str,
+        config: &'a ProcessConfiguration,
+        stdin: std::os::fd::RawFd,
+        stdout: std::os::fd::RawFd,
+        stderr: Option<std::os::fd::RawFd>,
+    ) -> DaemonFut<'a, ()> {
+        Box::pin(AppleContainerClient::create_process(
+            self,
+            container_id,
+            process_id,
+            config,
+            stdin,
+            stdout,
+            stderr,
+        ))
+    }
+
+    fn start_process<'a>(
+        &'a self,
+        container_id: &'a str,
+        process_id: &'a str,
+    ) -> DaemonFut<'a, ()> {
+        Box::pin(AppleContainerClient::start_process(
+            self,
+            container_id,
+            process_id,
+        ))
+    }
+
+    fn wait_process<'a>(
+        &'a self,
+        container_id: &'a str,
+        process_id: &'a str,
+        issued: tokio::sync::oneshot::Sender<()>,
+    ) -> DaemonFut<'a, i32> {
+        Box::pin(AppleContainerClient::wait_process_issuing(
+            self,
+            container_id,
+            process_id,
+            issued,
+        ))
+    }
+
+    fn kill_process<'a>(
+        &'a self,
+        container_id: &'a str,
+        process_id: &'a str,
+        signal: i32,
+    ) -> DaemonFut<'a, ()> {
+        Box::pin(AppleContainerClient::kill_process(
+            self,
+            container_id,
+            process_id,
+            signal,
+        ))
+    }
+}
+
+/// The daemon call a container stop drives, behind a seam.
+///
+/// Separate from [`ExecDaemon`] because it is a container-level call, and
+/// behind a trait for the same reason that one is: the retry in
+/// [`stop_past_stale_process_records`] is only observable if a test can make
+/// the first attempt fail and the next one succeed.
+trait StopDaemon: Send + Sync {
+    fn stop<'a>(&'a self, container_id: &'a str) -> DaemonFut<'a, ()>;
+}
+
+impl StopDaemon for AppleContainerClient {
+    fn stop<'a>(&'a self, container_id: &'a str) -> DaemonFut<'a, ()> {
+        Box::pin(AppleContainerClient::stop(self, container_id))
+    }
+}
+
+/// Stop a container, retrying once past the daemon's stale process records.
+///
+/// `containerCreateProcess` registers a process with the daemon before the
+/// guest has accepted it, and that record survives a guest-side refusal — an
+/// image with no passwd entry for the requested user, say. The daemon's stop
+/// handler then tries to delete a process the guest has never heard of, fails
+/// with `invalidState`, and fails the whole stop with it, so one refused
+/// `dev exec` — or one refused readiness probe — leaves a container that can
+/// be neither stopped nor removed.
+///
+/// Nothing here can release such a record directly. `containerCreateProcess`,
+/// `containerStartProcess`, `containerWait`, `containerResize` and
+/// `containerKill` are the whole of the daemon's process surface (its
+/// `DeleteProcess` is an internal guest RPC, not an XPC route), and a kill
+/// deletes nothing for a process that never ran. The failed stop is what
+/// discards the records, though, so the attempt behind it is the one that gets
+/// through. Retrying is safe for every other failure too: a stop is
+/// idempotent, and a container that stopped on the first attempt loses only
+/// the second call.
+async fn stop_past_stale_process_records(
+    daemon: &dyn StopDaemon,
+    id: &str,
+) -> Result<(), DevError> {
+    let refused = match daemon.stop(id).await {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    daemon.stop(id).await.map_err(|again| {
+        DevError::Runtime(format!(
+            "Failed to stop container: {again} (an earlier attempt failed with: {refused})"
+        ))
+    })
+}
+
+/// Put a process's exit wait on the wire before its start request.
+///
+/// `create_process` only registers a process; only `start_process` runs it.
+/// The daemon, though, never answers a `containerWait` that reaches it while
+/// it is recording that process's exit, so a wait sent after the start is lost
+/// whenever the command finishes first — a short command like `echo` usually
+/// does, which is the `dev exec` and lifecycle-hook hang in issue #4.
+///
+/// Polling the wait once is not enough to order the two. Every request is a
+/// synchronous XPC send queued onto the blocking pool, so polling only queues
+/// it: which thread runs first, and therefore which request the daemon sees
+/// first, is the pool's business. `on_the_wire` is signalled from inside that
+/// blocking closure immediately before the send, so the start goes out only
+/// once the wait genuinely has. A wait registered while the process still
+/// cannot exit is always answered.
+async fn start_with_registered_exit_wait<W>(
+    what: &str,
+    executable: &str,
+    exit_wait: &mut std::pin::Pin<&mut W>,
+    on_the_wire: tokio::sync::oneshot::Receiver<()>,
+    start: impl std::future::Future<Output = Result<(), AppleContainerError>>,
+) -> Result<(), DevError>
+where
+    W: std::future::Future<Output = Result<i32, AppleContainerError>>,
+{
+    tokio::select! {
+        biased;
+        // Only a daemon-side failure can answer this early: a process that has
+        // not been started has no exit to report. Taking the answer here also
+        // keeps the caller from polling a future that has already completed.
+        answered = exit_wait.as_mut() => Err(match answered {
+            Err(e) => DevError::Runtime(format!("{what} wait failed: {e}")),
+            Ok(code) => DevError::Runtime(format!(
+                "{what} wait reported exit {code} for a process that was never started"
+            )),
+        }),
+        // The wait's request has reached the daemon; start the process behind
+        // it. A dropped signal means the wait will never report anything, and
+        // starting anyway is what surfaces that as a failure rather than as a
+        // process nothing is watching.
+        _ = on_the_wire => start
+            .await
+            .map_err(|e| DevError::Runtime(start_failure(what, executable, &e.to_string()))),
+    }
+}
+
+/// How a failure of the start step is worded, so the wording and the code that
+/// reads it back cannot drift apart.
+const START_FAILED: &str = "start failed";
+
+/// How a start failure the daemon blamed on the executable itself is worded,
+/// for the same reason.
+const NO_SUCH_EXECUTABLE: &str = "the image has no such executable";
+
+/// Word a failed start, saying whether it was the executable's fault.
+///
+/// The attribution is made here because this is the only place that has both
+/// halves of it: what the daemon said, and which executable this exec asked
+/// it to run. [`is_missing_command_failure`] then reads the verdict back
+/// rather than re-deriving it from prose that no longer names the command.
+fn start_failure(what: &str, executable: &str, reported: &str) -> String {
+    match blames_the_executable(executable, reported) {
+        true => format!("{what} {START_FAILED}: {NO_SUCH_EXECUTABLE} ({reported})"),
+        false => format!("{what} {START_FAILED}: {reported}"),
+    }
+}
+
+/// Whether a start failure is about the executable this exec named, rather
+/// than about something else the start step touches.
+///
+/// The start step does more than `execve`: it chdirs into the working
+/// directory, and the guest has a rootfs and mounts under it. Each of those
+/// fails with the same `ENOENT` and the same `strerror` text ("No such file or
+/// directory"), so the phrase alone attributes nothing — which is what the
+/// trait contract forbids. What does attribute it is the path the daemon
+/// named: a failure to run `/bin/sh` names `/bin/sh`, while a workspace folder
+/// that is not there names the folder.
+///
+/// Matched per path segment rather than as a substring, so an executable named
+/// `sh` is not read out of an unrelated `/usr/share/...` in the message. When
+/// nothing matches, this is the runtime's problem and not the image's, which
+/// is the safe way for it to be wrong: readiness fails loudly instead of being
+/// announced for a container no command can run in.
+fn blames_the_executable(executable: &str, reported: &str) -> bool {
+    if executable.is_empty() {
+        return false;
+    }
+    let reported = reported.to_ascii_lowercase();
+    if reported.contains("executable file not found") {
+        return true;
+    }
+    if !reported.contains("no such file or directory") {
+        return false;
+    }
+    let executable = executable.to_ascii_lowercase();
+    reported
+        .split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | ',' | ';' | ':'))
+        .any(|token| {
+            token == executable
+                || token
+                    .rsplit_once('/')
+                    .is_some_and(|(_, base)| base == executable)
+        })
+}
+
+/// Whether an exec failure is the daemon refusing to run a command the image
+/// does not have.
+///
+/// Deliberately narrow, on two axes. Only the *start* step can carry that
+/// meaning: the daemon has accepted the process configuration by then and is
+/// trying to execute it. A create failure, a wait failure and every XPC
+/// transport error are the runtime failing to run anything at all and must
+/// stay fatal to readiness, so the step is checked first.
+///
+/// The second axis is attribution: a start failure only counts when
+/// [`blames_the_executable`] found the daemon naming the very command this
+/// exec asked for. That verdict is recorded in the message as
+/// [`NO_SUCH_EXECUTABLE`] when it is made, so nothing here has to guess at
+/// wording the daemon has not been observed to use.
+fn is_missing_command_failure(message: &str) -> bool {
+    message
+        .split_once(START_FAILED)
+        .is_some_and(|(_, detail)| detail.contains(NO_SUCH_EXECUTABLE))
+}
+
+/// Create, start, and wait for one process, capturing its output.
+async fn run_captured_process(
+    daemon: &dyn ExecDaemon,
+    id: &str,
+    proc_config: &ProcessConfiguration,
+) -> Result<ExecResult, DevError> {
+    let (stdin_read, stdin_write) = exec_pipe()?;
+    let (stdout_read, stdout_write) = exec_pipe()?;
+    let (stderr_read, stderr_write) = exec_pipe()?;
+
+    let process_id = next_process_id("exec");
+
+    daemon
+        .create_process(
+            id,
+            &process_id,
+            proc_config,
+            stdin_read.as_raw_fd(),
+            stdout_write.as_raw_fd(),
+            Some(stderr_write.as_raw_fd()),
+        )
+        .await
+        .map_err(|e| DevError::Runtime(format!("exec failed: {e}")))?;
+
+    // The daemon holds its own copies of all three descriptors now. Closing
+    // ours gives the process EOF on stdin — nothing writes to it, so a
+    // command that reads stdin would otherwise block forever — and lets the
+    // readers below see EOF once the process exits.
+    drop(stdin_write);
+    drop(stdin_read);
+    drop(stdout_write);
+    drop(stderr_write);
+
+    // Drained from here on, so a process that fills a pipe buffer can still
+    // reach its exit.
+    let output = OutputReaders::draining(stdout_read, stderr_read)?;
+
+    let (issued, on_the_wire) = tokio::sync::oneshot::channel();
+    let exit_wait = daemon.wait_process(id, &process_id, issued);
+    tokio::pin!(exit_wait);
+    let start = daemon.start_process(id, &process_id);
+    if let Err(e) = start_with_registered_exit_wait(
+        "exec",
+        &proc_config.executable,
+        &mut exit_wait,
+        on_the_wire,
+        start,
+    )
+    .await
+    {
+        abandon_process(daemon, id, &process_id, output).await;
+        return Err(e);
+    }
+
+    let exit_code = match exit_wait.await {
+        Ok(code) => code,
+        Err(e) => {
+            abandon_process(daemon, id, &process_id, output).await;
+            return Err(DevError::Runtime(format!("exec wait failed: {e}")));
+        }
+    };
+
+    let (stdout, stderr) = output.collected().await?;
+    Ok(ExecResult {
+        exit_code,
+        stdout,
+        stderr,
+    })
+}
+
+/// Give up on a process whose exec failed, releasing what it still holds.
+///
+/// Both halves matter. The exit wait is already registered with the daemon, so
+/// the process is killed to have that wait answered rather than left
+/// outstanding. The output readers are then cancelled rather than waited out:
+/// a process the daemon refused to start has no exit to close the write ends
+/// it dup'd in `create_process`, and a kill closes nothing for a process that
+/// never ran, so those readers would never reach EOF.
+async fn abandon_process(
+    daemon: &dyn ExecDaemon,
+    id: &str,
+    process_id: &str,
+    output: OutputReaders,
+) {
+    let _ = daemon.kill_process(id, process_id, libc::SIGKILL).await;
+    output.released().await;
+}
+
+/// The pair of readers draining one captured exec's output.
+struct OutputReaders {
+    stdout: tokio::task::JoinHandle<std::io::Result<String>>,
+    stderr: tokio::task::JoinHandle<std::io::Result<String>>,
+}
+
+impl OutputReaders {
+    fn draining(
+        stdout: os_pipe::PipeReader,
+        stderr: os_pipe::PipeReader,
+    ) -> Result<Self, DevError> {
+        Ok(Self {
+            stdout: read_pipe(stdout, "stdout")?,
+            stderr: read_pipe(stderr, "stderr")?,
+        })
+    }
+
+    /// What both readers read, once each has reached EOF.
+    async fn collected(self) -> Result<(String, String), DevError> {
+        let (stdout, stderr) = tokio::join!(self.stdout, self.stderr);
+        Ok((
+            finish_read(stdout, "stdout")?,
+            finish_read(stderr, "stderr")?,
+        ))
+    }
+
+    /// Cancel both readers and wait for them to let go of the pipes.
+    async fn released(self) {
+        self.stdout.abort();
+        self.stderr.abort();
+        let _ = tokio::join!(self.stdout, self.stderr);
+    }
+}
+
+/// Create a pipe, mapping the OS error into a runtime error.
+fn exec_pipe() -> Result<(os_pipe::PipeReader, os_pipe::PipeWriter), DevError> {
+    os_pipe::pipe().map_err(|e| DevError::Runtime(format!("pipe: {e}")))
+}
+
+/// Drain a pipe to a string in a task that can be cancelled.
+///
+/// Read through the reactor rather than by parking a thread on the descriptor,
+/// because only the former can be given up on. The daemon holds its own copy
+/// of the write end for a process it never started, so such a read never sees
+/// EOF; a blocking-pool thread stuck in it outlives the failed command, and
+/// the tokio runtime waits for that pool as it shuts down, so `dev exec` and
+/// `dev up` would exit only after printing nothing — the issue #4 hang, moved
+/// onto the failure path.
+fn read_pipe(
+    reader: os_pipe::PipeReader,
+    stream: &str,
+) -> Result<tokio::task::JoinHandle<std::io::Result<String>>, DevError> {
+    let mut reader = tokio::net::unix::pipe::Receiver::from_owned_fd(reader.into())
+        .map_err(|e| DevError::Runtime(format!("watch {stream}: {e}")))?;
+    Ok(tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = String::new();
+        reader.read_to_string(&mut buf).await.map(|_| buf)
+    }))
+}
+
+/// Unwrap the two error layers a [`read_pipe`] task can fail with.
+fn finish_read(
+    joined: Result<std::io::Result<String>, tokio::task::JoinError>,
+    stream: &str,
+) -> Result<String, DevError> {
+    joined
+        .map_err(|e| DevError::Runtime(format!("{stream} reader join: {e}")))?
+        .map_err(|e| DevError::Runtime(format!("read {stream}: {e}")))
 }
 
 /// Translate Shift+Enter escape sequences into a plain carriage return.
@@ -286,7 +1089,7 @@ fn truncate_container_id(name: &str) -> String {
 fn to_apple_config(
     config: &ContainerConfig,
     image: ImageDescription,
-    image_env: &[String],
+    image_config: &CachedImageConfig,
 ) -> ContainerConfiguration {
     let mounts: Vec<Filesystem> = config
         .mounts
@@ -319,7 +1122,7 @@ fn to_apple_config(
         })
         .collect();
 
-    let init_env = merge_env(image_env, &config.env);
+    let init_env = merge_env(&image_config.env, &config.env);
 
     let init_process = ProcessConfiguration {
         executable: config
@@ -332,7 +1135,11 @@ fn to_apple_config(
             Vec::new()
         },
         environment: init_env,
-        working_directory: "/".to_string(),
+        working_directory: container_working_directory(
+            config.workspace_folder.as_deref(),
+            config.workspace_mount.as_ref(),
+            image_config.working_dir.as_deref(),
+        ),
         terminal: false,
         user: User::Raw {
             raw: UserString {
@@ -374,6 +1181,53 @@ fn to_apple_config(
             search_domains: vec![],
             options: vec![],
         }),
+    }
+}
+
+/// Whether a container's labels satisfy every `key=value` filter.
+///
+/// AND semantics, with an empty value meaning "any value for this key".
+fn labels_match(labels: &HashMap<String, String>, filters: &[(&str, &str)]) -> bool {
+    filters.iter().all(|(key, value)| {
+        labels
+            .get(*key)
+            .is_some_and(|v| value.is_empty() || v == value)
+    })
+}
+
+/// Fail a filtered query the daemon answered with an unreadable record for the
+/// very container being asked about, and nothing else.
+///
+/// Skipping undecodable entries keeps unrelated containers discoverable, but
+/// answering "nothing matched" for the caller's *own* container reads as "no
+/// such container": `dev up` then creates a duplicate that the daemon rejects
+/// with a confusing "already exists" instead of the decode failure that
+/// explains it.
+///
+/// Two cases keep the tolerant behaviour. An unfiltered query asks about every
+/// container rather than a specific one. And a query that *did* find a readable
+/// container for these labels has what the caller came for — failing it would
+/// cost `dev status`, `dev exec`, `dev shell` and `dev down` a container they
+/// can reach, leaving the unreadable one impossible to clean up.
+fn report_undecodable_match(
+    undecodable: &[apple_container::models::UndecodableSnapshot],
+    filters: &[(&str, &str)],
+    readable_matches: usize,
+) -> Result<(), DevError> {
+    if filters.is_empty() || readable_matches > 0 {
+        return Ok(());
+    }
+    match undecodable
+        .iter()
+        .find(|entry| labels_match(&entry.labels, filters))
+    {
+        Some(entry) => Err(DevError::Runtime(format!(
+            "container '{}' belongs to this workspace but the daemon returned a record this \
+             version cannot read ({}). Remove it with `container delete {}` and run `dev up` \
+             again.",
+            entry.id, entry.error, entry.id
+        ))),
+        None => Ok(()),
     }
 }
 
@@ -434,28 +1288,35 @@ impl ContainerRuntime for AppleRuntime {
             let image: ImageDescription = serde_json::from_slice(&image_desc_bytes)
                 .map_err(|e| DevError::Runtime(format!("parse image descriptor: {e}")))?;
 
-            // Fetch OCI image config env vars (cached or from registry) so the
-            // init process inherits the image's expected environment.
-            let cached = read_cached_config(&config.image);
-            let image_env = if let Some(c) = cached {
-                c.env
+            // Fetch the OCI image config so the init process inherits the
+            // image's expected environment and working directory.
+            //
+            // The blob the daemon just unpacked comes first: it is the exact
+            // config this container will run with. The reference-keyed cache
+            // carries no digest and never expires, so for a moving tag
+            // (`node:22`) it can be months out of date — preferring it would
+            // hand a freshly pulled image the previous one's PATH.
+            let image_config = if let Some(c) = read_local_image_config(&image) {
+                c
+            } else if let Some(c) = read_cached_config(&config.image) {
+                c
             } else if config.image.starts_with("localhost/") {
                 // Local images have no registry to query; daemon handles env vars.
-                Vec::new()
+                CachedImageConfig::default()
             } else {
                 match fetch_and_cache_oci_config(&config.image).await {
-                    Ok(c) => c.env,
+                    Ok(c) => c,
                     Err(e) => {
                         eprintln!(
                             "Warning: could not fetch image config for {}: {e}",
                             config.image
                         );
-                        Vec::new()
+                        CachedImageConfig::default()
                     }
                 }
             };
 
-            let apple_config = to_apple_config(&config, image, &image_env);
+            let apple_config = to_apple_config(&config, image, &image_config);
             let id = apple_config.id.clone();
 
             // Report truncation here rather than in the caller: only this runtime
@@ -478,6 +1339,14 @@ impl ContainerRuntime for AppleRuntime {
                 .create(&apple_config, &kernel)
                 .await
                 .map_err(|e| DevError::Runtime(format!("Failed to create container: {e}")))?;
+
+            self.remember_defaults(
+                &id,
+                ProcessDefaults {
+                    working_directory: apple_config.init_process.working_directory.clone(),
+                    environment: apple_config.init_process.environment.clone(),
+                },
+            );
 
             Ok(id)
         })
@@ -505,12 +1374,7 @@ impl ContainerRuntime for AppleRuntime {
 
     fn stop_container(&self, id: &str) -> BoxFut<'_, ()> {
         let id = id.to_string();
-        Box::pin(async move {
-            self.client
-                .stop(&id)
-                .await
-                .map_err(|e| DevError::Runtime(format!("Failed to stop container: {e}")))
-        })
+        Box::pin(async move { stop_past_stale_process_records(&self.client, &id).await })
     }
 
     fn remove_container(&self, id: &str) -> BoxFut<'_, ()> {
@@ -527,134 +1391,18 @@ impl ContainerRuntime for AppleRuntime {
         let id = id.to_string();
         let cmd = cmd.to_vec();
         let user = user.map(|u| u.to_string());
-        Box::pin(async move {
-            let (stdin_read, _stdin_write) =
-                os_pipe::pipe().map_err(|e| DevError::Runtime(format!("pipe: {e}")))?;
-            let (stdout_read, stdout_write) =
-                os_pipe::pipe().map_err(|e| DevError::Runtime(format!("pipe: {e}")))?;
-            let (stderr_read, stderr_write) =
-                os_pipe::pipe().map_err(|e| DevError::Runtime(format!("pipe: {e}")))?;
-
-            let executable = cmd.first().cloned().unwrap_or_default();
-            let arguments = if cmd.len() > 1 {
-                cmd[1..].to_vec()
-            } else {
-                Vec::new()
-            };
-
-            let process_id = format!("exec-{}", std::process::id());
-
-            let uid = user
-                .as_deref()
-                .and_then(|u| u.parse::<u32>().ok())
-                .unwrap_or(0);
-
-            let proc_config = ProcessConfiguration {
-                executable,
-                arguments,
-                environment: Vec::new(),
-                working_directory: "/".to_string(),
-                terminal: false,
-                user: User::Id {
-                    id: UserId { uid, gid: uid },
-                },
-                supplemental_groups: vec![],
-                rlimits: vec![],
-            };
-
-            self.client
-                .create_process(
-                    &id,
-                    &process_id,
-                    &proc_config,
-                    stdin_read.as_raw_fd(),
-                    stdout_write.as_raw_fd(),
-                    stderr_write.as_raw_fd(),
-                )
-                .await
-                .map_err(|e| DevError::Runtime(format!("exec failed: {e}")))?;
-
-            // Close write ends so reads will see EOF.
-            drop(stdout_write);
-            drop(stderr_write);
-
-            // Read stdout and stderr.
-            use std::io::Read;
-            let mut stdout_buf = String::new();
-            let mut stderr_buf = String::new();
-
-            let mut stdout_read = stdout_read;
-            let mut stderr_read = stderr_read;
-
-            stdout_read
-                .read_to_string(&mut stdout_buf)
-                .map_err(|e| DevError::Runtime(format!("read stdout: {e}")))?;
-            stderr_read
-                .read_to_string(&mut stderr_buf)
-                .map_err(|e| DevError::Runtime(format!("read stderr: {e}")))?;
-
-            Ok(ExecResult {
-                exit_code: 0,
-                stdout: stdout_buf,
-                stderr: stderr_buf,
-            })
-        })
+        Box::pin(async move { self.exec_impl(&id, &cmd, user.as_deref()).await })
     }
 
-    fn exec_interactive(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, ()> {
+    fn exec_reports_missing_command(&self, error: &DevError) -> bool {
+        is_missing_command_failure(&error.to_string())
+    }
+
+    fn exec_interactive(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, i32> {
         let id = id.to_string();
         let cmd = cmd.to_vec();
         let user = user.map(|u| u.to_string());
-        Box::pin(async move {
-            let _raw_guard = RawModeGuard::enter()?;
-
-            let executable = cmd.first().cloned().unwrap_or_default();
-            let arguments = if cmd.len() > 1 {
-                cmd[1..].to_vec()
-            } else {
-                Vec::new()
-            };
-
-            let process_id = format!("exec-interactive-{}", std::process::id());
-
-            let uid = user
-                .as_deref()
-                .and_then(|u| u.parse::<u32>().ok())
-                .unwrap_or(0);
-
-            let proc_config = ProcessConfiguration {
-                executable,
-                arguments,
-                environment: Vec::new(),
-                working_directory: "/".to_string(),
-                terminal: true,
-                user: User::Id {
-                    id: UserId { uid, gid: uid },
-                },
-                supplemental_groups: vec![],
-                rlimits: vec![],
-            };
-
-            // For interactive mode, pass the real terminal fds directly.
-            let stdin_fd = std::io::stdin().as_raw_fd();
-            let stdout_fd = std::io::stdout().as_raw_fd();
-            let stderr_fd = std::io::stderr().as_raw_fd();
-
-            self.client
-                .create_process(
-                    &id,
-                    &process_id,
-                    &proc_config,
-                    stdin_fd,
-                    stdout_fd,
-                    stderr_fd,
-                )
-                .await
-                .map_err(|e| DevError::Runtime(format!("exec_interactive failed: {e}")))?;
-
-            // _raw_guard is dropped here, restoring the terminal.
-            Ok(())
-        })
+        Box::pin(async move { self.exec_interactive_impl(&id, &cmd, user.as_deref()).await })
     }
 
     fn inspect_container(&self, id: &str) -> BoxFut<'_, ContainerInfo> {
@@ -684,9 +1432,9 @@ impl ContainerRuntime for AppleRuntime {
     fn list_containers(&self, label_filters: &[String]) -> BoxFut<'_, Vec<ContainerInfo>> {
         let label_filters = label_filters.to_vec();
         Box::pin(async move {
-            let snapshots = self
+            let listing = self
                 .client
-                .list()
+                .list_all()
                 .await
                 .map_err(|e| DevError::Runtime(format!("list failed: {e}")))?;
 
@@ -697,15 +1445,8 @@ impl ContainerRuntime for AppleRuntime {
                 .collect();
 
             let mut result = Vec::new();
-            for snap in snapshots {
-                let all_match = parsed_filters.iter().all(|(key, value)| {
-                    snap.configuration
-                        .labels
-                        .get(*key)
-                        .is_some_and(|v| value.is_empty() || v == value)
-                });
-
-                if all_match {
+            for snap in listing.snapshots {
+                if labels_match(&snap.configuration.labels, &parsed_filters) {
                     let state = match snap.status {
                         RuntimeStatus::Running => ContainerState::Running,
                         _ => ContainerState::Stopped,
@@ -720,6 +1461,8 @@ impl ContainerRuntime for AppleRuntime {
                     });
                 }
             }
+
+            report_undecodable_match(&listing.undecodable, &parsed_filters, result.len())?;
 
             Ok(result)
         })
@@ -780,9 +1523,1124 @@ mod tests {
     use super::*;
     // Non-test code refers to these via fully-qualified paths, so they are not in
     // the module-level import that `use super::*` re-exports.
-    use apple_container::models::{DnsInfo, NetworkInfo, NetworkOptions, Platform};
+    use apple_container::models::{
+        DnsInfo, NetworkInfo, NetworkOptions, Platform, UndecodableSnapshot,
+    };
     use std::collections::HashMap;
+    use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use tempfile::TempDir;
+
+    // ---- issue #4 regression coverage: the exec create → start → wait
+    // sequence, driven against a stand-in daemon so it runs in CI ----
+
+    /// The descriptors the daemon keeps once `create_process` has handed them
+    /// over. XPC gives the real daemon its own copies, so the fake dups them
+    /// and the caller's closes are observable exactly as they are in
+    /// production.
+    struct HeldStdio {
+        stdin: OwnedFd,
+        stdout: Option<OwnedFd>,
+        stderr: Option<OwnedFd>,
+    }
+
+    /// Stand-in for the Apple Containers daemon's process API.
+    ///
+    /// It reproduces the daemon behaviour behind issue #4's hang: a wait that
+    /// arrives after the process has exited is silently dropped and never
+    /// answered.
+    #[derive(Default)]
+    struct FakeExecDaemon {
+        calls: Mutex<Vec<&'static str>>,
+        held: Mutex<Option<HeldStdio>>,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        exit_code: i32,
+        /// What `start_process` refuses with, if it refuses at all.
+        start_refusal: Option<&'static str>,
+        created_terminal: AtomicBool,
+        created_stderr: AtomicBool,
+        wait_fails: bool,
+        /// Refuse the wait only once the process is running, so the failure
+        /// lands on the caller's exit wait instead of on its start. The
+        /// process is left running, as it is when a real wait breaks.
+        wait_fails_after_the_start: bool,
+        /// Hold the wait's request back before it reaches the daemon, the way
+        /// a contended blocking pool delays the thread carrying it.
+        delay_wait_request: bool,
+        stdin_reached_eof: AtomicBool,
+        /// Set once `start_process` has run the process.
+        started: AtomicBool,
+        /// Set once `start_process` has run the process to completion.
+        exited: AtomicBool,
+    }
+
+    fn dup_fd(fd: RawFd) -> OwnedFd {
+        let duplicated = unsafe { libc::dup(fd) };
+        assert!(duplicated >= 0, "the fake daemon must be able to dup {fd}");
+        unsafe { OwnedFd::from_raw_fd(duplicated) }
+    }
+
+    fn write_fd(fd: &OwnedFd, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        let written = unsafe { libc::write(fd.as_raw_fd(), data.as_ptr().cast(), data.len()) };
+        assert_eq!(written, data.len() as isize, "fake daemon stdio write");
+    }
+
+    /// Whether every write end of a pipe has been closed.
+    ///
+    /// Nothing ever writes to an exec's stdin, so a process that does not see
+    /// EOF here is a process that blocks forever.
+    fn pipe_is_at_eof(fd: RawFd) -> bool {
+        let mut watch = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut watch, 1, 2_000) } <= 0 {
+            return false;
+        }
+        let mut byte = 0u8;
+        unsafe { libc::read(fd, std::ptr::addr_of_mut!(byte).cast(), 1) == 0 }
+    }
+
+    /// A pipe to hand the daemon in place of a terminal, as `(read, write)`.
+    ///
+    /// The live smoke needs something it can read back what the pty relayed,
+    /// which `/dev/null` is not.
+    #[cfg(target_os = "macos")]
+    fn terminal_pipe() -> (OwnedFd, OwnedFd) {
+        let mut ends = [0 as RawFd; 2];
+        assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0, "pipe");
+        unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) }
+    }
+
+    /// Read from `fd` until `wanted` shows up or the budget runs out.
+    ///
+    /// Bounded on both ends: the daemon keeps its own copy of the write end, so
+    /// waiting for EOF could park forever, and a relay that never happens has
+    /// to fail the assertion rather than hang the smoke.
+    #[cfg(target_os = "macos")]
+    fn read_until(fd: &OwnedFd, wanted: &str, budget: std::time::Duration) -> String {
+        let deadline = std::time::Instant::now() + budget;
+        let mut seen = Vec::new();
+        while std::time::Instant::now() < deadline {
+            let mut watch = libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            match unsafe { libc::poll(&mut watch, 1, 250) } {
+                0 => continue,
+                ready if ready < 0 => break,
+                _ => {}
+            }
+            let mut buf = [0u8; 1024];
+            let read = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            if read <= 0 {
+                break;
+            }
+            seen.extend_from_slice(&buf[..read as usize]);
+            if String::from_utf8_lossy(&seen).contains(wanted) {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&seen).into_owned()
+    }
+
+    impl FakeExecDaemon {
+        fn producing(stdout: &str, stderr: &str, exit_code: i32) -> Self {
+            Self {
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: stderr.as_bytes().to_vec(),
+                exit_code,
+                ..Self::default()
+            }
+        }
+
+        fn failing_start() -> Self {
+            Self::refusing_the_start_with("start refused")
+        }
+
+        fn refusing_the_start_with(reason: &'static str) -> Self {
+            Self {
+                start_refusal: Some(reason),
+                ..Self::default()
+            }
+        }
+
+        fn failing_wait() -> Self {
+            Self {
+                wait_fails: true,
+                ..Self::default()
+            }
+        }
+
+        /// Runs the process, then refuses its exit wait while it is still
+        /// going — so nothing has closed the process's output pipes.
+        fn failing_wait_on_a_running_process() -> Self {
+            Self {
+                wait_fails_after_the_start: true,
+                ..Self::default()
+            }
+        }
+
+        /// Produces output and exits, but its wait request is slow to reach
+        /// the daemon.
+        fn with_a_slow_wait_request(stdout: &str, exit_code: i32) -> Self {
+            Self {
+                delay_wait_request: true,
+                ..Self::producing(stdout, "", exit_code)
+            }
+        }
+
+        fn record(&self, call: &'static str) {
+            self.calls.lock().unwrap().push(call);
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        /// Close the daemon's copies of the output pipes, as a process exiting
+        /// does.
+        fn close_output(&self) {
+            if let Some(held) = self.held.lock().unwrap().as_mut() {
+                held.stdout.take();
+                held.stderr.take();
+            }
+        }
+
+        /// Whether the caller still has the output pipes open.
+        ///
+        /// A write to a pipe whose read end is gone fails with `EPIPE` — Rust
+        /// ignores `SIGPIPE`, so it is an error and not a signal — which is
+        /// how the daemon's side of a released reader is visible from here.
+        fn output_readers_attached(&self) -> bool {
+            let held = self.held.lock().unwrap();
+            let held = held.as_ref().expect("probe without create");
+            [held.stdout.as_ref(), held.stderr.as_ref()]
+                .into_iter()
+                .flatten()
+                .any(|end| {
+                    let byte = 0u8;
+                    let written =
+                        unsafe { libc::write(end.as_raw_fd(), std::ptr::addr_of!(byte).cast(), 1) };
+                    written == 1
+                })
+        }
+    }
+
+    impl ExecDaemon for FakeExecDaemon {
+        fn create_process<'a>(
+            &'a self,
+            _container_id: &'a str,
+            _process_id: &'a str,
+            config: &'a ProcessConfiguration,
+            stdin: RawFd,
+            stdout: RawFd,
+            stderr: Option<RawFd>,
+        ) -> DaemonFut<'a, ()> {
+            self.record("create");
+            self.created_terminal
+                .store(config.terminal, Ordering::SeqCst);
+            self.created_stderr
+                .store(stderr.is_some(), Ordering::SeqCst);
+            *self.held.lock().unwrap() = Some(HeldStdio {
+                stdin: dup_fd(stdin),
+                stdout: Some(dup_fd(stdout)),
+                stderr: stderr.map(dup_fd),
+            });
+            Box::pin(async { Ok(()) })
+        }
+
+        /// Each request reaches the daemon when its future is polled, not when
+        /// it is built, so the recorded call order is the order the daemon
+        /// sees — which is the whole point of registering the wait first.
+        fn start_process<'a>(
+            &'a self,
+            _container_id: &'a str,
+            _process_id: &'a str,
+        ) -> DaemonFut<'a, ()> {
+            Box::pin(async move {
+                self.record("start");
+                if let Some(reason) = self.start_refusal {
+                    return Err(AppleContainerError::XpcError(reason.to_string()));
+                }
+                {
+                    let held = self.held.lock().unwrap();
+                    let held = held.as_ref().expect("start without create");
+                    if let Some(stdout) = held.stdout.as_ref() {
+                        write_fd(stdout, &self.stdout);
+                    }
+                    if let Some(stderr) = held.stderr.as_ref() {
+                        write_fd(stderr, &self.stderr);
+                    }
+                }
+                self.started.store(true, Ordering::SeqCst);
+                if self.wait_fails_after_the_start {
+                    // Still running: its pipes stay open, as they do for any
+                    // process that has not exited yet.
+                    return Ok(());
+                }
+                // The command runs to completion and exits, closing its pipes.
+                self.exited.store(true, Ordering::SeqCst);
+                self.close_output();
+                Ok(())
+            })
+        }
+
+        /// The signal fires where the real client's does: from inside the
+        /// request, before it could be answered. A start that goes out ahead of
+        /// it is a start the daemon can record an exit for before the wait
+        /// lands — the ordering the real daemon drops on the floor.
+        fn wait_process<'a>(
+            &'a self,
+            _container_id: &'a str,
+            _process_id: &'a str,
+            issued: tokio::sync::oneshot::Sender<()>,
+        ) -> DaemonFut<'a, i32> {
+            Box::pin(async move {
+                if self.delay_wait_request {
+                    // Whatever else is runnable gets to go first, exactly as a
+                    // contended blocking pool would let it.
+                    for _ in 0..64 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                // Recorded where the daemon would see it, which is also where
+                // the caller is told the request is on its way.
+                self.record("wait");
+                let _ = issued.send(());
+                let at_eof = {
+                    let held = self.held.lock().unwrap();
+                    let held = held.as_ref().expect("wait without create");
+                    pipe_is_at_eof(held.stdin.as_raw_fd())
+                };
+                self.stdin_reached_eof.store(at_eof, Ordering::Relaxed);
+                if self.wait_fails {
+                    return Err(AppleContainerError::XpcError("wait refused".to_string()));
+                }
+                if self.wait_fails_after_the_start {
+                    // Answered only once the process is running, so the
+                    // caller is past its start step when this fails.
+                    return std::future::poll_fn(move |_| {
+                        if self.started.load(Ordering::SeqCst) {
+                            std::task::Poll::Ready(Err(AppleContainerError::XpcError(
+                                "wait refused".to_string(),
+                            )))
+                        } else {
+                            std::task::Poll::Pending
+                        }
+                    })
+                    .await;
+                }
+                if self.exited.load(Ordering::SeqCst) {
+                    // The exit is already recorded, so this is a wait the
+                    // daemon drops: it is never answered.
+                    std::future::pending::<()>().await;
+                }
+                let exit_code = self.exit_code;
+                // Answered once the process the caller starts behind it exits.
+                std::future::poll_fn(move |_| {
+                    if self.exited.load(Ordering::SeqCst) {
+                        std::task::Poll::Ready(Ok(exit_code))
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                })
+                .await
+            })
+        }
+
+        fn kill_process<'a>(
+            &'a self,
+            _container_id: &'a str,
+            _process_id: &'a str,
+            _signal: i32,
+        ) -> DaemonFut<'a, ()> {
+            self.record("kill");
+            // Deliberately closes nothing. Only a process closes its own
+            // pipes, by exiting; the daemon holds the copies it dup'd in
+            // `create_process` whether or not the kill reaches anything, and
+            // for a process it refused to start there is nothing to kill at
+            // all. A caller that waits for EOF here waits forever.
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn exec_config() -> ProcessConfiguration {
+        exec_process_config(
+            &["echo".to_string(), "hello".to_string()],
+            None,
+            false,
+            &ProcessDefaults {
+                working_directory: "/tmp".to_string(),
+                environment: Vec::new(),
+            },
+        )
+    }
+
+    /// Run one captured exec, turning a hang into a failure.
+    ///
+    /// The stand-in daemon drops a late wait exactly as the real one does, so
+    /// a regression that goes back to waiting after the start never finishes.
+    /// The bound is generous: it only has to be shorter than the harness's
+    /// patience, never shorter than a slow machine's exec.
+    async fn bounded_exec(daemon: &FakeExecDaemon) -> Result<ExecResult, DevError> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_captured_process(daemon, "cid", &exec_config()),
+        )
+        .await
+        .expect("exec must report the process's exit instead of hanging")
+    }
+
+    /// The reported break: `create_process` registers a process but never runs
+    /// it, so nothing writes to the output pipes and `dev exec` hangs. A
+    /// create-only implementation fails here on the missing `start`.
+    #[tokio::test]
+    async fn exec_creates_then_starts_then_waits_for_the_process() {
+        let daemon = FakeExecDaemon::producing("hello\n", "", 0);
+        let result = bounded_exec(&daemon)
+            .await
+            .expect("a cooperating daemon must produce a result");
+
+        assert_eq!(
+            daemon.calls(),
+            vec!["create", "wait", "start"],
+            "a created process must also be started, with its exit wait already registered"
+        );
+        assert_eq!(result.stdout, "hello\n");
+        assert_eq!(result.exit_code, 0);
+    }
+
+    /// The daemon never answers a `containerWait` that arrives after it has
+    /// recorded the process's exit, and a short command exits before a wait
+    /// sent after the start can land — that is the `dev up` lifecycle-hook and
+    /// `dev exec` hang in issue #4. Registering the wait first is what makes a
+    /// command that exits immediately still report its exit.
+    #[tokio::test]
+    async fn exec_registers_its_exit_wait_before_the_process_can_exit() {
+        let daemon = FakeExecDaemon::producing("hello\n", "", 0);
+        let result = bounded_exec(&daemon).await.expect("exec");
+
+        assert_eq!(
+            daemon.calls().iter().position(|c| *c == "wait"),
+            Some(1),
+            "the exit wait must be sent between the create and the start, got: {:?}",
+            daemon.calls()
+        );
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "hello\n");
+    }
+
+    /// Registering the wait means getting its *request* to the daemon first,
+    /// not merely polling its future. Every request is a synchronous XPC send
+    /// queued onto the blocking pool, so polling only queues it — under pool
+    /// contention the start's thread can still issue first, the daemon records
+    /// the exit before the wait lands, and the wait is dropped: the issue #4
+    /// hang, back again. The start must wait for the wait to actually go out.
+    #[tokio::test]
+    async fn exec_holds_the_start_until_the_wait_request_has_gone_out() {
+        let daemon = FakeExecDaemon::with_a_slow_wait_request("hello\n", 0);
+        let result = bounded_exec(&daemon)
+            .await
+            .expect("a start must not overtake the wait it is registered behind");
+
+        assert_eq!(
+            daemon.calls(),
+            vec!["create", "wait", "start"],
+            "the daemon must see the wait before the start, got: {:?}",
+            daemon.calls()
+        );
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "hello\n");
+    }
+
+    /// The exit code was hardcoded to 0, so every failing lifecycle hook and
+    /// every `dev exec` failure looked like success.
+    #[tokio::test]
+    async fn exec_reports_the_processes_real_exit_code_and_stderr() {
+        let daemon = FakeExecDaemon::producing("", "oops\n", 7);
+        let result = bounded_exec(&daemon)
+            .await
+            .expect("a cooperating daemon must produce a result");
+
+        assert_eq!(result.exit_code, 7, "the real exit code must survive");
+        assert_eq!(result.stderr, "oops\n");
+        assert!(result.stdout.is_empty());
+    }
+
+    /// Nothing writes to an exec's stdin, so both of the caller's ends must be
+    /// closed before the process runs — otherwise a command that reads stdin
+    /// (`cat`, an `apt-get` prompt) blocks until the container dies.
+    #[tokio::test]
+    async fn exec_closes_stdin_so_the_process_sees_eof() {
+        let daemon = FakeExecDaemon::producing("", "", 0);
+        bounded_exec(&daemon).await.expect("exec");
+
+        assert!(
+            daemon.stdin_reached_eof.load(Ordering::Relaxed),
+            "the process must see EOF on stdin while it is still running"
+        );
+    }
+
+    /// A failed wait leaves a process running whose pipes the output readers
+    /// are still blocked on, so it has to be killed rather than waited out.
+    #[tokio::test]
+    async fn exec_kills_the_process_when_waiting_fails() {
+        let daemon = FakeExecDaemon::failing_wait();
+        let err = bounded_exec(&daemon)
+            .await
+            .expect_err("a failed wait must surface as an error");
+
+        assert!(
+            format!("{err}").contains("exec wait failed"),
+            "the error must name the failed step, got: {err}"
+        );
+        assert!(
+            daemon.calls().contains(&"kill"),
+            "a failed wait must stop the process, got: {:?}",
+            daemon.calls()
+        );
+    }
+
+    /// A start failure must not be reported as a successful command, and it
+    /// leaves an exit wait already registered with the daemon: the process has
+    /// to be torn down so that wait is answered rather than outstanding
+    /// forever.
+    #[tokio::test]
+    async fn exec_surfaces_a_start_failure_and_stops_the_process() {
+        let daemon = FakeExecDaemon::failing_start();
+        let err = bounded_exec(&daemon)
+            .await
+            .expect_err("a failed start must surface as an error");
+
+        assert!(
+            format!("{err}").contains("exec start failed"),
+            "the error must name the failed step, got: {err}"
+        );
+        assert!(
+            daemon.calls().contains(&"kill"),
+            "a failed start must stop the process, got: {:?}",
+            daemon.calls()
+        );
+    }
+
+    /// What a released reader looks like from the daemon's side, with the
+    /// pipes closed afterwards so a regression fails this test instead of
+    /// wedging the whole suite on a reader still parked on them.
+    fn readers_released(daemon: &FakeExecDaemon) -> bool {
+        let attached = daemon.output_readers_attached();
+        daemon.close_output();
+        !attached
+    }
+
+    /// A daemon that refuses the start never runs the process, so nothing ever
+    /// closes the output pipes it dup'd: there is no process to exit, and a
+    /// kill closes nothing. Readers left on those pipes outlive the failed
+    /// command, and the tokio runtime waits for them as it shuts down — so
+    /// `dev exec -- /nonexistent-binary` printed nothing and never exited, and
+    /// `dev up`'s readiness diagnosis never reached the user.
+    #[tokio::test]
+    async fn a_refused_start_releases_the_output_readers() {
+        let daemon = FakeExecDaemon::failing_start();
+
+        let err = bounded_exec(&daemon)
+            .await
+            .expect_err("a failed start must surface as an error");
+
+        assert!(
+            format!("{err}").contains("exec start failed"),
+            "the real error must propagate, got: {err}"
+        );
+        assert!(
+            readers_released(&daemon),
+            "a refused start must release its output readers, not leave them \
+             on pipes the daemon still holds the write ends of"
+        );
+    }
+
+    /// The same for the other failure path: the process is running, its exit
+    /// wait breaks, and the kill that follows is no guarantee the daemon
+    /// closes anything. The readers have to be given up on either way.
+    #[tokio::test]
+    async fn a_refused_wait_releases_the_output_readers() {
+        let daemon = FakeExecDaemon::failing_wait_on_a_running_process();
+
+        let err = bounded_exec(&daemon)
+            .await
+            .expect_err("a failed wait must surface as an error");
+
+        assert!(
+            format!("{err}").contains("exec wait failed"),
+            "the real error must propagate, got: {err}"
+        );
+        assert!(
+            daemon.calls().contains(&"start"),
+            "this must fail on the exit wait of a started process, got: {:?}",
+            daemon.calls()
+        );
+        assert!(
+            readers_released(&daemon),
+            "a failed wait must release its output readers, not leave them on \
+             the pipes of a process nothing has closed"
+        );
+    }
+
+    /// A daemon whose stop fails until its stale process records are gone.
+    ///
+    /// Models what one refused exec leaves behind: `containerCreateProcess`
+    /// registered a process the guest never accepted, so the stop handler's
+    /// delete of it fails with `invalidState` — and the failed stop is what
+    /// discards the record, so the next attempt gets through.
+    struct FakeStopDaemon {
+        refusals_left: std::sync::Mutex<usize>,
+        attempts: AtomicUsize,
+    }
+
+    impl FakeStopDaemon {
+        fn refusing(refusals: usize) -> Self {
+            Self {
+                refusals_left: std::sync::Mutex::new(refusals),
+                attempts: AtomicUsize::new(0),
+            }
+        }
+
+        fn attempts(&self) -> usize {
+            self.attempts.load(Ordering::SeqCst)
+        }
+    }
+
+    impl StopDaemon for FakeStopDaemon {
+        fn stop<'a>(&'a self, _container_id: &'a str) -> DaemonFut<'a, ()> {
+            Box::pin(async move {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                let mut left = self.refusals_left.lock().unwrap();
+                if *left == 0 {
+                    return Ok(());
+                }
+                *left -= 1;
+                Err(AppleContainerError::XpcError(
+                    "failed to delete process (cause: deleteProcess: invalidState: \
+                     'exec exec-4040-9 does not exist in container')"
+                        .to_string(),
+                ))
+            })
+        }
+    }
+
+    /// One refused `dev exec` — or one refused readiness probe — leaves a
+    /// process record the daemon's stop handler then chokes on, so `dev down
+    /// --remove` reported the container as still running and refused to remove
+    /// it. The failed stop clears the record, so the stop behind it must be
+    /// made rather than the failure reported.
+    #[tokio::test]
+    async fn a_stop_refused_over_a_stale_process_record_is_retried() {
+        let daemon = FakeStopDaemon::refusing(1);
+
+        stop_past_stale_process_records(&daemon, "vsc-workspace")
+            .await
+            .expect("the stop behind the one that cleared the record must be made");
+
+        assert_eq!(
+            daemon.attempts(),
+            2,
+            "the refusal must be retried exactly once"
+        );
+    }
+
+    /// The retry is not a way to swallow a stop that genuinely cannot happen:
+    /// a daemon refusing both attempts still fails, and both refusals are
+    /// reported so the real cause is not replaced by the retry's.
+    #[tokio::test]
+    async fn a_stop_refused_twice_reports_both_refusals() {
+        let daemon = FakeStopDaemon::refusing(2);
+
+        let err = stop_past_stale_process_records(&daemon, "vsc-workspace")
+            .await
+            .expect_err("a stop that never succeeds must surface as an error");
+
+        assert_eq!(daemon.attempts(), 2, "the retry must be bounded to one");
+        assert!(
+            format!("{err}").contains("an earlier attempt failed with"),
+            "the first refusal must survive as context, got: {err}"
+        );
+    }
+
+    /// A stop the daemon accepts costs nothing extra — the retry is only for
+    /// the refusal.
+    #[tokio::test]
+    async fn an_accepted_stop_is_made_once() {
+        let daemon = FakeStopDaemon::refusing(0);
+
+        stop_past_stale_process_records(&daemon, "vsc-workspace")
+            .await
+            .expect("an accepted stop must succeed");
+
+        assert_eq!(
+            daemon.attempts(),
+            1,
+            "a stop that worked must not be redone"
+        );
+    }
+
+    // ---- issue #4 regression coverage: an undecodable containerList entry
+    // must not read as "this workspace has no container" ----
+
+    fn undecodable(id: &str, local_folder: &str) -> UndecodableSnapshot {
+        UndecodableSnapshot {
+            id: id.to_string(),
+            labels: HashMap::from([(
+                "devcontainer.local_folder".to_string(),
+                local_folder.to_string(),
+            )]),
+            error: "missing field `status`".to_string(),
+        }
+    }
+
+    /// An entry the models cannot read that carries *this* workspace's labels,
+    /// with no readable container to fall back on, must fail the query.
+    /// Silently dropping it makes `dev up` see an empty list and create a
+    /// duplicate the daemon then rejects with an error that says nothing about
+    /// the real cause.
+    #[test]
+    fn a_query_that_matches_only_an_undecodable_entry_fails_with_the_decode_cause() {
+        let entries = vec![undecodable("vsc-mine", "/w/mine")];
+        let filters = [("devcontainer.local_folder", "/w/mine")];
+
+        let err = report_undecodable_match(&entries, &filters, 0)
+            .expect_err("the workspace's own unreadable container must be reported");
+        let message = format!("{err}");
+        assert!(message.contains("vsc-mine"), "{message}");
+        assert!(message.contains("missing field `status`"), "{message}");
+    }
+
+    /// The hard error exists only to stop `dev up` creating a duplicate it
+    /// cannot see. Once the query *did* find a readable container for these
+    /// labels, every command has what it came for — failing anyway would deny
+    /// `dev status`/`exec`/`shell` a container they can reach and leave
+    /// `dev down` unable to clean up.
+    #[test]
+    fn a_readable_match_keeps_the_query_working_despite_an_undecodable_sibling() {
+        let entries = vec![undecodable("vsc-mine-stale", "/w/mine")];
+        let filters = [("devcontainer.local_folder", "/w/mine")];
+
+        assert!(
+            report_undecodable_match(&entries, &filters, 1).is_ok(),
+            "a reachable container must not be hidden by an unreadable sibling"
+        );
+    }
+
+    /// The tolerance that made the fix work stays: another workspace's
+    /// unreadable container must not break this workspace's discovery.
+    #[test]
+    fn an_unrelated_undecodable_entry_does_not_fail_the_query() {
+        let entries = vec![undecodable("vsc-theirs", "/w/theirs")];
+        assert!(
+            report_undecodable_match(&entries, &[("devcontainer.local_folder", "/w/mine")], 0)
+                .is_ok()
+        );
+        // Nor may an entry whose labels are unreadable too be blamed on a
+        // workspace that never owned it.
+        let bare = vec![UndecodableSnapshot {
+            id: "<unknown>".to_string(),
+            labels: HashMap::new(),
+            error: "unreadable".to_string(),
+        }];
+        assert!(
+            report_undecodable_match(&bare, &[("devcontainer.local_folder", "/w/mine")], 0).is_ok()
+        );
+    }
+
+    /// An unfiltered listing asks about every container rather than a specific
+    /// one, so it keeps reporting the containers it *can* read.
+    #[test]
+    fn an_unfiltered_listing_still_tolerates_undecodable_entries() {
+        let entries = vec![undecodable("vsc-mine", "/w/mine")];
+        assert!(report_undecodable_match(&entries, &[], 0).is_ok());
+    }
+
+    /// `remoteUser` is normally a name, and a name must not silently become
+    /// root: `dev exec --user vscode` and every lifecycle hook would otherwise
+    /// run as uid 0 on this runtime but as the named user on docker/podman.
+    #[test]
+    fn named_user_maps_to_raw_user_string() {
+        match to_apple_user(Some("vscode")) {
+            User::Raw { raw } => assert_eq!(raw.user_string, "vscode"),
+            other => panic!("named user must map to User::Raw, got {other:?}"),
+        }
+        match to_apple_user(Some("node:node")) {
+            User::Raw { raw } => assert_eq!(raw.user_string, "node:node"),
+            other => panic!("named user:group must map to User::Raw, got {other:?}"),
+        }
+    }
+
+    /// Numeric specs still take the id path, including the `uid:gid` form.
+    #[test]
+    fn numeric_user_maps_to_ids() {
+        match to_apple_user(Some("1000")) {
+            User::Id { id } => assert_eq!((id.uid, id.gid), (1000, 1000)),
+            other => panic!("numeric user must map to User::Id, got {other:?}"),
+        }
+        match to_apple_user(Some("1000:2000")) {
+            User::Id { id } => assert_eq!((id.uid, id.gid), (1000, 2000)),
+            other => panic!("numeric uid:gid must map to User::Id, got {other:?}"),
+        }
+    }
+
+    /// No user (and no meaningful user) means root, as before.
+    #[test]
+    fn missing_user_defaults_to_root_ids() {
+        for spec in [None, Some(""), Some("   ")] {
+            match to_apple_user(spec) {
+                User::Id { id } => assert_eq!((id.uid, id.gid), (0, 0)),
+                other => panic!("{spec:?} must default to uid/gid 0, got {other:?}"),
+            }
+        }
+    }
+
+    /// Only the start step can mean "the image has no such executable": by
+    /// then the daemon has accepted the process configuration and is trying to
+    /// execute it. A create failure, a wait failure and every XPC transport
+    /// error are the runtime failing to run anything at all — and the readiness
+    /// gate lets a missing command through, so misreading one of those as a
+    /// missing shell would announce readiness for a container `dev exec` cannot
+    /// use, which is the whole of issue #4.
+    #[test]
+    fn only_a_start_step_not_found_reads_as_a_missing_command() {
+        let blamed = start_failure(
+            "exec",
+            "sh",
+            "internalError: No such file or directory for sh",
+        );
+        assert!(is_missing_command_failure(&blamed), "{blamed}");
+
+        // The same verdict on a step that never got as far as the executable.
+        assert!(!is_missing_command_failure(&format!(
+            "exec failed: {NO_SUCH_EXECUTABLE}"
+        )));
+        assert!(!is_missing_command_failure(&format!(
+            "exec wait failed: {NO_SUCH_EXECUTABLE}"
+        )));
+        // A start that failed for a reason of the runtime's own.
+        assert!(!is_missing_command_failure(
+            "exec start failed: XPC send returned null"
+        ));
+        assert!(!is_missing_command_failure("exec start failed"));
+        assert!(!is_missing_command_failure("no such file or directory"));
+    }
+
+    /// The `strerror` text alone attributes nothing: the start step chdirs into
+    /// the working directory and mounts a rootfs under it, and each of those
+    /// fails with the same `ENOENT` wording. Only the path the daemon named
+    /// says whose fault it was — so a workspace folder that is not there, or a
+    /// mount that did not attach, has to stay fatal to readiness.
+    #[test]
+    fn only_an_enoent_naming_the_executable_blames_the_image() {
+        assert!(blames_the_executable(
+            "sh",
+            "internalError: exec /bin/sh: no such file or directory"
+        ));
+        assert!(blames_the_executable(
+            "/bin/sh",
+            "internalError: \"/bin/sh\": No such file or directory"
+        ));
+        assert!(blames_the_executable(
+            "sh",
+            "exec: \"sh\": executable file not found in $PATH"
+        ));
+
+        // The working directory this branch now sets on every exec.
+        assert!(!blames_the_executable(
+            "sh",
+            "internalError: chdir /workspaces/api: no such file or directory"
+        ));
+        // A path that merely contains the executable's name is not it.
+        assert!(!blames_the_executable(
+            "sh",
+            "internalError: chdir /usr/share/app: no such file or directory"
+        ));
+        // The guest's own failures, reported with the same words.
+        assert!(!blames_the_executable(
+            "sh",
+            "internalError: mount /dev/vdb: no such file or directory"
+        ));
+        assert!(!blames_the_executable("sh", "internalError: invalidState"));
+        assert!(!blames_the_executable(
+            "",
+            "internalError: no such file or directory"
+        ));
+    }
+
+    /// End to end: a daemon that refuses the start naming the executable is
+    /// tolerable to the readiness gate, and one that refuses it naming the
+    /// working directory is not — even though both carry the same `ENOENT`
+    /// wording.
+    #[tokio::test]
+    async fn an_enoent_about_the_working_directory_stays_fatal_to_readiness() {
+        let blamed = FakeExecDaemon::refusing_the_start_with(
+            "internalError: exec /bin/echo: no such file or directory",
+        );
+        let message = bounded_exec(&blamed)
+            .await
+            .expect_err("a refused start must surface as an error")
+            .to_string();
+        assert!(
+            is_missing_command_failure(&message),
+            "an ENOENT naming the executable is the image's business: {message}"
+        );
+
+        let elsewhere = FakeExecDaemon::refusing_the_start_with(
+            "internalError: chdir /workspaces/api: no such file or directory",
+        );
+        let message = bounded_exec(&elsewhere)
+            .await
+            .expect_err("a refused start must surface as an error")
+            .to_string();
+        assert!(
+            !is_missing_command_failure(&message),
+            "an ENOENT this client cannot attribute to the command must stay fatal: {message}"
+        );
+    }
+
+    /// The wording the classifier reads back is the wording the exec path
+    /// actually produces, so the two cannot drift apart unnoticed.
+    #[tokio::test]
+    async fn a_failed_start_is_worded_the_way_the_classifier_reads_it() {
+        let daemon = FakeExecDaemon::failing_start();
+        let err = bounded_exec(&daemon)
+            .await
+            .expect_err("a failed start must surface as an error");
+
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("exec {START_FAILED}: ")),
+            "the classifier keys off this wording, got: {message}"
+        );
+        assert!(
+            !is_missing_command_failure(&message),
+            "a start refused for the runtime's own reason must stay fatal: {message}"
+        );
+    }
+
+    /// The daemon keys processes by identifier within a container, and `dev up`
+    /// execs lifecycle hooks concurrently — so two execs from one CLI run must
+    /// never share an identifier.
+    #[test]
+    fn exec_process_ids_are_unique_per_call() {
+        let ids: Vec<String> = (0..64).map(|_| next_process_id("exec")).collect();
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "exec process ids must be unique");
+        assert!(ids.iter().all(|id| id.starts_with("exec-")));
+    }
+
+    /// The command's first word is the executable and the rest are arguments;
+    /// an empty command must not panic.
+    #[test]
+    fn exec_process_config_splits_command() {
+        let config = exec_process_config(
+            &["sh".to_string(), "-c".to_string(), "echo hi".to_string()],
+            None,
+            false,
+            &defaults_in("/workspaces/demo"),
+        );
+        assert_eq!(config.executable, "sh");
+        assert_eq!(config.arguments, vec!["-c", "echo hi"]);
+        assert!(!config.terminal);
+        assert_eq!(config.working_directory, "/workspaces/demo");
+
+        let empty = exec_process_config(&[], None, true, &defaults_in("/"));
+        assert_eq!(empty.executable, "");
+        assert!(empty.arguments.is_empty());
+        assert!(empty.terminal);
+    }
+
+    fn defaults_in(working_directory: &str) -> ProcessDefaults {
+        ProcessDefaults {
+            working_directory: working_directory.to_string(),
+            environment: Vec::new(),
+        }
+    }
+
+    /// Apple's daemon gives an exec nothing the container has: with an empty
+    /// environ there is no `PATH`, so `postCreateCommand: "npm install"` fails
+    /// with command-not-found where docker — which inherits the container's
+    /// environment — succeeds. Whatever the image and the devcontainer features
+    /// put on `PATH` has to reach every exec.
+    #[test]
+    fn an_exec_inherits_the_containers_environment() {
+        let defaults = ProcessDefaults {
+            working_directory: "/workspaces/demo".to_string(),
+            environment: vec![
+                "PATH=/usr/local/share/nvm/versions/node/v22/bin:/usr/bin".to_string(),
+                "NODE_VERSION=22".to_string(),
+            ],
+        };
+
+        let config = exec_process_config(&["npm".to_string()], None, false, &defaults);
+
+        assert_eq!(
+            config.environment, defaults.environment,
+            "an exec must run with the container's own environment"
+        );
+    }
+
+    /// The environment a container is created with is what its execs inherit,
+    /// so the image's env and the config's env must both survive into it.
+    #[test]
+    fn the_created_containers_environment_is_what_execs_inherit() {
+        let mut container_config = minimal_container_config();
+        container_config
+            .env
+            .insert("DEV_MODE".to_string(), "1".to_string());
+
+        let apple_config = to_apple_config(
+            &container_config,
+            ImageDescription::default(),
+            &CachedImageConfig {
+                env: vec!["PATH=/usr/local/bin:/usr/bin".to_string()],
+                ..CachedImageConfig::default()
+            },
+        );
+
+        let defaults = ProcessDefaults {
+            working_directory: apple_config.init_process.working_directory.clone(),
+            environment: apple_config.init_process.environment.clone(),
+        };
+        let exec = exec_process_config(&["sh".to_string()], None, false, &defaults);
+
+        assert!(
+            exec.environment
+                .contains(&"PATH=/usr/local/bin:/usr/bin".to_string()),
+            "the image's PATH must reach an exec, got: {:?}",
+            exec.environment
+        );
+        assert!(exec.environment.contains(&"DEV_MODE=1".to_string()));
+    }
+
+    /// An exec must start in the container's own working directory, the way
+    /// `docker exec` inherits the container's `WorkingDir`. Running everything
+    /// from `/` breaks relative-path lifecycle hooks such as
+    /// `postCreateCommand: npm install`.
+    #[test]
+    fn exec_working_directory_is_not_forced_to_root() {
+        let config = exec_process_config(
+            &["npm".to_string(), "install".to_string()],
+            None,
+            false,
+            &defaults_in("/workspaces/project"),
+        );
+        assert_eq!(
+            config.working_directory, "/workspaces/project",
+            "exec must run in the container's working directory"
+        );
+    }
+
+    /// The daemon chdirs into whatever string it is handed, so an unusable
+    /// value has to become `/` rather than fail the process.
+    #[test]
+    fn unusable_working_directories_fall_back_to_root() {
+        for spec in ["", "relative/path"] {
+            let config = exec_process_config(&["sh".to_string()], None, false, &defaults_in(spec));
+            assert_eq!(
+                config.working_directory, "/",
+                "{spec:?} must fall back to /"
+            );
+        }
+    }
+
+    /// The resolved `workspaceFolder` is where a devcontainer's commands
+    /// belong, so it wins over both the mount root and the image's
+    /// `WorkingDir`; each of those is in turn the fallback for a container that
+    /// has no folder, and no workspace at all.
+    #[test]
+    fn container_working_directory_prefers_the_workspace_folder() {
+        let mount = WorkspaceMount {
+            source: std::path::PathBuf::from("/host/monorepo"),
+            target: "/srv/app".to_string(),
+        };
+
+        assert_eq!(
+            container_working_directory(
+                Some("/srv/app/packages/api"),
+                Some(&mount),
+                Some("/usr/src/app")
+            ),
+            "/srv/app/packages/api",
+            "a workspaceFolder subdirectory must win over the mount root"
+        );
+        assert_eq!(
+            container_working_directory(None, Some(&mount), Some("/usr/src/app")),
+            "/srv/app"
+        );
+        assert_eq!(
+            container_working_directory(None, None, Some("/usr/src/app")),
+            "/usr/src/app"
+        );
+        assert_eq!(container_working_directory(None, None, None), "/");
+        assert_eq!(container_working_directory(Some(""), None, Some("")), "/");
+        assert_eq!(
+            container_working_directory(Some("packages/api"), None, None),
+            "/"
+        );
+    }
+
+    /// The container config `dev up` produces for a monorepo must start its
+    /// processes in the configured project directory, which is what every exec
+    /// then inherits.
+    #[test]
+    fn to_apple_config_runs_in_the_resolved_workspace_folder() {
+        let mut container_config = minimal_container_config();
+        container_config.workspace_mount = Some(WorkspaceMount {
+            source: std::path::PathBuf::from("/host/monorepo"),
+            target: "/srv/app".to_string(),
+        });
+        container_config.workspace_folder = Some("/srv/app/packages/api".to_string());
+
+        let apple_config = to_apple_config(
+            &container_config,
+            ImageDescription::default(),
+            &CachedImageConfig {
+                working_dir: Some("/usr/src/app".to_string()),
+                ..CachedImageConfig::default()
+            },
+        );
+
+        assert_eq!(
+            apple_config.init_process.working_directory,
+            "/srv/app/packages/api"
+        );
+        assert_eq!(
+            apple_config.mounts.last().map(|m| m.destination.as_str()),
+            Some("/srv/app"),
+            "the source tree is still mounted at the mount target"
+        );
+    }
+
+    fn minimal_container_config() -> ContainerConfig {
+        ContainerConfig {
+            image: "docker.io/library/alpine:latest".to_string(),
+            name: "vsc-test".to_string(),
+            labels: HashMap::new(),
+            env: HashMap::new(),
+            mounts: vec![],
+            volumes: vec![],
+            ports: vec![],
+            workspace_mount: None,
+            workspace_folder: None,
+            extra_args: vec![],
+            entrypoint: None,
+            init: false,
+            privileged: false,
+            cap_add: vec![],
+            security_opt: vec![],
+        }
+    }
 
     /// A name at or under the limit must pass through untouched.
     #[test]
@@ -803,6 +2661,39 @@ mod tests {
         assert_eq!(id.len(), MAX_CONTAINER_ID_LEN);
     }
 
+    /// A locally built image has no registry to ask, so its environment and
+    /// working directory can only come from the config blob on disk. Losing
+    /// them silently drops whatever the devcontainer features put on `PATH`.
+    #[test]
+    fn image_config_is_read_from_an_oci_config_document() {
+        let document = serde_json::json!({
+            "config": {
+                "Env": ["PATH=/usr/local/bin:/usr/bin", "NODE_VERSION=22"],
+                "User": "node",
+                "WorkingDir": "/workspaces"
+            }
+        });
+
+        let config = CachedImageConfig::from_oci_config(&document);
+        assert_eq!(
+            config.env,
+            vec![
+                "PATH=/usr/local/bin:/usr/bin".to_string(),
+                "NODE_VERSION=22".to_string()
+            ]
+        );
+        assert_eq!(config.user.as_deref(), Some("node"));
+        assert_eq!(config.working_dir.as_deref(), Some("/workspaces"));
+    }
+
+    #[test]
+    fn an_image_config_without_a_config_section_yields_defaults() {
+        let config = CachedImageConfig::from_oci_config(&serde_json::json!({}));
+        assert!(config.env.is_empty());
+        assert_eq!(config.user, None);
+        assert_eq!(config.working_dir, None);
+    }
+
     /// Two workspaces whose names share a long prefix must not collide. The retained
     /// suffix is what supplies the entropy, so a prefix-only truncation would be wrong.
     #[test]
@@ -817,6 +2708,100 @@ mod tests {
             "names differing only in suffix must not collide"
         );
         assert!(id_a.ends_with(&a[a.len() - 18..]));
+    }
+
+    /// The Apple container config built from a `dev up`-style `ContainerConfig`
+    /// must (a) truncate the ID to Apple's limit and (b) carry the
+    /// `devcontainer.local_folder` label that `dev status`/`dev exec` filter on.
+    ///
+    /// This characterizes the creation→discovery contract at the heart of issue
+    /// #4 — `dev up` reported readiness for a container `dev status`/`dev exec`
+    /// could not find. It does not reproduce the original break (which was a
+    /// `containerList` decode failure, covered in
+    /// `apple_container::models::tests`); it pins the two invariants any future
+    /// change to `to_apple_config` must preserve: the ID stays inside the
+    /// daemon's length limit, and the labels `workspace_labels(workspace, None)`
+    /// queries with are actually set on the created container.
+    #[test]
+    fn to_apple_config_truncates_id_and_carries_discovery_label() {
+        use crate::runtime::WorkspaceMount;
+        use crate::util::{container_name, workspace_labels};
+
+        let workspace = std::path::Path::new("/tmp/test-apple-repro");
+        let config_file = workspace.join(".devcontainer/devcontainer.json");
+
+        // Build the ContainerConfig exactly as `commands::up::run` does: the
+        // name comes from `container_name(workspace)` and the labels from
+        // `workspace_labels(workspace, Some(config_file))`.
+        let name = container_name(workspace);
+        let labels: HashMap<String, String> = workspace_labels(workspace, Some(&config_file))
+            .into_iter()
+            .collect();
+        let local_folder = labels
+            .get("devcontainer.local_folder")
+            .expect("up config must set devcontainer.local_folder")
+            .clone();
+
+        let container_config = ContainerConfig {
+            image: "docker.io/library/alpine:latest".to_string(),
+            name: name.clone(),
+            labels,
+            env: HashMap::new(),
+            mounts: vec![],
+            volumes: vec![],
+            ports: vec![],
+            workspace_mount: Some(WorkspaceMount {
+                source: workspace.to_path_buf(),
+                target: "/workspaces/test-apple-repro".to_string(),
+            }),
+            workspace_folder: Some("/workspaces/test-apple-repro".to_string()),
+            extra_args: vec![],
+            entrypoint: None,
+            init: false,
+            privileged: false,
+            cap_add: vec![],
+            security_opt: vec![],
+        };
+
+        let image = ImageDescription::default();
+        let image_config = CachedImageConfig {
+            working_dir: Some("/usr/src/app".to_string()),
+            ..CachedImageConfig::default()
+        };
+        let apple_config = to_apple_config(&container_config, image, &image_config);
+
+        // (a) ID fits Apple's daemon limit.
+        assert_eq!(
+            apple_config.id.len(),
+            MAX_CONTAINER_ID_LEN,
+            "Apple container ID must be truncated to the daemon limit"
+        );
+        assert_ne!(apple_config.id, container_config.name);
+
+        // (b) The discovery label survives into the Apple config, and the label
+        // that `dev status`/`dev exec` query with (`workspace_labels(workspace, None)`,
+        // which is local_folder only) matches it — so a container created by
+        // `dev up` is findable by the same workspace label.
+        assert_eq!(
+            apple_config.labels.get("devcontainer.local_folder"),
+            Some(&local_folder),
+            "created container must carry the workspace local_folder label"
+        );
+        let discovery_labels = workspace_labels(workspace, None);
+        for (key, value) in &discovery_labels {
+            assert_eq!(
+                apple_config.labels.get(key),
+                Some(value),
+                "discovery label {key} must match the label set at create time"
+            );
+        }
+
+        // (c) The container runs in the workspace folder, which is what execs
+        // inherit — lifecycle hooks would otherwise run in `/`.
+        assert_eq!(
+            apple_config.init_process.working_directory, "/workspaces/test-apple-repro",
+            "container working directory must be the workspace folder"
+        );
     }
 
     /// Direct integration test: create + start a container using AppleRuntime,
@@ -1014,6 +2999,7 @@ mod tests {
                 source: workspace_path.clone(),
                 target: "/workspaces/test-apple-workspace".to_string(),
             }),
+            workspace_folder: Some("/workspaces/test-apple-workspace".to_string()),
             extra_args: vec![],
             entrypoint: None,
             init: false,
@@ -1059,5 +3045,293 @@ mod tests {
             .delete(&truncated_id, true)
             .await
             .expect("delete failed");
+    }
+
+    /// Integration test for the `dev exec` path. Covers the three ways exec was
+    /// broken on the issue #4 path: the process was never started (so `exec`
+    /// hung forever), the exit code was hardcoded to 0 (so every failure looked
+    /// like success), and stdin was never closed (so any command that reads it
+    /// hung forever).
+    ///
+    /// Ignored by default: requires a running Apple Container daemon and pulls
+    /// an image over the network. Run with
+    /// `cargo test --features apple -- --ignored`.
+    #[tokio::test]
+    #[ignore = "requires a live Apple Container daemon and network access"]
+    #[cfg(target_os = "macos")]
+    async fn test_apple_runtime_exec_runs_and_returns() {
+        let runtime = AppleRuntime::connect().expect("connect failed");
+        let container_id = "apple-runtime-exec-test";
+        let image_ref = "docker.io/library/alpine:latest";
+
+        // Pull and unpack image.
+        let platform = serde_json::json!({"architecture": "arm64", "os": "linux"});
+        let platform_json = serde_json::to_vec(&platform).unwrap();
+        let image_desc_bytes = apple_container::build::pull_image(image_ref, &platform_json)
+            .await
+            .expect("pull_image failed");
+        apple_container::build::unpack_image(&image_desc_bytes, &platform_json)
+            .await
+            .expect("unpack_image failed");
+        let image: ImageDescription =
+            serde_json::from_slice(&image_desc_bytes).expect("parse image descriptor failed");
+        let kernel = runtime
+            .client
+            .get_default_kernel()
+            .await
+            .expect("get_default_kernel failed");
+
+        let config = ContainerConfiguration {
+            id: container_id.to_string(),
+            image,
+            mounts: vec![],
+            published_ports: vec![],
+            labels: HashMap::new(),
+            init_process: ProcessConfiguration {
+                executable: "sleep".to_string(),
+                arguments: vec!["3600".to_string()],
+                environment: vec![],
+                working_directory: "/tmp".to_string(),
+                terminal: false,
+                user: User::Raw {
+                    raw: UserString {
+                        user_string: "root".to_string(),
+                    },
+                },
+                supplemental_groups: vec![],
+                rlimits: vec![],
+            },
+            resources: Resources {
+                cpus: 4,
+                memory_in_bytes: 1024 * 1024 * 1024,
+            },
+            runtime_handler: "container-runtime-linux".to_string(),
+            platform: Platform {
+                architecture: "arm64".to_string(),
+                os: "linux".to_string(),
+            },
+            networks: vec![NetworkInfo {
+                network: "default".to_string(),
+                options: NetworkOptions {
+                    hostname: Some(container_id.to_string()),
+                    mtu: Some(1280),
+                },
+            }],
+            dns: Some(DnsInfo {
+                nameservers: vec![],
+                search_domains: vec![],
+                options: vec![],
+            }),
+        };
+
+        // Clean up any previous test container.
+        let _ = runtime.client.stop(container_id).await;
+        let _ = runtime.client.delete(container_id, true).await;
+
+        runtime
+            .client
+            .create(&config, &kernel)
+            .await
+            .expect("create failed");
+        let devnull = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .expect("open /dev/null");
+        let fd = devnull.as_raw_fd();
+        runtime
+            .client
+            .bootstrap(container_id, fd, fd, fd)
+            .await
+            .expect("bootstrap failed");
+        runtime
+            .client
+            .start_process(container_id, container_id)
+            .await
+            .expect("start_process failed");
+
+        // Each exec is wrapped in a timeout so a regression that reintroduces a
+        // hang fails fast instead of stalling CI.
+        async fn bounded(runtime: &AppleRuntime, id: &str, cmd: &[&str]) -> ExecResult {
+            let cmd: Vec<String> = cmd.iter().map(|s| s.to_string()).collect();
+            let described = cmd.join(" ");
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                runtime.exec(id, &cmd, None),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("exec hung: {described}"))
+            .unwrap_or_else(|e| panic!("exec failed: {described}: {e}"))
+        }
+
+        let result = bounded(&runtime, container_id, &["echo", "hello"]).await;
+        assert_eq!(
+            result.stdout.trim(),
+            "hello",
+            "exec should return command output"
+        );
+        assert_eq!(result.exit_code, 0, "a successful command must report 0");
+
+        // A failing command must report its real status, or lifecycle hook
+        // failures and `dev exec` exit codes are silently swallowed.
+        let failed = bounded(
+            &runtime,
+            container_id,
+            &["sh", "-c", "echo oops >&2; exit 7"],
+        )
+        .await;
+        assert_eq!(failed.exit_code, 7, "exit code must be propagated");
+        assert_eq!(failed.stderr.trim(), "oops");
+
+        // An exec starts in the container's working directory, not `/`, so
+        // relative-path lifecycle hooks resolve the way they do on docker.
+        let cwd = bounded(&runtime, container_id, &["pwd"]).await;
+        assert_eq!(
+            cwd.stdout.trim(),
+            "/tmp",
+            "exec must inherit the container's working directory"
+        );
+
+        // Nothing writes to the exec'd process's stdin, so it must see EOF.
+        // `cat` would otherwise block until the container is killed.
+        let piped = bounded(&runtime, container_id, &["cat"]).await;
+        assert_eq!(piped.exit_code, 0, "cat must exit once stdin reaches EOF");
+        assert!(piped.stdout.is_empty());
+
+        // Live smoke for Apple's terminal exec contract: `terminal=true`
+        // starts with stdin/stdout and no separate stderr fd, then reports its
+        // exit — and the guest's stderr still reaches the caller, because the
+        // daemon relays it over the pty. That last part is the premise the
+        // whole fix rests on: if it did not hold, `dev shell` would silently
+        // lose every error message the shell printed. So the process writes to
+        // stderr and the fd handed over as stdout is a pipe this reads back,
+        // rather than /dev/null with nobody looking.
+        let defaults = ProcessDefaults {
+            working_directory: "/tmp".to_string(),
+            environment: Vec::new(),
+        };
+        let proc_config = exec_process_config(
+            &[
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "echo oops >&2; exit 0".to_string(),
+            ],
+            None,
+            true,
+            &defaults,
+        );
+        let (terminal_out, terminal_in) = terminal_pipe();
+        let process_id = next_process_id("exec-interactive-smoke");
+        runtime
+            .client
+            .create_process(
+                container_id,
+                &process_id,
+                &proc_config,
+                fd,
+                terminal_in.as_raw_fd(),
+                None,
+            )
+            .await
+            .expect("terminal create_process failed");
+        // The daemon has its own copy; this one would otherwise hold the pipe
+        // open against the read below.
+        drop(terminal_in);
+
+        let (issued, on_the_wire) = tokio::sync::oneshot::channel();
+        let exit_wait = runtime
+            .client
+            .wait_process_issuing(container_id, &process_id, issued);
+        tokio::pin!(exit_wait);
+        start_with_registered_exit_wait(
+            "exec_interactive",
+            &proc_config.executable,
+            &mut exit_wait,
+            on_the_wire,
+            runtime.client.start_process(container_id, &process_id),
+        )
+        .await
+        .expect("terminal start_process failed");
+
+        let exit_code = tokio::time::timeout(std::time::Duration::from_secs(30), exit_wait)
+            .await
+            .expect("terminal exec wait hung")
+            .expect("terminal exec wait failed");
+        assert_eq!(exit_code, 0);
+
+        let relayed = read_until(&terminal_out, "oops", std::time::Duration::from_secs(10));
+        assert!(
+            relayed.contains("oops"),
+            "a terminal exec omits the stderr fd, so the guest's stderr must arrive on the \
+             terminal instead; got {relayed:?}"
+        );
+
+        // Clean up. The daemon can report a stop timeout after the container
+        // has stopped, so deletion is the authoritative cleanup check.
+        let _ = stop_past_stale_process_records(&runtime.client, container_id).await;
+        for _ in 0..20 {
+            if runtime
+                .client
+                .get(container_id)
+                .await
+                .map(|snapshot| snapshot.status != RuntimeStatus::Running)
+                .unwrap_or(true)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        runtime
+            .client
+            .delete(container_id, true)
+            .await
+            .expect("delete failed");
+    }
+
+    // ---- Apple interactive-shell regression: stderr omitted when terminal=true
+
+    /// The caller-side half of the terminal stderr contract: `dev shell`'s
+    /// process configuration must ask for a terminal, which is what makes the
+    /// client omit the stderr fd. That omission is proved against the XPC
+    /// message itself in `apple_container`'s own
+    /// `a_terminal_process_request_carries_no_stderr_key`, which is the only
+    /// place the key's presence is observable; asserting it against a stand-in
+    /// here would only restate the `None` this file passes in.
+    #[test]
+    fn the_interactive_exec_configuration_asks_for_a_terminal() {
+        let defaults = ProcessDefaults {
+            working_directory: "/tmp".to_string(),
+            environment: Vec::new(),
+        };
+
+        let interactive = exec_process_config(&["/bin/sh".to_string()], None, true, &defaults);
+        assert!(
+            interactive.terminal,
+            "dev shell runs against the caller's terminal"
+        );
+
+        let captured = exec_process_config(&["/bin/sh".to_string()], None, false, &defaults);
+        assert!(
+            !captured.terminal,
+            "a captured exec reads its own stdout and stderr and must not ask for a pty"
+        );
+    }
+
+    /// Guard against an over-broad fix that drops stderr everywhere: noninteractive
+    /// exec must still carry all three fds and return its captured output.
+    #[tokio::test]
+    async fn exec_noninteractive_retains_all_three_fds() {
+        let daemon = FakeExecDaemon::producing("hello\n", "oops\n", 0);
+        let result = bounded_exec(&daemon)
+            .await
+            .expect("exec must produce a result");
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "hello\n");
+        assert_eq!(result.stderr, "oops\n");
+        assert!(
+            daemon.created_stderr.load(Ordering::SeqCst),
+            "noninteractive must retain stderr"
+        );
     }
 }

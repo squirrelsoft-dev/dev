@@ -12,7 +12,7 @@ use tokio::io::AsyncWriteExt;
 use crate::error::DevError;
 use crate::runtime::{
     AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ContainerState,
-    ExecResult, ImageMetadata,
+    ExecResult, ImageMetadata, terminal_size,
 };
 
 /// RAII guard that puts the terminal into raw mode and restores it on drop.
@@ -43,19 +43,6 @@ impl RawModeGuard {
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) };
-    }
-}
-
-/// Query the current terminal size via TIOCGWINSZ ioctl.
-fn terminal_size() -> Option<(u16, u16)> {
-    use std::os::fd::AsRawFd;
-    let fd = std::io::stdout().as_raw_fd();
-    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0 && ws.ws_row > 0
-    {
-        Some((ws.ws_col, ws.ws_row))
-    } else {
-        None
     }
 }
 
@@ -142,6 +129,63 @@ impl tokio::io::AsyncRead for LogOutputStream {
 /// Shared bollard-backed runtime used by both Docker and Podman.
 pub struct BollardRuntime {
     client: Docker,
+}
+
+/// Whether the daemon refused this exec because the image has no such
+/// executable, rather than being unable to run one at all.
+///
+/// The daemon declines to start an exec whose executable is not in the image,
+/// so a missing shell arrives as an API error rather than as a non-zero exit
+/// status — but only an error the docker *server* answered with can mean that.
+/// Every transport failure — a restarted Docker Desktop, a moved socket — is a
+/// different variant, and matching those on text alone would read a bare ENOENT
+/// (`DevError::Io` is `#[error(transparent)]`, so it stringifies to exactly "No
+/// such file or directory") as an image without a shell, announcing readiness
+/// for a container nothing can reach.
+///
+/// A server error is not enough on its own either, because the OCI runtime
+/// reports every failure of the same start step through the same variant, and
+/// several of them carry ENOENT without the executable being the reason: `error
+/// setting cwd to "/srv/app": no such file or directory` for a `workspaceFolder`
+/// the image does not have, `open /dev/pts/0: no such file or directory` for a
+/// broken terminal. Nothing ran in either case, so the text has to be
+/// attributable to the command itself: either the runtime says so outright
+/// (`executable file not found in $PATH`), or the not-found is reported inside
+/// the `exec: "<argv0>": …` clause that names the executable it tried.
+fn reports_missing_command(error: &DevError) -> bool {
+    let DevError::Bollard(bollard::errors::Error::DockerResponseServerError { message, .. }) =
+        error
+    else {
+        return false;
+    };
+    let message = message.to_ascii_lowercase();
+    if message.contains("executable file not found") {
+        return true;
+    }
+    message
+        .split_once("exec: ")
+        .is_some_and(|(_, named)| named.contains("no such file or directory"))
+}
+
+/// How long an interactive exec's status is waited for once its streams close.
+///
+/// Only spent when the streams outlive the process's own exit record, which is
+/// milliseconds in practice — the shell exits as soon as it sees the EOF that
+/// ended the session. A budget rather than an unbounded wait so a process that
+/// keeps running with no stdin cannot park `dev shell` forever.
+const EXEC_STATUS_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The exit code an `inspect_exec` reply carries, if it carries a final one.
+///
+/// `None` means "ask again": docker reports a still-running exec with no code,
+/// and records the code slightly after the process ends, so both states are
+/// answers about an exec that has not finished being reported rather than an
+/// exec that succeeded.
+fn recorded_exit_code(running: Option<bool>, exit_code: Option<i64>) -> Option<i32> {
+    if running == Some(true) {
+        return None;
+    }
+    exit_code.map(|code| code as i32)
 }
 
 impl BollardRuntime {
@@ -305,6 +349,23 @@ impl BollardRuntime {
         &self,
         config: &ContainerConfig,
     ) -> Result<String, DevError> {
+        let container_config = Self::to_create_body(config);
+
+        let opts = CreateContainerOptions {
+            name: Some(config.name.clone()),
+            ..Default::default()
+        };
+
+        let response = self
+            .client
+            .create_container(Some(opts), container_config)
+            .await?;
+
+        Ok(response.id)
+    }
+
+    /// Build the daemon-facing create body from our generic container config.
+    fn to_create_body(config: &ContainerConfig) -> ContainerCreateBody {
         let mut binds = Vec::new();
         for m in &config.mounts {
             let ro = if m.readonly { ":ro" } else { "" };
@@ -364,7 +425,7 @@ impl BollardRuntime {
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
 
-        let container_config = ContainerCreateBody {
+        ContainerCreateBody {
             image: Some(config.image.clone()),
             labels: Some(
                 labels
@@ -374,6 +435,11 @@ impl BollardRuntime {
             ),
             env: Some(env),
             exposed_ports: Some(exposed_ports),
+            // The resolved workspaceFolder becomes the container's WorkingDir,
+            // which every `docker exec` without an explicit one inherits — so
+            // lifecycle hooks and `dev exec` run where the devcontainer spec
+            // says they should, matching the Apple runtime.
+            working_dir: config.workspace_folder.clone(),
             host_config: Some(host_config),
             entrypoint: config.entrypoint.as_ref().map(|ep| vec![ep.clone()]),
             // Keep the container running with a default command if no entrypoint provided.
@@ -383,19 +449,7 @@ impl BollardRuntime {
                 None
             },
             ..Default::default()
-        };
-
-        let opts = CreateContainerOptions {
-            name: Some(config.name.clone()),
-            ..Default::default()
-        };
-
-        let response = self
-            .client
-            .create_container(Some(opts), container_config)
-            .await?;
-
-        Ok(response.id)
+        }
     }
 
     async fn start_container_impl(&self, id: &str) -> Result<(), DevError> {
@@ -487,7 +541,7 @@ impl BollardRuntime {
         id: &str,
         cmd: &[String],
         user: Option<&str>,
-    ) -> Result<(), DevError> {
+    ) -> Result<i32, DevError> {
         use futures_util::StreamExt;
 
         let exec = self
@@ -675,8 +729,38 @@ impl BollardRuntime {
             sigwinch_abort.abort();
         }
 
+        let exit_code = self.recorded_exec_status(&exec.id).await?;
+
         // _raw_guard is dropped here, restoring the terminal.
-        Ok(())
+        Ok(exit_code)
+    }
+
+    /// The status the interactive exec finished with.
+    ///
+    /// The stream loop can end while the process is still running: a piped or
+    /// redirected stdin reaches EOF, which ends the forwarding task and wins
+    /// the `select!` above, and only then does dropping the input half give the
+    /// container's shell its own EOF. Reading `inspect_exec` once at that
+    /// moment answers `running: true` with no code recorded, so the status is
+    /// polled until docker has one. `dev shell` turns this into its own exit
+    /// status, so neither a transport failure nor a status docker never
+    /// recorded may pass for success.
+    async fn recorded_exec_status(&self, exec_id: &str) -> Result<i32, DevError> {
+        let deadline = std::time::Instant::now() + EXEC_STATUS_BUDGET;
+        loop {
+            let info = self.client.inspect_exec(exec_id).await?;
+            if let Some(code) = recorded_exit_code(info.running, info.exit_code) {
+                return Ok(code);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(DevError::Runtime(format!(
+                    "the interactive session ended but docker reported no exit status for it \
+                     within {}s",
+                    EXEC_STATUS_BUDGET.as_secs()
+                )));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     async fn exec_attached_impl(
@@ -905,7 +989,11 @@ impl ContainerRuntime for BollardRuntime {
         Box::pin(async move { self.exec_impl(&id, &cmd, user.as_deref()).await })
     }
 
-    fn exec_interactive(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, ()> {
+    fn exec_reports_missing_command(&self, error: &DevError) -> bool {
+        reports_missing_command(error)
+    }
+
+    fn exec_interactive(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, i32> {
         let id = id.to_string();
         let cmd = cmd.to_vec();
         let user = user.map(|u| u.to_string());
@@ -1015,7 +1103,11 @@ impl ContainerRuntime for DockerRuntime {
         self.0.exec(id, cmd, user)
     }
 
-    fn exec_interactive(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, ()> {
+    fn exec_reports_missing_command(&self, error: &DevError) -> bool {
+        self.0.exec_reports_missing_command(error)
+    }
+
+    fn exec_interactive(&self, id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, i32> {
         self.0.exec_interactive(id, cmd, user)
     }
 
@@ -1042,5 +1134,163 @@ impl ContainerRuntime for DockerRuntime {
         user: Option<&str>,
     ) -> BoxFut<'_, AttachedExec> {
         self.0.exec_attached(id, cmd, user)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::WorkspaceMount;
+
+    fn container_config(workspace_folder: Option<&str>) -> ContainerConfig {
+        ContainerConfig {
+            image: "ubuntu:24.04".to_string(),
+            name: "vsc-test".to_string(),
+            labels: HashMap::new(),
+            env: HashMap::new(),
+            mounts: vec![],
+            volumes: vec![],
+            ports: vec![],
+            workspace_mount: Some(WorkspaceMount {
+                source: std::path::PathBuf::from("/host/monorepo"),
+                target: "/srv/app".to_string(),
+            }),
+            workspace_folder: workspace_folder.map(str::to_string),
+            extra_args: vec![],
+            entrypoint: None,
+            init: false,
+            privileged: false,
+            cap_add: vec![],
+            security_opt: vec![],
+        }
+    }
+
+    /// The container's `WorkingDir` is the resolved `workspaceFolder`, which
+    /// may be a subdirectory of the workspace mount. Every `docker exec` that
+    /// does not name its own working directory inherits this, so lifecycle
+    /// hooks and `dev exec` run where the devcontainer spec says — the same
+    /// place the Apple runtime uses.
+    #[test]
+    fn create_body_runs_in_the_resolved_workspace_folder() {
+        let body = BollardRuntime::to_create_body(&container_config(Some("/srv/app/packages/api")));
+
+        assert_eq!(body.working_dir.as_deref(), Some("/srv/app/packages/api"));
+        assert_eq!(
+            body.host_config
+                .and_then(|h| h.binds)
+                .and_then(|b| b.first().cloned()),
+            Some("/host/monorepo:/srv/app".to_string()),
+            "the source tree is still bound at the workspaceMount target"
+        );
+    }
+
+    /// Without a resolved folder the field stays unset, so the daemon keeps
+    /// using the image's own `WorkingDir`.
+    #[test]
+    fn create_body_leaves_working_dir_unset_without_a_workspace_folder() {
+        let body = BollardRuntime::to_create_body(&container_config(None));
+        assert_eq!(body.working_dir, None);
+    }
+
+    fn server_error(message: &str) -> DevError {
+        DevError::Bollard(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            message: message.to_string(),
+        })
+    }
+
+    /// Only an error the docker server answered with, and that the server
+    /// attributed to the executable, reads as "the image has no such
+    /// executable". Everything else is the runtime failing to run anything,
+    /// and the readiness gate treats a missing command as tolerable — so
+    /// misreading one of those announces readiness for a container nothing can
+    /// reach.
+    #[test]
+    fn only_a_server_side_refusal_reads_as_a_missing_command() {
+        assert!(reports_missing_command(&server_error(
+            "OCI runtime exec failed: exec: \"sh\": executable file not found in $PATH"
+        )));
+        // An absolute argv[0] the image does not have is reported as ENOENT
+        // instead, but still inside the clause naming the executable.
+        assert!(reports_missing_command(&server_error(
+            "OCI runtime exec failed: exec failed: unable to start container process: \
+             exec: \"/opt/bin/sh\": stat /opt/bin/sh: no such file or directory: unknown"
+        )));
+
+        // A bare ENOENT from a restarted daemon or a moved socket carries the
+        // same words, and `DevError::Io` is transparent so it stringifies to
+        // exactly them — but nothing ran, so it must stay fatal.
+        assert!(!reports_missing_command(&DevError::Io(
+            std::io::Error::from(std::io::ErrorKind::NotFound)
+        )));
+        assert!(!reports_missing_command(&DevError::Runtime(
+            "No such file or directory (os error 2)".to_string()
+        )));
+        assert!(!reports_missing_command(&server_error(
+            "no such file or directory"
+        )));
+        // The same ENOENT from the start step, about the working directory
+        // this runtime now sets from `workspaceFolder` rather than about the
+        // command. Nothing ran, so readiness must fail rather than warn.
+        assert!(!reports_missing_command(&server_error(
+            "OCI runtime exec failed: exec failed: unable to start container process: \
+             error setting cwd to \"/srv/app/packages/api\": no such file or directory: unknown"
+        )));
+        assert!(!reports_missing_command(&server_error(
+            "OCI runtime exec failed: exec failed: unable to start container process: \
+             open /dev/pts/0: no such file or directory: unknown"
+        )));
+        assert!(!reports_missing_command(&server_error(
+            "container is not running"
+        )));
+    }
+
+    /// `detect_runtime` only ever hands out `DockerRuntime`, so a classifier
+    /// the wrapper forgets to forward is a classifier that never runs: the
+    /// trait's default answers `false` and `dev up` fails on a shell-less
+    /// image instead of tolerating it. Asked through `dyn ContainerRuntime` so
+    /// the wrapper's own table is what answers.
+    #[test]
+    fn the_docker_wrapper_forwards_the_missing_command_classifier() {
+        // A path rather than a live daemon: bollard only checks that the socket
+        // is there, and nothing here sends a request over it.
+        let socket = tempfile::NamedTempFile::new().expect("stand-in socket");
+        let runtime = DockerRuntime(
+            BollardRuntime::connect_to_socket(&socket.path().to_string_lossy())
+                .expect("building a docker client must not need a daemon"),
+        );
+        let runtime: &dyn ContainerRuntime = &runtime;
+
+        assert!(runtime.exec_reports_missing_command(&server_error(
+            "OCI runtime exec failed: exec: \"sh\": executable file not found in $PATH"
+        )));
+        assert!(!runtime.exec_reports_missing_command(&server_error("container is not running")));
+    }
+
+    /// The interactive session's streams can close before docker has recorded
+    /// the process's exit — a redirected stdin reaching EOF ends the session
+    /// while the shell is still running — so neither state may be read as a
+    /// success `dev shell` would then exit with.
+    #[test]
+    fn an_exec_status_is_only_final_once_the_process_has_stopped() {
+        assert_eq!(recorded_exit_code(Some(false), Some(7)), Some(7));
+        assert_eq!(recorded_exit_code(Some(false), Some(0)), Some(0));
+        assert_eq!(recorded_exit_code(None, Some(3)), Some(3));
+
+        assert_eq!(
+            recorded_exit_code(Some(true), None),
+            None,
+            "a running exec has not reported a status yet"
+        );
+        assert_eq!(
+            recorded_exit_code(Some(true), Some(0)),
+            None,
+            "a running exec's zero is a placeholder, not its status"
+        );
+        assert_eq!(
+            recorded_exit_code(Some(false), None),
+            None,
+            "a stopped exec whose code is not recorded yet is not a success"
+        );
     }
 }

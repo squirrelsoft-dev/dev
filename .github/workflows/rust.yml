@@ -98,8 +98,13 @@ jobs:
       - name: cargo build --features apple
         run: cargo build --features apple
 
-      - name: cargo test --features apple
-        run: cargo test --features apple
+      # `--workspace` so crates/apple-container's own tests run too. Without
+      # it cargo only tests the root package, and the containerList decode
+      # regression tests for issue #4 (crates/apple-container/src/models.rs)
+      # never execute. The ubuntu job cannot use --workspace: it has no protoc,
+      # which that crate's build script needs.
+      - name: cargo test --workspace --features apple
+        run: cargo test --workspace --features apple
 
       # `-p devcontainer --no-deps` scopes the gate to the root package, so
       # src/runtime/apple.rs is linted while crates/apple-container is only
