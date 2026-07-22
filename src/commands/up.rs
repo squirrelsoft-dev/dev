@@ -178,7 +178,15 @@ pub(crate) async fn run_with_runtime(
                 let user =
                     resolve_remote_user(runtime, &container.image, config.remote_user.as_deref())
                         .await?;
-                verify_container_usable(runtime, &container.id, workspace, user.as_deref()).await?;
+                let workspace_folder = config.workspace_folder_path(workspace, user.as_deref())?;
+                verify_container_usable(
+                    runtime,
+                    &container.id,
+                    workspace,
+                    user.as_deref(),
+                    Some(&workspace_folder),
+                )
+                .await?;
                 println!("Container '{}' is already running.", container.name);
                 return Ok(());
             }
@@ -190,10 +198,25 @@ pub(crate) async fn run_with_runtime(
                 let user =
                     resolve_remote_user(runtime, &container.image, config.remote_user.as_deref())
                         .await?;
-                verify_container_usable(runtime, &container.id, workspace, user.as_deref()).await?;
+                let workspace_folder = config.workspace_folder_path(workspace, user.as_deref())?;
+                verify_container_usable(
+                    runtime,
+                    &container.id,
+                    workspace,
+                    user.as_deref(),
+                    Some(&workspace_folder),
+                )
+                .await?;
                 if config.post_start_command.is_some() {
-                    run_lifecycle_hooks(runtime, &container.id, &config, user.as_deref(), None)
-                        .await?;
+                    run_lifecycle_hooks(
+                        runtime,
+                        &container.id,
+                        &config,
+                        user.as_deref(),
+                        Some(&workspace_folder),
+                        None,
+                    )
+                    .await?;
                 }
                 println!("Container '{}' started.", container.name);
                 return Ok(());
@@ -448,6 +471,8 @@ pub(crate) async fn run_with_runtime(
         env.insert(k.clone(), v.clone());
     }
 
+    let workspace_folder = config.workspace_folder_path(workspace, remote_user)?;
+
     let container_config = ContainerConfig {
         image: final_image,
         name: name.clone(),
@@ -460,7 +485,7 @@ pub(crate) async fn run_with_runtime(
             source: workspace.to_path_buf(),
             target: config.workspace_mount_target(workspace, remote_user)?,
         }),
-        workspace_folder: Some(config.workspace_folder_path(workspace, remote_user)?),
+        workspace_folder: Some(workspace_folder.clone()),
         extra_args: vec![],
         entrypoint: None,
         init: caps.init,
@@ -482,7 +507,14 @@ pub(crate) async fn run_with_runtime(
 
     eprintln!("Starting container '{name}'...");
     runtime.start_container(&container_id).await?;
-    verify_container_usable(runtime, &container_id, workspace, remote_user).await?;
+    verify_container_usable(
+        runtime,
+        &container_id,
+        workspace,
+        remote_user,
+        Some(&workspace_folder),
+    )
+    .await?;
 
     // Run lifecycle hooks — feature hooks first, then config hooks (Gap 6).
     let feature_hooks = if ordered_features.is_empty() {
@@ -490,7 +522,15 @@ pub(crate) async fn run_with_runtime(
     } else {
         Some(ordered_features.as_slice())
     };
-    run_lifecycle_hooks(runtime, &container_id, &config, remote_user, feature_hooks).await?;
+    run_lifecycle_hooks(
+        runtime,
+        &container_id,
+        &config,
+        remote_user,
+        Some(&workspace_folder),
+        feature_hooks,
+    )
+    .await?;
 
     // Clone dotfiles if configured (Gap 15).
     if let Some(ref dotfiles) = config.dotfiles {
@@ -661,9 +701,10 @@ async fn verify_container_usable(
     container_id: &str,
     workspace: &Path,
     remote_user: Option<&str>,
+    workdir: Option<&str>,
 ) -> anyhow::Result<()> {
     verify_container_discoverable(runtime, container_id, workspace).await?;
-    verify_container_execs(runtime, container_id, remote_user).await
+    verify_container_execs(runtime, container_id, remote_user, workdir).await
 }
 
 /// Run one trivial command in the container, the way every later command does.
@@ -694,6 +735,7 @@ async fn verify_container_execs(
     runtime: &dyn ContainerRuntime,
     container_id: &str,
     remote_user: Option<&str>,
+    workdir: Option<&str>,
 ) -> anyhow::Result<()> {
     let probe = vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()];
     let mut polls = ReadinessPolls::new();
@@ -707,8 +749,11 @@ async fn verify_container_execs(
 
     loop {
         let window = polls.remaining();
-        let attempt =
-            tokio::time::timeout(window, runtime.exec(container_id, &probe, remote_user)).await;
+        let attempt = tokio::time::timeout(
+            window,
+            runtime.exec(container_id, &probe, remote_user, workdir),
+        )
+        .await;
 
         let latest = match attempt {
             // A process that ran to completion proves the create → start → wait
@@ -1013,7 +1058,7 @@ async fn install_dotfiles(
         target.replace('\'', "'\\''"),
     );
     let args = vec!["sh".to_string(), "-c".to_string(), clone_cmd];
-    let result = runtime.exec(container_id, &args, user).await?;
+    let result = runtime.exec(container_id, &args, user, None).await?;
     if result.exit_code != 0 {
         eprintln!(
             "Warning: failed to clone dotfiles (exit {}):\n{}",
@@ -1026,7 +1071,7 @@ async fn install_dotfiles(
     if let Some(ref install_cmd) = dotfiles.install_command {
         eprintln!("Running dotfiles install command: {install_cmd}");
         let args = vec!["sh".to_string(), "-c".to_string(), install_cmd.clone()];
-        let result = runtime.exec(container_id, &args, user).await?;
+        let result = runtime.exec(container_id, &args, user, None).await?;
         if result.exit_code != 0 {
             eprintln!(
                 "Warning: dotfiles install command failed (exit {}):\n{}",
@@ -1350,7 +1395,15 @@ async fn run_compose(
     } else {
         Some(ordered_features.as_slice())
     };
-    run_lifecycle_hooks(runtime, &container_id, config, remote_user, feature_hooks).await?;
+    run_lifecycle_hooks(
+        runtime,
+        &container_id,
+        config,
+        remote_user,
+        None,
+        feature_hooks,
+    )
+    .await?;
 
     // 13. Install dotfiles.
     if let Some(ref dotfiles) = config.dotfiles {
@@ -1693,7 +1746,13 @@ mod tests {
             unused()
         }
 
-        fn exec(&self, _id: &str, _cmd: &[String], _user: Option<&str>) -> BoxFut<'_, ExecResult> {
+        fn exec(
+            &self,
+            _id: &str,
+            _cmd: &[String],
+            _user: Option<&str>,
+            _workdir: Option<&str>,
+        ) -> BoxFut<'_, ExecResult> {
             unused()
         }
 
@@ -1702,6 +1761,7 @@ mod tests {
             _id: &str,
             _cmd: &[String],
             _user: Option<&str>,
+            _workdir: Option<&str>,
         ) -> BoxFut<'_, i32> {
             unused()
         }
@@ -1866,7 +1926,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     /// One command `exec` was asked to run, and the user it ran as.
-    type ExecCall = (Vec<String>, Option<String>);
+    type ExecCall = (Vec<String>, Option<String>, Option<String>);
 
     /// Stand-in runtime for `run_with_runtime`, modelling a daemon: created
     /// containers land in `containers`, `start_container` marks them running,
@@ -2099,6 +2159,19 @@ mod tests {
             self
         }
 
+        fn already_stopped(self, workspace: &Path, config_path: &Path) -> Self {
+            self.containers.lock().unwrap().push(ContainerInfo {
+                id: "already-stopped-id".to_string(),
+                name: "already-stopped".to_string(),
+                state: ContainerState::Stopped,
+                labels: workspace_labels(workspace, Some(config_path))
+                    .into_iter()
+                    .collect(),
+                image: "ubuntu:24.04".to_string(),
+            });
+            self
+        }
+
         fn created_config(&self) -> ContainerConfig {
             self.created_config
                 .lock()
@@ -2190,9 +2263,16 @@ mod tests {
             unused()
         }
 
-        fn exec(&self, _id: &str, cmd: &[String], user: Option<&str>) -> BoxFut<'_, ExecResult> {
+        fn exec(
+            &self,
+            _id: &str,
+            cmd: &[String],
+            user: Option<&str>,
+            workdir: Option<&str>,
+        ) -> BoxFut<'_, ExecResult> {
             let cmd = cmd.to_vec();
             let user = user.map(str::to_string);
+            let workdir = workdir.map(str::to_string);
             let exec_fails = self.exec_fails;
             let command_missing = self.exec_command_missing;
             let exit_code = self.exec_exit_code;
@@ -2201,7 +2281,7 @@ mod tests {
             let refusals_left = self.exec_refusals_before_silence.clone();
             let execs = self.execs.clone();
             Box::pin(async move {
-                execs.lock().unwrap().push((cmd, user));
+                execs.lock().unwrap().push((cmd, user, workdir));
                 // A real exec talks to a daemon, so it is Pending on its first
                 // poll. Answering synchronously would let this fake succeed
                 // inside a zero-length timeout that a real runtime could never
@@ -2256,6 +2336,7 @@ mod tests {
             _id: &str,
             _cmd: &[String],
             _user: Option<&str>,
+            _workdir: Option<&str>,
         ) -> BoxFut<'_, i32> {
             unused()
         }
@@ -2647,7 +2728,7 @@ mod tests {
             .await
             .expect("up should succeed with a cooperating fake runtime");
 
-        let (_, user) = rt.execs().first().cloned().expect("the gate must probe");
+        let (_, user, _) = rt.execs().first().cloned().expect("the gate must probe");
         assert_eq!(
             user.as_deref(),
             Some("vscode"),
@@ -2822,6 +2903,96 @@ mod tests {
         assert!(
             rt.created_config.lock().unwrap().is_none(),
             "a usable running container must not be recreated"
+        );
+    }
+
+    /// Reusing a running Docker/Podman container is the trigger; the masking
+    /// condition is that its configured `WorkingDir` might happen to match the
+    /// workspace folder. The probe must name the resolved folder either way so
+    /// a stale unrelated `WorkingDir` cannot make `dev up` report readiness for
+    /// lifecycle hooks and user commands that will run elsewhere.
+    #[tokio::test(start_paused = true)]
+    async fn up_probes_a_reused_running_container_in_the_workspace_folder() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(
+            &workspace,
+            r#"{
+                "image": "ubuntu:24.04",
+                "workspaceMount": "source=${localWorkspaceFolder},target=/srv/app,type=bind",
+                "workspaceFolder": "/srv/app/packages/api"
+            }"#,
+        );
+        let rt = UpFakeRuntime::ok().already_running(workspace.path(), &config_path);
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("a running reusable container should stay reusable");
+
+        let (_, _, workdir) = rt.execs().first().cloned().expect("the gate must probe");
+        assert_eq!(workdir.as_deref(), Some("/srv/app/packages/api"));
+        assert!(
+            rt.created_config.lock().unwrap().is_none(),
+            "the existing container must not be recreated just to correct exec cwd"
+        );
+    }
+
+    /// Matching control: when the effective workspace folder is the mount root,
+    /// the reused-container path still passes that same path explicitly. This
+    /// proves the fix is not conditional on detecting a mismatch we cannot
+    /// reliably inspect through every runtime.
+    #[tokio::test(start_paused = true)]
+    async fn up_probes_a_reused_running_container_at_the_mount_root_control_path() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(
+            &workspace,
+            r#"{
+                "image": "ubuntu:24.04",
+                "workspaceMount": "source=${localWorkspaceFolder},target=/srv/app,type=bind"
+            }"#,
+        );
+        let rt = UpFakeRuntime::ok().already_running(workspace.path(), &config_path);
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("a running reusable container should stay reusable");
+
+        let (_, _, workdir) = rt.execs().first().cloned().expect("the gate must probe");
+        assert_eq!(workdir.as_deref(), Some("/srv/app"));
+    }
+
+    /// A stopped existing container exercises the visible lifecycle symptom:
+    /// `postStartCommand` runs after reuse and must not inherit a stale image
+    /// or previous-config `WorkingDir`.
+    #[tokio::test(start_paused = true)]
+    async fn post_start_for_a_reused_stopped_container_runs_in_the_workspace_folder() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(
+            &workspace,
+            r#"{
+                "image": "ubuntu:24.04",
+                "workspaceMount": "source=${localWorkspaceFolder},target=/srv/app,type=bind",
+                "workspaceFolder": "/srv/app/packages/api",
+                "postStartCommand": "touch started"
+            }"#,
+        );
+        let rt = UpFakeRuntime::ok().already_stopped(workspace.path(), &config_path);
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("a stopped reusable container should be started in place");
+
+        let execs = rt.execs();
+        assert_eq!(
+            execs.len(),
+            2,
+            "reuse should run the readiness probe and the postStartCommand"
+        );
+        assert!(
+            execs
+                .iter()
+                .all(|(_, _, workdir)| workdir.as_deref() == Some("/srv/app/packages/api")),
+            "every workspace-scoped exec must use workspaceFolder, got: {execs:?}"
+        );
+        assert!(
+            rt.created_config.lock().unwrap().is_none(),
+            "a stopped reusable container must not be recreated"
         );
     }
 

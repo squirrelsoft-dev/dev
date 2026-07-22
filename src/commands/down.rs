@@ -324,6 +324,7 @@ mod tests {
             _id: &str,
             _cmd: &[String],
             _user: Option<&str>,
+            _workdir: Option<&str>,
         ) -> BoxFut<'static, ExecResult> {
             as_fut(Ok(ExecResult {
                 exit_code: 0,
@@ -337,6 +338,7 @@ mod tests {
             _id: &str,
             _cmd: &[String],
             _user: Option<&str>,
+            _workdir: Option<&str>,
         ) -> BoxFut<'static, i32> {
             as_fut(Ok(0))
         }
