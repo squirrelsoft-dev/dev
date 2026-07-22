@@ -284,8 +284,12 @@ pub(crate) fn select_runtime_in(
         return Ok(RuntimeSelection::Auto);
     }
 
-    let raw = fs::read_to_string(&base_path)?;
-    let json: serde_json::Value = parse_jsonc(&raw)?;
+    let Ok(raw) = fs::read_to_string(&base_path) else {
+        return Ok(RuntimeSelection::Auto);
+    };
+    let Ok(json) = parse_jsonc::<serde_json::Value>(&raw) else {
+        return Ok(RuntimeSelection::Auto);
+    };
     let Some(value) = json.get(DEFAULT_RUNTIME_PROPERTY) else {
         return Ok(RuntimeSelection::Auto);
     };
@@ -386,7 +390,7 @@ fn configured_runtime_unavailable_error(runtime_name: RuntimeName, err: DevError
     ))
 }
 
-#[cfg(any(test, not(all(target_os = "macos", feature = "apple"))))]
+#[cfg(not(all(target_os = "macos", feature = "apple")))]
 fn configured_runtime_not_compiled_error(runtime_name: RuntimeName) -> DevError {
     let detail = match runtime_name {
         RuntimeName::Apple => {
@@ -585,31 +589,73 @@ mod tests {
     }
 
     #[test]
-    fn configured_unavailable_runtime_error_is_distinct_and_actionable() {
-        let err = configured_runtime_unavailable_error(
-            RuntimeName::Docker,
-            DevError::Runtime("cannot connect to Docker daemon".to_string()),
-        );
-        let message = err.to_string();
+    fn malformed_base_config_degrades_runtime_selection_to_auto() {
+        let (_dir, home) = dev_home_with_base_config(Some(r#"{"remoteUser":"vscode","#));
 
-        assert!(
-            message.contains("Configured defaultRuntime 'docker' is unavailable"),
-            "{message}"
+        assert_eq!(
+            select_runtime_in(&home, None).unwrap(),
+            RuntimeSelection::Auto
         );
-        assert!(
-            message.contains("cannot connect to Docker daemon"),
-            "{message}"
+    }
+
+    #[test]
+    fn unreadable_base_config_contents_degrade_runtime_selection_to_auto() {
+        let dir = TempDir::new().unwrap();
+        let home = DevHome::at(dir.path());
+        let path = home.base_config();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, [0xff, 0xfe, 0xfd]).unwrap();
+
+        assert_eq!(
+            select_runtime_in(&home, None).unwrap(),
+            RuntimeSelection::Auto
         );
-        assert!(message.contains("Start Docker"), "{message}");
-        assert!(
-            message.contains("dev base config set defaultRuntime"),
-            "{message}"
+    }
+
+    #[test]
+    fn explicit_runtime_override_bypasses_malformed_base_config() {
+        let (_dir, home) = dev_home_with_base_config(Some(r#"{"defaultRuntime":"#));
+
+        assert_eq!(
+            select_runtime_in(&home, Some("podman")).unwrap(),
+            RuntimeSelection::Explicit(RuntimeName::Podman)
         );
-        assert!(
-            message.contains("dev base config unset defaultRuntime"),
-            "{message}"
-        );
-        assert!(!message.contains("Unknown runtime"), "{message}");
+    }
+
+    #[test]
+    fn configured_unavailable_runtime_error_is_distinct_and_actionable_for_every_runtime() {
+        for (runtime_name, remediation) in [
+            (RuntimeName::Docker, "Start Docker"),
+            (RuntimeName::Podman, "Start Podman"),
+            (RuntimeName::Apple, "Start Apple Containers"),
+        ] {
+            let err = configured_runtime_unavailable_error(
+                runtime_name,
+                DevError::Runtime(format!("cannot connect to {runtime_name}")),
+            );
+            let message = err.to_string();
+
+            assert!(
+                message.contains(&format!(
+                    "Configured defaultRuntime '{runtime_name}' is unavailable"
+                )),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!("cannot connect to {runtime_name}")),
+                "{message}"
+            );
+            assert!(message.contains(remediation), "{message}");
+            assert!(
+                message.contains("dev base config set defaultRuntime"),
+                "{message}"
+            );
+            assert!(
+                message.contains("dev base config unset defaultRuntime"),
+                "{message}"
+            );
+            assert!(!message.contains("Unknown runtime"), "{message}");
+        }
     }
 
     #[cfg(not(all(target_os = "macos", feature = "apple")))]

@@ -128,9 +128,9 @@ dev base config add remoteEnv EDITOR=vim
 dev base config unset defaultRuntime                # return runtime selection to auto-detect
 ```
 
-If no base config exists, the layer is skipped. Pass `--no-base` to `dev up`/`dev build` to skip it for one run. The base layer is merged in memory only — it is never written into the project's own config, and features it contributes are kept out of the project's `devcontainer-lock.json`.
+If no base config exists, the layer is skipped. Pass `--no-base` to `dev up`/`dev build` to skip the devcontainer settings in this layer for one run. The base layer is merged in memory only — it is never written into the project's own config, and features it contributes are kept out of the project's `devcontainer-lock.json`.
 
-`defaultRuntime` is a `dev` preference stored in this same base config file, not a separate runtime config. It accepts `docker`, `podman`, or `apple` and applies to every command that selects a container runtime (`up`, `build`, `shell`, `exec`, `status`, `down`, `forward`, and `open`). Removing it leaves no stale state and restores the same automatic runtime selection used by a fresh install.
+`defaultRuntime` is a `dev` preference stored in this same base config file, not a separate runtime config. It accepts `docker`, `podman`, or `apple` and applies to every command that selects a container runtime (`up`, `build`, `shell`, `exec`, `status`, `down`, `forward`, `open`, and recipe-project `config`). Removing it leaves no stale state and restores the same automatic runtime selection used by a fresh install. `--no-base` skips base devcontainer settings for `up` and `build`; it does not disable `defaultRuntime`, because runtime selection happens before the effective devcontainer config is loaded.
 
 ### Global templates
 
