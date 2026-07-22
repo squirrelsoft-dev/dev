@@ -81,6 +81,11 @@ pub struct ContainerConfig {
     /// Equal to the workspace mount target unless the config selects a
     /// subdirectory of it.
     pub workspace_folder: Option<String>,
+    /// Leftover raw `runArgs` after variable substitution. Now always empty:
+    /// the supported subset of `runArgs` is translated into create-time fields
+    /// by `devcontainer::run_args` before container creation, and every other
+    /// flag is rejected (issue #5 — `runArgs` used to be silently dropped).
+    /// Retained so the struct stays a plain data bag the runtime tests build.
     #[allow(dead_code)]
     pub extra_args: Vec<String>,
     pub entrypoint: Option<String>,
@@ -92,6 +97,8 @@ pub struct ContainerConfig {
     pub cap_add: Vec<String>,
     /// Security options (--security-opt).
     pub security_opt: Vec<String>,
+    /// User namespace mode (--userns).
+    pub userns_mode: Option<String>,
 }
 
 #[derive(Debug, Clone)]

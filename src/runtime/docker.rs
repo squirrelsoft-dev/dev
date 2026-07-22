@@ -416,6 +416,7 @@ impl BollardRuntime {
             } else {
                 Some(config.security_opt.clone())
             },
+            userns_mode: config.userns_mode.clone(),
             ..Default::default()
         };
 
@@ -1162,6 +1163,7 @@ mod tests {
             privileged: false,
             cap_add: vec![],
             security_opt: vec![],
+            userns_mode: None,
         }
     }
 
@@ -1190,6 +1192,69 @@ mod tests {
     fn create_body_leaves_working_dir_unset_without_a_workspace_folder() {
         let body = BollardRuntime::to_create_body(&container_config(None));
         assert_eq!(body.working_dir, None);
+    }
+
+    /// The env map `dev up` assembles — `containerEnv`/`remoteEnv` plus the
+    /// `runArgs` environment inputs (env-file/`--env`/`-e`) — must reach the
+    /// bollard create request as `KEY=VALUE` strings. This is create-body
+    /// coverage, not a live-daemon integration test.
+    #[test]
+    fn create_body_carries_env_entries_as_key_value_strings() {
+        let mut cfg = container_config(None);
+        cfg.env.insert("FROM_FILE".to_string(), "true".to_string());
+        cfg.env.insert("FROM_FLAG".to_string(), "yes".to_string());
+        cfg.env.insert("EMPTY".to_string(), String::new());
+
+        let body = BollardRuntime::to_create_body(&cfg);
+        let env = body.env.expect("env should be set on the create body");
+
+        assert!(
+            env.iter().any(|e| e == "FROM_FILE=true"),
+            "env-file entry must reach the daemon body, got {env:?}"
+        );
+        assert!(
+            env.iter().any(|e| e == "FROM_FLAG=yes"),
+            "--env flag entry must reach the daemon body, got {env:?}"
+        );
+        assert!(
+            env.iter().any(|e| e == "EMPTY="),
+            "empty-valued env entry must reach the daemon body, got {env:?}"
+        );
+    }
+
+    /// Runtime-option runArgs are translated into existing `ContainerConfig`
+    /// fields and then into the bollard HostConfig. This pins the shared
+    /// Docker/Podman create-body conversion seam without claiming daemon-level
+    /// execution.
+    #[test]
+    fn create_body_carries_runtime_option_fields() {
+        let mut cfg = container_config(None);
+        cfg.cap_add = vec!["SYS_PTRACE".to_string(), "NET_ADMIN".to_string()];
+        cfg.security_opt = vec![
+            "seccomp=unconfined".to_string(),
+            "label=disable".to_string(),
+        ];
+        cfg.privileged = true;
+        cfg.init = true;
+        cfg.userns_mode = Some("keep-id".to_string());
+
+        let body = BollardRuntime::to_create_body(&cfg);
+        let host = body.host_config.expect("host config should be set");
+
+        assert_eq!(
+            host.cap_add,
+            Some(vec!["SYS_PTRACE".to_string(), "NET_ADMIN".to_string()])
+        );
+        assert_eq!(
+            host.security_opt,
+            Some(vec![
+                "seccomp=unconfined".to_string(),
+                "label=disable".to_string()
+            ])
+        );
+        assert_eq!(host.privileged, Some(true));
+        assert_eq!(host.init, Some(true));
+        assert_eq!(host.userns_mode.as_deref(), Some("keep-id"));
     }
 
     fn server_error(message: &str) -> DevError {

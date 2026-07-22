@@ -162,10 +162,15 @@ Higher-priority layers override lower ones, with behavior depending on the field
 | Field type | Merge strategy | Examples |
 |-----------|----------------|----------|
 | Scalar | Higher priority wins | `image`, `remoteUser`, `name` |
-| Array | Concatenate (deduplicated) | `mounts`, `forwardPorts`, `runArgs` |
+| Array | Concatenate (deduplicated) | `mounts`, `forwardPorts` |
+| Array | Concatenate (order preserved, not deduplicated) | `runArgs` |
 | Map | Merge (higher priority keys win) | `remoteEnv`, `containerEnv` |
 | Features | Union (all features combined) | `features` |
 | Lifecycle commands | Named-command objects union (higher priority wins per name); string and array forms follow scalar rules | `postCreateCommand`, `onCreateCommand` |
+
+`runArgs` is not deduplicated because repeated flags such as `--env-file` are
+legitimate and their left-to-right order is semantically meaningful (see
+[runArgs support](#runargs-support) below).
 
 **Selector precedence.** Whichever of `image`, `build`, or `dockerComposeFile` a project's own `.devcontainer/devcontainer.json` declares is authoritative: competing selectors from lower layers are dropped, not merged — so a base config `image` cannot turn a `build`- or compose-based project into an image-based one. A recipe project has no `devcontainer.json`, so the same rule applies to the highest layer that declares a selector (recipe overrides, then runtime, then base). `dev config set image` on a recipe therefore drops a `build` inherited from the global template.
 
@@ -223,6 +228,131 @@ dev up --runtime apple
 ```
 
 Docker Compose (`dockerComposeFile`) is supported for the full lifecycle — build, up, down, shell, exec, features, UID remapping — and uses `docker compose` or `podman compose` depending on the selected runtime.
+
+## runArgs support
+
+`devcontainer.json`'s `runArgs` is a list of Docker/Podman `run` flags. `dev`
+does not shell out to `docker run`, so it cannot pass arbitrary CLI flags
+through to the daemon. Instead it translates a supported subset of `runArgs`
+into existing container-create fields for the image-based Docker/Podman path,
+and rejects every other flag *before* host lifecycle commands, image builds,
+lockfile writes, existing-container reuse, or container creation with an
+actionable error. Docker Compose (`dockerComposeFile`) has no global
+container-create argument channel. If a project declares non-empty `runArgs`,
+`dev` fails with Compose service-definition guidance; inherited base/runtime
+`runArgs` are ignored on Compose so lower-layer Docker/Podman defaults do not
+break unrelated Compose projects. (See
+[issue #5](https://github.com/squirrelsoft-dev/dev/issues/5):
+previously every `runArg` was parsed and then dropped.)
+
+### Supported flags
+
+| Flag | Forms accepted | Translates to |
+|------|----------------|---------------|
+| `--env-file` | `--env-file PATH`, `--env-file=PATH` | env entries read from the file |
+| `--env` | `--env KEY=VALUE`, `--env=KEY=VALUE` | a `KEY=VALUE` env entry |
+| `-e` | `-e KEY=VALUE`, `-eKEY=VALUE` | a `KEY=VALUE` env entry |
+| `--cap-add` | `--cap-add VALUE`, `--cap-add=VALUE` | HostConfig `CapAdd` entries |
+| `--security-opt` | `--security-opt VALUE`, `--security-opt=VALUE` | HostConfig `SecurityOpt` entries |
+| `--userns` | `--userns VALUE`, `--userns=VALUE` | HostConfig `UsernsMode`; last value wins |
+| `--privileged` | `--privileged` only | HostConfig `Privileged=true` |
+| `--init` | `--init` only | HostConfig `Init=true` |
+
+Repeated env files, env flags, capabilities, and security options are
+preserved; repeated duplicate capabilities/security options are sent once in
+stable order after feature-contributed values. Boolean assignments such as
+`--init=true` and `--privileged=false` are rejected; use the bare flag. For
+value-taking two-token forms, the next token must be a non-empty value, not
+another flag.
+
+Apple Containers supports only the environment subset (`--env-file`, `--env`,
+and `-e`). Runtime options such as `--cap-add`, `--security-opt`, `--userns`,
+`--privileged`, and `--init` fail before side effects when `--runtime apple` or
+`defaultRuntime: "apple"` selects Apple.
+
+### The reporter's configuration
+
+This is the exact configuration from issue #5, and it now works on both Docker
+and Podman:
+
+```json
+"runArgs": ["--env-file", "${localWorkspaceFolder}/.devcontainer/.env"]
+```
+
+`${localWorkspaceFolder}` is substituted *before* the file is opened, so the
+path resolves against the workspace just as it does in your editor.
+
+On versions before this fix, the direct workaround for issue #5 is to move the
+values into `containerEnv` or start the container through an editor/Docker CLI
+path that already honors `runArgs`.
+
+### Env-file format
+
+Env files are parsed with Docker-compatible behavior (matching `docker/cli`'s
+`pkg/kvfile`):
+
+- the file must be valid UTF-8 (a leading UTF-8 BOM is tolerated);
+- leading whitespace is trimmed on each line; **trailing whitespace is part of
+  the value** and kept;
+- blank lines and lines whose first non-blank character is `#` are ignored;
+- `KEY=VALUE` keeps the value verbatim — there is **no quoting, interpolation,
+  or escaping** (quotes are part of the value);
+- a bare env-file `KEY` (no `=`) passes the host environment variable through:
+  if it is set on the host it becomes `KEY=value`, and if it is unset the key
+  is **omitted** rather than invented as an empty value;
+- a key may not be empty or contain whitespace.
+
+Relative env-file paths resolve against the workspace folder — the `dev`
+equivalent of the directory `docker run` is invoked from.
+
+For `--env KEY` / `-e KEY`, Dev uses the host value when `KEY` is set. If it is
+unset, Dev fails with a precise error instead of forwarding a bare key, because
+the daemon API path cannot safely represent Docker CLI's "explicitly unset this
+key" behavior without accidentally leaving an image-provided value in place.
+
+### Precedence
+
+Environment is applied in this order, with the last value for a key winning:
+
+1. the image's own environment (lowest);
+2. `dev`'s effective `containerEnv` overlays it;
+3. Dev's current create-time `remoteEnv` layer overlays `containerEnv`;
+4. all `--env-file` entries from `runArgs`, in their relative order;
+5. all explicit `--env`/`-e` entries from `runArgs`, in their relative order.
+
+This matches Docker CLI precedence for env files and explicit env flags:
+explicit `--env`/`-e` entries override duplicate env-file values even if the
+flag appears before the file in `runArgs`. `remoteEnv` is documented here as
+Dev's current create-time behavior; changing that is outside this issue.
+
+### Failure behavior
+
+A missing, unreadable, malformed, or non-UTF-8 env file fails before container
+creation with an error naming the file path and the offending line number. The
+error never includes env-file contents or secret values — only the variable
+**name** (which is not a secret) and the line number.
+
+### Workaround for unsupported flags
+
+If you need a flag `dev` does not yet translate, use the equivalent
+first-class devcontainer property where one exists. Common mappings:
+
+| `runArgs` flag | First-class devcontainer property |
+|----------------|-----------------------------------|
+| `--network` | (no equivalent yet — file an issue) |
+| `--add-host` | (no equivalent yet — file an issue) |
+| `--cap-add` | supported directly in `runArgs` |
+| `--security-opt` | supported directly in `runArgs` |
+| `--userns` | supported directly in `runArgs` on Docker/Podman image-based containers |
+| `--privileged` | supported directly in `runArgs` |
+| `--init` | supported directly in `runArgs` |
+| `--publish` | `forwardPorts` |
+| `--volume` / `--mount` | `mounts` / `volumes` |
+
+For Docker Compose projects, put equivalents directly on the configured
+Compose service, for example `init: true`, `privileged: true`, `cap_add`,
+`security_opt`, or service-specific namespace/network settings where your
+Compose implementation supports them.
 
 ## Local `.test` domains
 
