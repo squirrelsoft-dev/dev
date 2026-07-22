@@ -964,7 +964,10 @@ impl OutputReaders {
     /// What both readers read, once each has reached EOF.
     async fn collected(self) -> Result<(String, String), DevError> {
         let (stdout, stderr) = tokio::join!(self.stdout, self.stderr);
-        Ok((finish_read(stdout, "stdout")?, finish_read(stderr, "stderr")?))
+        Ok((
+            finish_read(stdout, "stdout")?,
+            finish_read(stderr, "stderr")?,
+        ))
     }
 
     /// Cancel both readers and wait for them to let go of the pipes.
@@ -1676,9 +1679,8 @@ mod tests {
                 .flatten()
                 .any(|end| {
                     let byte = 0u8;
-                    let written = unsafe {
-                        libc::write(end.as_raw_fd(), std::ptr::addr_of!(byte).cast(), 1)
-                    };
+                    let written =
+                        unsafe { libc::write(end.as_raw_fd(), std::ptr::addr_of!(byte).cast(), 1) };
                     written == 1
                 })
         }
@@ -2124,7 +2126,11 @@ mod tests {
             .await
             .expect("an accepted stop must succeed");
 
-        assert_eq!(daemon.attempts(), 1, "a stop that worked must not be redone");
+        assert_eq!(
+            daemon.attempts(),
+            1,
+            "a stop that worked must not be redone"
+        );
     }
 
     // ---- issue #4 regression coverage: an undecodable containerList entry

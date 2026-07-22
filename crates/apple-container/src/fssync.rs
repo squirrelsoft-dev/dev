@@ -826,11 +826,13 @@ mod tests {
     #[test]
     fn an_absent_or_empty_filter_selects_everything() {
         assert!(ContextFilter::from_metadata(&metadata(&[])).is_unfiltered());
-        assert!(ContextFilter::from_metadata(&metadata(&[
-            ("followpaths", ""),
-            ("include-patterns", "")
-        ]))
-        .is_unfiltered());
+        assert!(
+            ContextFilter::from_metadata(&metadata(&[
+                ("followpaths", ""),
+                ("include-patterns", "")
+            ]))
+            .is_unfiltered()
+        );
         assert!(ContextFilter::default().matches_file("anything/at/all"));
     }
 
