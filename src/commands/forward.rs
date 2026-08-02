@@ -139,7 +139,7 @@ fn remove_keepalive(workspace: &Path, host_port: u16) {
 }
 
 /// Collect active port entries (with custom names) for this workspace.
-fn active_entries_for_workspace(workspace: &Path) -> Vec<crate::caddy::PortEntry> {
+pub(crate) fn active_entries_for_workspace(workspace: &Path) -> Vec<crate::caddy::PortEntry> {
     let dir = forward_dir();
     let prefix = workspace_hash(workspace);
     let mut entries = Vec::new();
