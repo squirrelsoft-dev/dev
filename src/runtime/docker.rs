@@ -188,6 +188,34 @@ fn recorded_exit_code(running: Option<bool>, exit_code: Option<i64>) -> Option<i
     exit_code.map(|code| code as i32)
 }
 
+/// Parse a `--device` value into a bollard `DeviceMapping`. Accepts the bare
+/// path form (`/dev/ttyACM0`), `host:container`, and `host:container:perms`.
+fn parse_device_mapping(spec: &str) -> bollard::models::DeviceMapping {
+    let parts: Vec<&str> = spec.split(':').collect();
+    match parts.as_slice() {
+        [host, container, perms] => bollard::models::DeviceMapping {
+            path_on_host: Some(host.to_string()),
+            path_in_container: Some(container.to_string()),
+            cgroup_permissions: Some(perms.to_string()),
+        },
+        [host, container] => bollard::models::DeviceMapping {
+            path_on_host: Some(host.to_string()),
+            path_in_container: Some(container.to_string()),
+            cgroup_permissions: None,
+        },
+        [path] => bollard::models::DeviceMapping {
+            path_on_host: Some(path.to_string()),
+            path_in_container: Some(path.to_string()),
+            cgroup_permissions: None,
+        },
+        _ => bollard::models::DeviceMapping {
+            path_on_host: Some(spec.to_string()),
+            path_in_container: Some(spec.to_string()),
+            cgroup_permissions: None,
+        },
+    }
+}
+
 impl BollardRuntime {
     /// Connect to a specific socket path.
     pub fn connect_to_socket(socket: &str) -> Result<Self, DevError> {
@@ -417,6 +445,22 @@ impl BollardRuntime {
                 Some(config.security_opt.clone())
             },
             userns_mode: config.userns_mode.clone(),
+            devices: if config.devices.is_empty() {
+                None
+            } else {
+                Some(
+                    config
+                        .devices
+                        .iter()
+                        .map(|d| parse_device_mapping(d))
+                        .collect(),
+                )
+            },
+            group_add: if config.group_add.is_empty() {
+                None
+            } else {
+                Some(config.group_add.clone())
+            },
             ..Default::default()
         };
 
@@ -1213,6 +1257,8 @@ mod tests {
             cap_add: vec![],
             security_opt: vec![],
             userns_mode: None,
+            devices: vec![],
+            group_add: vec![],
         }
     }
 
@@ -1268,6 +1314,33 @@ mod tests {
         assert!(
             env.iter().any(|e| e == "EMPTY="),
             "empty-valued env entry must reach the daemon body, got {env:?}"
+        );
+    }
+
+    /// `--device` and `--group-add` runArgs must reach the bollard create body
+    /// as `HostConfig.devices` and `HostConfig.group_add`.
+    #[test]
+    fn create_body_carries_devices_and_group_add() {
+        let mut cfg = container_config(None);
+        cfg.devices = vec!["/dev/ttyACM0".to_string(), "/dev/bus/usb".to_string()];
+        cfg.group_add = vec!["plugdev".to_string()];
+
+        let body = BollardRuntime::to_create_body(&cfg);
+        let host = body.host_config.expect("host config should be set");
+
+        let devices = host.devices.expect("devices should be set");
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0].path_on_host.as_deref(), Some("/dev/ttyACM0"));
+        assert_eq!(
+            devices[0].path_in_container.as_deref(),
+            Some("/dev/ttyACM0")
+        );
+        assert_eq!(devices[1].path_on_host.as_deref(), Some("/dev/bus/usb"));
+
+        assert_eq!(
+            host.group_add,
+            Some(vec!["plugdev".to_string()]),
+            "group_add must reach the daemon body"
         );
     }
 

@@ -15,6 +15,9 @@
 //! - `--cap-add VALUE`, `--cap-add=VALUE`
 //! - `--security-opt VALUE`, `--security-opt=VALUE`
 //! - `--userns VALUE`, `--userns=VALUE`
+//! - `--device VALUE`, `--device=VALUE`
+//! - `--group-add VALUE`, `--group-add=VALUE`
+//! - `--name VALUE`, `--name=VALUE`
 //! - bare `--privileged` and `--init`
 //!
 //! ## Environment precedence (last value for a key wins)
@@ -59,6 +62,12 @@ pub struct ResolvedRunArgs {
     pub privileged: bool,
     pub init: bool,
     pub userns_mode: Option<String>,
+    /// `--device` entries, passed through to the container create call.
+    pub devices: Vec<String>,
+    /// `--group-add` entries, passed through to the container create call.
+    pub group_add: Vec<String>,
+    /// `--name` override for the container name.
+    pub name: Option<String>,
 }
 
 /// Validate and translate the supported `runArgs` subset into the existing
@@ -117,6 +126,25 @@ pub fn resolve_run_args(args: &[String], workspace: &Path) -> Result<ResolvedRun
         } else if arg == "--userns" {
             let value = next_value(args, &mut i, arg, "--userns")?;
             resolved.userns_mode = Some(value);
+        } else if let Some(value) = arg.strip_prefix("--device=") {
+            resolved
+                .devices
+                .push(non_empty_inline_value(arg, value, "--device")?.to_string());
+        } else if arg == "--device" {
+            let value = next_value(args, &mut i, arg, "--device")?;
+            resolved.devices.push(value);
+        } else if let Some(value) = arg.strip_prefix("--group-add=") {
+            resolved
+                .group_add
+                .push(non_empty_inline_value(arg, value, "--group-add")?.to_string());
+        } else if arg == "--group-add" {
+            let value = next_value(args, &mut i, arg, "--group-add")?;
+            resolved.group_add.push(value);
+        } else if let Some(value) = arg.strip_prefix("--name=") {
+            resolved.name = Some(non_empty_inline_value(arg, value, "--name")?.to_string());
+        } else if arg == "--name" {
+            let value = next_value(args, &mut i, arg, "--name")?;
+            resolved.name = Some(value);
         } else if arg == "--privileged" {
             resolved.privileged = true;
         } else if arg.starts_with("--privileged=") {
@@ -583,6 +611,43 @@ mod tests {
     }
 
     #[test]
+    fn device_group_add_and_name_flags_are_parsed() {
+        let ws = PathBuf::from("/ws");
+        let args: Vec<String> = [
+            "--device=/dev/ttyACM0",
+            "--device",
+            "/dev/bus/usb",
+            "--group-add=plugdev",
+            "--group-add",
+            "dialout",
+            "--name",
+            "my-container",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let resolved = super::resolve_run_args(&args, &ws).unwrap();
+
+        assert_eq!(resolved.devices, vec!["/dev/ttyACM0", "/dev/bus/usb"]);
+        assert_eq!(resolved.group_add, vec!["plugdev", "dialout"]);
+        assert_eq!(resolved.name.as_deref(), Some("my-container"));
+    }
+
+    #[test]
+    fn device_group_add_and_name_reject_empty_values() {
+        let ws = PathBuf::from("/ws");
+        for flag in ["--device=", "--group-add=", "--name="] {
+            let err = super::resolve_run_args(&[flag.to_string()], &ws).unwrap_err();
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("non-empty"),
+                "{flag} should require a non-empty value, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
     fn value_taking_flags_reject_another_flag_as_their_missing_value() {
         let ws = PathBuf::from("/ws");
         for (flag, next) in [
@@ -592,6 +657,9 @@ mod tests {
             ("--cap-add", "--init"),
             ("--security-opt", "--init"),
             ("--userns", "--init"),
+            ("--device", "--init"),
+            ("--group-add", "--init"),
+            ("--name", "--init"),
         ] {
             let err =
                 super::resolve_run_args(&[flag.to_string(), next.to_string()], &ws).unwrap_err();

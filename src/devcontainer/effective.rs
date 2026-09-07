@@ -19,6 +19,19 @@ pub(crate) struct EffectiveConfig {
     pub(crate) config: DevcontainerConfig,
     /// Feature ids the base layer contributed that the project does not declare.
     pub(crate) base_feature_ids: HashSet<String>,
+    /// Content hash of the effective config value (base + project + CLI). Used
+    /// to detect config drift against a running container's stored fingerprint.
+    pub(crate) config_hash: String,
+}
+
+/// A stable content hash of an effective config value. `serde_json::Map` is a
+/// `BTreeMap` (no `preserve_order`), so serialization is key-sorted and
+/// deterministic across runs.
+fn config_hash(value: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(serde_json::to_string(value).unwrap_or_default().as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 pub(crate) fn load_effective_config(
@@ -28,11 +41,13 @@ pub(crate) fn load_effective_config(
     let base_path = base_config_dir().join("devcontainer.json");
     let (value, base_feature_ids) =
         load_effective_config_value(config_path, include_base, &base_path)?;
+    let config_hash = config_hash(&value);
     let config = serde_json::from_value(value)
         .map_err(|e| DevError::InvalidConfig(format!("Failed to parse merged config: {e}")))?;
     Ok(EffectiveConfig {
         config,
         base_feature_ids,
+        config_hash,
     })
 }
 
@@ -46,11 +61,13 @@ pub(crate) fn effective_config_from_parts(
     value: Value,
     base_feature_ids: HashSet<String>,
 ) -> anyhow::Result<EffectiveConfig> {
+    let config_hash = config_hash(&value);
     let config = serde_json::from_value(value)
         .map_err(|e| DevError::InvalidConfig(format!("Failed to parse composed config: {e}")))?;
     Ok(EffectiveConfig {
         config,
         base_feature_ids,
+        config_hash,
     })
 }
 
@@ -216,6 +233,37 @@ pub(crate) fn absolutize_config_paths(base: &mut Value, base_dir: &Path) {
                 _ => {}
             }
         }
+    }
+
+    // `initializeCommand` runs on the host with the workspace as cwd, so a
+    // base-contributed relative host script must resolve against the base
+    // config directory rather than the project workspace. Handles the string,
+    // array, and named-object (parallel) forms the spec allows.
+    match obj.get_mut("initializeCommand") {
+        Some(Value::String(cmd)) => {
+            if let Some(abs) = resolve_local_ref(cmd, base_dir) {
+                obj.insert("initializeCommand".to_string(), Value::String(abs));
+            }
+        }
+        Some(Value::Array(cmds)) => {
+            for cmd in cmds.iter_mut() {
+                if let Value::String(c) = cmd
+                    && let Some(abs) = resolve_local_ref(c, base_dir)
+                {
+                    *cmd = Value::String(abs);
+                }
+            }
+        }
+        Some(Value::Object(named)) => {
+            for value in named.values_mut() {
+                if let Value::String(c) = value
+                    && let Some(abs) = resolve_local_ref(c, base_dir)
+                {
+                    *value = Value::String(abs);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -815,12 +863,18 @@ mod tests {
                 "mounts": [
                     "source=./cache,target=/cache,type=bind",
                     "source=named-volume,target=/data,type=volume"
-                ]
+                ],
+                "initializeCommand": "./setup.sh"
             }"#,
         );
         let base_dir = base_path.parent().unwrap();
 
         let value = effective_value(&config_path, true, &base_path);
+
+        assert_eq!(
+            value["initializeCommand"],
+            base_dir.join("./setup.sh").to_string_lossy().as_ref()
+        );
 
         assert_eq!(
             value["build"]["dockerfile"],
@@ -913,6 +967,69 @@ mod tests {
         assert_eq!(
             value["mounts"][0],
             format!("{}:/cache", base_dir.join("./cache").to_string_lossy())
+        );
+    }
+
+    #[test]
+    fn initialize_command_array_and_object_forms_are_rebased() {
+        let workspace = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let config_path = write_project_config(&workspace, r#"{"image": "ubuntu:24.04"}"#);
+        let base_path = write_base_config(
+            &home,
+            r#"{
+                "initializeCommand": ["./a.sh", "./b.sh"]
+            }"#,
+        );
+        let base_dir = base_path.parent().unwrap();
+
+        let value = effective_value(&config_path, true, &base_path);
+
+        assert_eq!(
+            value["initializeCommand"][0],
+            base_dir.join("./a.sh").to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            value["initializeCommand"][1],
+            base_dir.join("./b.sh").to_string_lossy().as_ref()
+        );
+
+        // Named-object (parallel) form.
+        let base_path = write_base_config(
+            &home,
+            r#"{
+                "initializeCommand": {"setup": "./setup.sh", "other": "echo hi"}
+            }"#,
+        );
+        let value = effective_value(&config_path, true, &base_path);
+        assert_eq!(
+            value["initializeCommand"]["setup"],
+            base_dir.join("./setup.sh").to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            value["initializeCommand"]["other"], "echo hi",
+            "non-relative commands must be left untouched"
+        );
+    }
+
+    #[test]
+    fn initialize_command_absolute_and_variable_are_untouched() {
+        let workspace = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let config_path = write_project_config(&workspace, r#"{"image": "ubuntu:24.04"}"#);
+        let base_path = write_base_config(
+            &home,
+            r#"{
+                "initializeCommand": ["/abs/setup.sh", "${localWorkspaceFolder}/setup.sh"]
+            }"#,
+        );
+
+        let value = effective_value(&config_path, true, &base_path);
+
+        assert_eq!(value["initializeCommand"][0], "/abs/setup.sh");
+        assert_eq!(
+            value["initializeCommand"][1],
+            "${localWorkspaceFolder}/setup.sh"
         );
     }
 

@@ -99,6 +99,10 @@ pub struct ContainerConfig {
     pub security_opt: Vec<String>,
     /// User namespace mode (--userns).
     pub userns_mode: Option<String>,
+    /// Host devices to expose (--device).
+    pub devices: Vec<String>,
+    /// Additional groups to add (--group-add).
+    pub group_add: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
