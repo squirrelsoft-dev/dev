@@ -87,6 +87,7 @@ async fn run() -> anyhow::Result<()> {
             update_remote_user_uid_default,
             port_overrides,
             no_base,
+            reuse,
         } => {
             commands::up::run(
                 &workspace,
@@ -99,6 +100,7 @@ async fn run() -> anyhow::Result<()> {
                 &update_remote_user_uid_default,
                 &port_overrides,
                 no_base,
+                reuse,
             )
             .await?;
         }

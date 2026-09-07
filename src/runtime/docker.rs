@@ -6,6 +6,7 @@ use bollard::query_parameters::{
     ListContainersOptions, RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
 };
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::Path;
 use tokio::io::AsyncWriteExt;
 
@@ -186,6 +187,34 @@ fn recorded_exit_code(running: Option<bool>, exit_code: Option<i64>) -> Option<i
         return None;
     }
     exit_code.map(|code| code as i32)
+}
+
+/// Parse a `--device` value into a bollard `DeviceMapping`. Accepts the bare
+/// path form (`/dev/ttyACM0`), `host:container`, and `host:container:perms`.
+fn parse_device_mapping(spec: &str) -> bollard::models::DeviceMapping {
+    let parts: Vec<&str> = spec.split(':').collect();
+    match parts.as_slice() {
+        [host, container, perms] => bollard::models::DeviceMapping {
+            path_on_host: Some(host.to_string()),
+            path_in_container: Some(container.to_string()),
+            cgroup_permissions: Some(perms.to_string()),
+        },
+        [host, container] => bollard::models::DeviceMapping {
+            path_on_host: Some(host.to_string()),
+            path_in_container: Some(container.to_string()),
+            cgroup_permissions: None,
+        },
+        [path] => bollard::models::DeviceMapping {
+            path_on_host: Some(path.to_string()),
+            path_in_container: Some(path.to_string()),
+            cgroup_permissions: None,
+        },
+        _ => bollard::models::DeviceMapping {
+            path_on_host: Some(spec.to_string()),
+            path_in_container: Some(spec.to_string()),
+            cgroup_permissions: None,
+        },
+    }
 }
 
 impl BollardRuntime {
@@ -417,6 +446,22 @@ impl BollardRuntime {
                 Some(config.security_opt.clone())
             },
             userns_mode: config.userns_mode.clone(),
+            devices: if config.devices.is_empty() {
+                None
+            } else {
+                Some(
+                    config
+                        .devices
+                        .iter()
+                        .map(|d| parse_device_mapping(d))
+                        .collect(),
+                )
+            },
+            group_add: if config.group_add.is_empty() {
+                None
+            } else {
+                Some(config.group_add.clone())
+            },
             ..Default::default()
         };
 
@@ -631,11 +676,15 @@ impl BollardRuntime {
             // Writing to cancel_writer causes the poll() in the reader to
             // wake up and exit cleanly, avoiding a stuck blocking thread that
             // would prevent the tokio runtime from shutting down.
-            let (cancel_reader, cancel_writer) =
+            let (cancel_reader, mut cancel_writer) =
                 os_pipe::pipe().map_err(|e| DevError::Runtime(format!("pipe: {e}")))?;
 
             // Channel to bridge blocking stdin reads → async container writes.
             let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+            // Signals when the blocking stdin reader thread has fully exited, so
+            // the cleanup can wait on it with a bounded timeout instead of
+            // joining a thread that may be stuck (issue #32).
+            let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
 
             // Blocking stdin reader using poll() so it can be cancelled.
             let stdin_reader_handle = std::thread::spawn(move || {
@@ -658,6 +707,13 @@ impl BollardRuntime {
                     ];
                     let ready = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
                     if ready < 0 {
+                        // A terminal resize delivers SIGWINCH, which can make
+                        // poll return -1 with EINTR. Retry rather than exiting
+                        // the reader (issue #41), or input freezes on resize.
+                        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                        {
+                            continue;
+                        }
                         break;
                     }
                     if pfds[1].revents & libc::POLLIN != 0 {
@@ -676,6 +732,7 @@ impl BollardRuntime {
                         }
                     }
                 }
+                let _ = done_tx.send(());
             });
 
             // Async task that forwards channel data to the container stdin.
@@ -738,10 +795,20 @@ impl BollardRuntime {
             }
 
             // Signal the blocking stdin reader to exit, then clean up.
+            // Abort the stdin writer first so its channel closes and a reader
+            // blocked in `blocking_send` is unblocked; then wake a reader
+            // blocked in `poll()` by writing to the cancel pipe (closing it
+            // also works, but an explicit write is unambiguous). This is the
+            // issue #32 fix: without it, `dev shell` can hang on exit when the
+            // exec stream ends but the stdin reader never wakes.
+            stdin_abort.abort();
+            let _ = cancel_writer.write(&[1]);
             drop(cancel_writer);
+            // Wait for the reader to exit, but never hang `dev shell` on a
+            // stuck thread (issue #32).
+            let _ = done_rx.recv_timeout(std::time::Duration::from_secs(2));
             let _ = stdin_reader_handle.join();
 
-            stdin_abort.abort();
             output_abort.abort();
             monitor_abort.abort();
             sigwinch_abort.abort();
@@ -1213,6 +1280,8 @@ mod tests {
             cap_add: vec![],
             security_opt: vec![],
             userns_mode: None,
+            devices: vec![],
+            group_add: vec![],
         }
     }
 
@@ -1268,6 +1337,33 @@ mod tests {
         assert!(
             env.iter().any(|e| e == "EMPTY="),
             "empty-valued env entry must reach the daemon body, got {env:?}"
+        );
+    }
+
+    /// `--device` and `--group-add` runArgs must reach the bollard create body
+    /// as `HostConfig.devices` and `HostConfig.group_add`.
+    #[test]
+    fn create_body_carries_devices_and_group_add() {
+        let mut cfg = container_config(None);
+        cfg.devices = vec!["/dev/ttyACM0".to_string(), "/dev/bus/usb".to_string()];
+        cfg.group_add = vec!["plugdev".to_string()];
+
+        let body = BollardRuntime::to_create_body(&cfg);
+        let host = body.host_config.expect("host config should be set");
+
+        let devices = host.devices.expect("devices should be set");
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0].path_on_host.as_deref(), Some("/dev/ttyACM0"));
+        assert_eq!(
+            devices[0].path_in_container.as_deref(),
+            Some("/dev/ttyACM0")
+        );
+        assert_eq!(devices[1].path_on_host.as_deref(), Some("/dev/bus/usb"));
+
+        assert_eq!(
+            host.group_add,
+            Some(vec!["plugdev".to_string()]),
+            "group_add must reach the daemon body"
         );
     }
 

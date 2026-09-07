@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -7,11 +8,13 @@ use serde_json::Value;
 use crate::cli::ConfigAction;
 use crate::collection::{fetch_all_features, fetch_collection_index};
 use crate::devcontainer::compose::compose_recipe_config;
+use crate::devcontainer::effective::load_effective_config_value;
 use crate::devcontainer::recipe::Recipe;
 use crate::runtime::{
     ACCEPTED_RUNTIME_VALUES, DEFAULT_RUNTIME_PROPERTY, RuntimeName, detect_runtime,
 };
 use crate::tui::prompts;
+use crate::util::paths::base_config_dir;
 use crate::util::workspace::{ConfigSource, find_config_source};
 
 /// Tracks where config changes should be written.
@@ -111,7 +114,7 @@ async fn run_with_target(
         Some(ConfigAction::Unset { property }) => config_unset(target, &property),
         Some(ConfigAction::Add { property, value }) => config_add(target, &property, &value),
         Some(ConfigAction::Remove { property, value }) => config_remove(target, &property, &value),
-        Some(ConfigAction::List) => config_list(target),
+        Some(ConfigAction::List { show_origin }) => config_list(target, show_origin),
         None => interactive(target, verbose).await,
     }
 }
@@ -167,6 +170,29 @@ fn read_target_config(target: &ConfigTarget<'_>) -> anyhow::Result<Value> {
         .config_path
         .ok_or_else(|| anyhow::anyhow!("No devcontainer.json path for config target"))?;
     read_config(path)
+}
+
+/// The effective (base + project) config value, mirroring what `dev up` builds
+/// from. Recipe targets already carry the composed value; direct targets merge
+/// the base layer in memory.
+fn effective_config_value(target: &ConfigTarget<'_>) -> anyhow::Result<Value> {
+    effective_config_value_with_base(target, &base_config_dir().join("devcontainer.json"))
+}
+
+/// [`effective_config_value`] with an explicit base path, so tests can drive the
+/// merge against a temporary base config without touching the real `~/.dev/`.
+fn effective_config_value_with_base(
+    target: &ConfigTarget<'_>,
+    base_path: &Path,
+) -> anyhow::Result<Value> {
+    if let Some(value) = &target.config_value {
+        return Ok(value.clone());
+    }
+    let path = target
+        .config_path
+        .ok_or_else(|| anyhow::anyhow!("No devcontainer.json path for config target"))?;
+    let (value, _) = load_effective_config_value(path, true, base_path)?;
+    Ok(value)
 }
 
 fn write_target_config(target: &ConfigTarget<'_>, json: &Value) -> anyhow::Result<()> {
@@ -485,11 +511,57 @@ fn config_remove(target: &ConfigTarget<'_>, property: &str, value: &str) -> anyh
     Ok(())
 }
 
-fn config_list(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
-    let json = read_target_config(target)?;
+fn config_list(target: &ConfigTarget<'_>, show_origin: bool) -> anyhow::Result<()> {
+    // Git-style: the workspace view shows the effective (base + project) merged
+    // config by default. The base view shows the base config alone.
+    let json = if target.kind == ConfigTargetKind::Base {
+        read_target_config(target)?
+    } else {
+        effective_config_value(target)?
+    };
     let obj = json
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("devcontainer.json is not a JSON object"))?;
+    // `git config --list --show-origin`-style provenance: which layer each key
+    // came from. Only meaningful for the merged workspace view.
+    let origins = if show_origin && target.kind != ConfigTargetKind::Base {
+        Some(config_origins(target)?)
+    } else {
+        None
+    };
+    let origin = |key: &str| -> String {
+        match &origins {
+            Some(o) => format!(
+                "[{}] ",
+                o.keys.get(key).map(String::as_str).unwrap_or("project")
+            ),
+            None => String::new(),
+        }
+    };
+    // Per-element origin for a merged array key, or empty when not annotating.
+    let elem_origin = |key: &str, i: usize| -> String {
+        match &origins {
+            Some(o) => o
+                .array_elements
+                .get(key)
+                .and_then(|v| v.get(i))
+                .map(|s| format!("[{s}] "))
+                .unwrap_or_default(),
+            None => String::new(),
+        }
+    };
+    // Per-key origin for a merged map key, or empty when not annotating.
+    let map_origin = |key: &str, sub: &str| -> String {
+        match &origins {
+            Some(o) => o
+                .map_elements
+                .get(key)
+                .and_then(|m| m.get(sub))
+                .map(|s| format!("[{s}] "))
+                .unwrap_or_default(),
+            None => String::new(),
+        }
+    };
 
     let scalar_keys: Vec<&str> = if target.kind == ConfigTargetKind::Base {
         vec![
@@ -506,7 +578,7 @@ fn config_list(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
     // Scalars
     for key in &scalar_keys {
         if let Some(val) = obj.get(*key) {
-            println!("{key}: {}", format_value(val));
+            println!("{}{key}: {}", origin(key), format_value(val));
         }
     }
 
@@ -514,9 +586,9 @@ fn config_list(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
     if let Some(features) = obj.get("features").and_then(|v| v.as_object())
         && !features.is_empty()
     {
-        println!("features:");
+        println!("{}features:", origin("features"));
         for key in features.keys() {
-            println!("  - {key}");
+            println!("  {}- {key}", map_origin("features", key));
         }
     }
 
@@ -524,8 +596,16 @@ fn config_list(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
     if let Some(ports) = obj.get("forwardPorts").and_then(|v| v.as_array())
         && !ports.is_empty()
     {
-        let ports_str: Vec<String> = ports.iter().map(format_value).collect();
-        println!("forwardPorts: {}", ports_str.join(", "));
+        let ports_str: Vec<String> = ports
+            .iter()
+            .enumerate()
+            .map(|(i, p)| format!("{}{}", elem_origin("forwardPorts", i), format_value(p)))
+            .collect();
+        println!(
+            "{}forwardPorts: {}",
+            origin("forwardPorts"),
+            ports_str.join(", ")
+        );
     }
 
     // Env maps
@@ -533,9 +613,9 @@ fn config_list(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
         if let Some(env) = obj.get(key).and_then(|v| v.as_object())
             && !env.is_empty()
         {
-            println!("{key}:");
+            println!("{}{key}:", origin(key));
             for (k, v) in env {
-                println!("  {k}={}", format_value(v));
+                println!("  {}{k}={}", map_origin(key, k), format_value(v));
             }
         }
     }
@@ -544,9 +624,9 @@ fn config_list(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
     if let Some(mounts) = obj.get("mounts").and_then(|v| v.as_array())
         && !mounts.is_empty()
     {
-        println!("mounts:");
-        for m in mounts {
-            println!("  - {}", format_value(m));
+        println!("{}mounts:", origin("mounts"));
+        for (i, m) in mounts.iter().enumerate() {
+            println!("  {}- {}", elem_origin("mounts", i), format_value(m));
         }
     }
 
@@ -554,13 +634,13 @@ fn config_list(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
     for key in LIFECYCLE_COMMANDS {
         if let Some(val) = obj.get(*key) {
             match val {
-                Value::String(s) => println!("{key}: {s}"),
+                Value::String(s) => println!("{}{key}: {s}", origin(key)),
                 Value::Array(arr) => {
                     let cmds: Vec<String> = arr.iter().map(format_value).collect();
-                    println!("{key}: [{}]", cmds.join(", "));
+                    println!("{}{key}: [{}]", origin(key), cmds.join(", "));
                 }
                 Value::Object(map) => {
-                    println!("{key}:");
+                    println!("{}{key}:", origin(key));
                     for (label, cmd) in map {
                         match cmd {
                             Value::String(s) => println!("  {label}: {s}"),
@@ -572,12 +652,124 @@ fn config_list(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
                         }
                     }
                 }
-                other => println!("{key}: {}", format_value(other)),
+                other => println!("{}{key}: {}", origin(key), format_value(other)),
             }
         }
     }
 
     Ok(())
+}
+
+/// Which layer each top-level key came from: `base`, `project`, or `both`.
+fn config_origins(target: &ConfigTarget<'_>) -> anyhow::Result<ConfigOrigins> {
+    config_origins_with_base(target, &base_config_dir().join("devcontainer.json"))
+}
+
+/// Per-layer provenance for the effective config, mirroring
+/// `git config --list --show-origin` but at element granularity for merged
+/// collections (arrays concatenate, maps merge, so each entry has its own
+/// origin).
+struct ConfigOrigins {
+    /// Top-level key → `base` | `project` | `both`.
+    keys: HashMap<String, String>,
+    /// Array keys (`mounts`, `forwardPorts`, `runArgs`) → per-element origin.
+    array_elements: HashMap<String, Vec<String>>,
+    /// Map keys (`containerEnv`, `remoteEnv`, `features`) → sub-key → origin.
+    map_elements: HashMap<String, HashMap<String, String>>,
+}
+
+/// [`config_origins`] with an explicit base path, so tests can drive the
+/// provenance against a temporary base config without touching the real `~/.dev/`.
+fn config_origins_with_base(
+    target: &ConfigTarget<'_>,
+    base_path: &Path,
+) -> anyhow::Result<ConfigOrigins> {
+    let base = if base_path.is_file() {
+        read_config(base_path).unwrap_or_else(|_| Value::Object(serde_json::Map::new()))
+    } else {
+        Value::Object(serde_json::Map::new())
+    };
+    let project = read_target_config(target)?;
+    let base_obj = base.as_object().cloned().unwrap_or_default();
+    let project_obj = project.as_object().cloned().unwrap_or_default();
+
+    let mut keys = HashMap::new();
+    let mut array_elements = HashMap::new();
+    let mut map_elements = HashMap::new();
+
+    for key in base_obj.keys().chain(project_obj.keys()) {
+        let in_base = base_obj.contains_key(key);
+        let in_project = project_obj.contains_key(key);
+        keys.insert(
+            key.clone(),
+            match (in_base, in_project) {
+                (true, true) => "both".to_string(),
+                (true, false) => "base".to_string(),
+                _ => "project".to_string(),
+            },
+        );
+
+        // Per-element origin for merged collections.
+        if matches!(key.as_str(), "mounts" | "forwardPorts" | "runArgs") {
+            let base_arr = base_obj
+                .get(key)
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let proj_arr = project_obj
+                .get(key)
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let merged = base_arr.iter().chain(proj_arr.iter());
+            let mut seen = std::collections::HashSet::new();
+            let mut origins = Vec::new();
+            for item in merged {
+                if !seen.insert(item.clone()) {
+                    continue;
+                }
+                let in_base = base_arr.contains(item);
+                let in_proj = proj_arr.contains(item);
+                origins.push(match (in_base, in_proj) {
+                    (true, true) => "both".to_string(),
+                    (true, false) => "base".to_string(),
+                    _ => "project".to_string(),
+                });
+            }
+            array_elements.insert(key.clone(), origins);
+        } else if matches!(key.as_str(), "containerEnv" | "remoteEnv" | "features") {
+            let base_map = base_obj
+                .get(key)
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let proj_map = project_obj
+                .get(key)
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let mut sub = HashMap::new();
+            for sub_key in base_map.keys().chain(proj_map.keys()) {
+                let in_base = base_map.contains_key(sub_key);
+                let in_proj = proj_map.contains_key(sub_key);
+                sub.insert(
+                    sub_key.clone(),
+                    match (in_base, in_proj) {
+                        (true, true) => "both".to_string(),
+                        (true, false) => "base".to_string(),
+                        _ => "project".to_string(),
+                    },
+                );
+            }
+            map_elements.insert(key.clone(), sub);
+        }
+    }
+
+    Ok(ConfigOrigins {
+        keys,
+        array_elements,
+        map_elements,
+    })
 }
 
 fn format_value(val: &Value) -> String {
@@ -619,7 +811,7 @@ async fn interactive(target: &ConfigTarget<'_>, verbose: u8) -> anyhow::Result<(
         4 => interactive_mounts(target)?,
         5 => interactive_lifecycle(target)?,
         6 => interactive_other(target)?,
-        7 => config_list(target)?,
+        7 => config_list(target, false)?,
         _ => unreachable!(),
     }
 
@@ -1332,14 +1524,14 @@ mod tests {
             r#"{"postCreateCommand": {"build": "npm run build", "test": "npm test"}}"#,
         );
         // Just verify it doesn't error
-        config_list(&target_for(&path)).unwrap();
+        config_list(&target_for(&path), false).unwrap();
     }
 
     #[test]
     fn test_config_list_lifecycle_array() {
         let (_dir, path) =
             setup_config(r#"{"postCreateCommand": ["npm install", "npm run build"]}"#);
-        config_list(&target_for(&path)).unwrap();
+        config_list(&target_for(&path), false).unwrap();
     }
 
     #[test]
@@ -1369,7 +1561,87 @@ mod tests {
             }"#,
         );
         // Just verify it doesn't error
-        config_list(&target_for(&path)).unwrap();
+        config_list(&target_for(&path), false).unwrap();
+    }
+
+    #[test]
+    fn test_effective_config_merges_base_beneath_project() {
+        let (_dir, path) = setup_config(
+            r#"{
+                "image": "ubuntu",
+                "containerEnv": {"SHARED": "project", "PROJECT_ONLY": "p"}
+            }"#,
+        );
+        let base_dir = TempDir::new().unwrap();
+        let base_path = base_dir.path().join("devcontainer.json");
+        fs::write(
+            &base_path,
+            r#"{"containerEnv": {"SHARED": "base", "BASE_ONLY": "b"}}"#,
+        )
+        .unwrap();
+
+        let value = effective_config_value_with_base(&target_for(&path), &base_path).unwrap();
+
+        // Project wins the conflict; base-only key survives.
+        assert_eq!(value["containerEnv"]["SHARED"], "project");
+        assert_eq!(value["containerEnv"]["PROJECT_ONLY"], "p");
+        assert_eq!(value["containerEnv"]["BASE_ONLY"], "b");
+    }
+
+    #[test]
+    fn test_effective_config_without_base_is_just_the_project() {
+        let (_dir, path) = setup_config(r#"{"image": "ubuntu", "remoteUser": "vscode"}"#);
+        let base_dir = TempDir::new().unwrap();
+        let base_path = base_dir.path().join("devcontainer.json");
+
+        let value = effective_config_value_with_base(&target_for(&path), &base_path).unwrap();
+
+        assert_eq!(value["image"], "ubuntu");
+        assert_eq!(value["remoteUser"], "vscode");
+    }
+
+    #[test]
+    fn test_config_origins_annotate_base_project_and_both() {
+        let (_dir, path) = setup_config(
+            r#"{
+                "image": "ubuntu",
+                "containerEnv": {"SHARED": "project"},
+                "forwardPorts": [3000],
+                "mounts": ["./proj:/proj"]
+            }"#,
+        );
+        let base_dir = TempDir::new().unwrap();
+        let base_path = base_dir.path().join("devcontainer.json");
+        fs::write(
+            &base_path,
+            r#"{"containerEnv": {"SHARED": "base"}, "mounts": ["./base:/base"]}"#,
+        )
+        .unwrap();
+
+        let origins = config_origins_with_base(&target_for(&path), &base_path).unwrap();
+
+        assert_eq!(
+            origins.keys.get("image").map(String::as_str),
+            Some("project")
+        );
+        assert_eq!(origins.keys.get("mounts").map(String::as_str), Some("both"));
+        assert_eq!(
+            origins.keys.get("containerEnv").map(String::as_str),
+            Some("both")
+        );
+        assert_eq!(
+            origins.keys.get("forwardPorts").map(String::as_str),
+            Some("project")
+        );
+
+        // Per-element origins for the merged mounts array.
+        let mount_origins = origins.array_elements.get("mounts").unwrap();
+        assert_eq!(mount_origins[0], "base");
+        assert_eq!(mount_origins[1], "project");
+
+        // Per-key origins for the merged containerEnv map.
+        let env_origins = origins.map_elements.get("containerEnv").unwrap();
+        assert_eq!(env_origins.get("SHARED").map(String::as_str), Some("both"));
     }
 
     // --- Recipe persistence tests ---
