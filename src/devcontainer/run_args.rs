@@ -13,6 +13,7 @@
 //! - `--env-file PATH` and `--env-file=PATH`
 //! - `--env KEY=VALUE`, `--env=KEY=VALUE`, `-e KEY=VALUE`, and `-eKEY=VALUE`
 //! - `--cap-add VALUE`, `--cap-add=VALUE`
+//! - `--device-cgroup-rule VALUE`, `--device-cgroup-rule=VALUE`
 //! - `--security-opt VALUE`, `--security-opt=VALUE`
 //! - `--userns VALUE`, `--userns=VALUE`
 //! - bare `--privileged` and `--init`
@@ -55,6 +56,8 @@ pub type EnvEntry = (String, String);
 pub struct ResolvedRunArgs {
     pub env: Vec<EnvEntry>,
     pub cap_add: Vec<String>,
+    /// Device cgroup rules (`--device-cgroup-rule`), in the order given.
+    pub device_cgroup_rules: Vec<String>,
     pub security_opt: Vec<String>,
     pub privileged: bool,
     pub init: bool,
@@ -104,6 +107,13 @@ pub fn resolve_run_args(args: &[String], workspace: &Path) -> Result<ResolvedRun
         } else if arg == "--cap-add" {
             let value = next_value(args, &mut i, arg, "--cap-add")?;
             resolved.cap_add.push(value);
+        } else if let Some(value) = arg.strip_prefix("--device-cgroup-rule=") {
+            resolved
+                .device_cgroup_rules
+                .push(non_empty_inline_value(arg, value, "--device-cgroup-rule")?.to_string());
+        } else if arg == "--device-cgroup-rule" {
+            let value = next_value(args, &mut i, arg, "--device-cgroup-rule")?;
+            resolved.device_cgroup_rules.push(value);
         } else if let Some(value) = arg.strip_prefix("--security-opt=") {
             resolved
                 .security_opt
@@ -351,7 +361,8 @@ fn unsupported_flag_error(flag: &str) -> DevError {
     DevError::InvalidConfig(format!(
         "unsupported `runArgs` flag `{name}`: `dev` translates only the documented \
          `runArgs` subset into the container create request: `--env-file`, `--env`, `-e`, \
-         `--cap-add`, `--security-opt`, `--userns`, `--privileged`, and `--init`. \
+         `--cap-add`, `--device-cgroup-rule`, `--security-opt`, `--userns`, `--privileged`, \
+         and `--init`. \
          Other Docker/Podman CLI flags have no direct daemon-API equivalent here; use the \
          equivalent first-class devcontainer property where Dev implements one (for example \
          `forwardPorts`, `mounts`, or `containerEnv`). See the README `runArgs` support matrix."
@@ -592,6 +603,7 @@ mod tests {
             ("--cap-add", "--init"),
             ("--security-opt", "--init"),
             ("--userns", "--init"),
+            ("--device-cgroup-rule", "--init"),
         ] {
             let err =
                 super::resolve_run_args(&[flag.to_string(), next.to_string()], &ws).unwrap_err();
@@ -622,6 +634,42 @@ mod tests {
 
         let err = super::resolve_run_args(&["--init=true".to_string()], &ws).unwrap_err();
         assert!(format!("{err}").contains("--init=true"));
+    }
+
+    /// `--device-cgroup-rule` is the narrow alternative to `--privileged` for
+    /// USB hardware: the rule covers a device class, so a board that
+    /// re-enumerates on replug stays reachable. Both token forms must be
+    /// accepted and the order preserved, since the daemon applies rules in
+    /// order.
+    #[test]
+    fn device_cgroup_rules_accept_both_forms_and_keep_order() {
+        let ws = PathBuf::from("/ws");
+        let args: Vec<String> = [
+            "--device-cgroup-rule",
+            "c 189:* rmw",
+            "--device-cgroup-rule=c 166:* rmw",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let resolved = super::resolve_run_args(&args, &ws).unwrap();
+
+        assert_eq!(
+            resolved.device_cgroup_rules,
+            vec!["c 189:* rmw".to_string(), "c 166:* rmw".to_string()]
+        );
+        assert!(
+            !resolved.privileged,
+            "a cgroup rule must not imply privileged"
+        );
+    }
+
+    #[test]
+    fn device_cgroup_rule_rejects_an_empty_inline_value() {
+        let ws = PathBuf::from("/ws");
+        let err = super::resolve_run_args(&["--device-cgroup-rule=".to_string()], &ws).unwrap_err();
+        assert!(format!("{err}").contains("--device-cgroup-rule"));
     }
 
     // ---- env-file parsing (pure) ----

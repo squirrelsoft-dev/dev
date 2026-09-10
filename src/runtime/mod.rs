@@ -99,6 +99,11 @@ pub struct ContainerConfig {
     pub security_opt: Vec<String>,
     /// User namespace mode (--userns).
     pub userns_mode: Option<String>,
+    /// Device cgroup rules (--device-cgroup-rule), e.g. `c 189:* rmw`. Unlike
+    /// `--device`, a rule covers a whole major/minor range, so a device that
+    /// re-enumerates while the container runs (USB replug) stays accessible
+    /// without granting `--privileged`.
+    pub device_cgroup_rules: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

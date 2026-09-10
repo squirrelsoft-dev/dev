@@ -417,6 +417,11 @@ impl BollardRuntime {
                 Some(config.security_opt.clone())
             },
             userns_mode: config.userns_mode.clone(),
+            device_cgroup_rules: if config.device_cgroup_rules.is_empty() {
+                None
+            } else {
+                Some(config.device_cgroup_rules.clone())
+            },
             ..Default::default()
         };
 
@@ -1213,6 +1218,7 @@ mod tests {
             cap_add: vec![],
             security_opt: vec![],
             userns_mode: None,
+            device_cgroup_rules: vec![],
         }
     }
 
@@ -1286,6 +1292,7 @@ mod tests {
         cfg.privileged = true;
         cfg.init = true;
         cfg.userns_mode = Some("keep-id".to_string());
+        cfg.device_cgroup_rules = vec!["c 189:* rmw".to_string(), "c 166:* rmw".to_string()];
 
         let body = BollardRuntime::to_create_body(&cfg);
         let host = body.host_config.expect("host config should be set");
@@ -1304,6 +1311,11 @@ mod tests {
         assert_eq!(host.privileged, Some(true));
         assert_eq!(host.init, Some(true));
         assert_eq!(host.userns_mode.as_deref(), Some("keep-id"));
+        assert_eq!(
+            host.device_cgroup_rules,
+            Some(vec!["c 189:* rmw".to_string(), "c 166:* rmw".to_string()]),
+            "device cgroup rules must reach HostConfig, in order"
+        );
     }
 
     /// Reused containers can carry an older or image-provided `WorkingDir`.

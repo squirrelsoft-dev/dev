@@ -2667,6 +2667,7 @@ mod tests {
             cap_add: vec![],
             security_opt: vec![],
             userns_mode: None,
+            device_cgroup_rules: vec![],
         }
     }
 
@@ -2790,6 +2791,7 @@ mod tests {
             cap_add: vec![],
             security_opt: vec![],
             userns_mode: None,
+            device_cgroup_rules: vec![],
         };
 
         let image = ImageDescription::default();
@@ -3036,6 +3038,7 @@ mod tests {
             cap_add: vec![],
             security_opt: vec![],
             userns_mode: None,
+            device_cgroup_rules: vec![],
         };
 
         // Clean up any previous test container (using truncated ID)

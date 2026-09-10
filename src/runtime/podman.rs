@@ -228,6 +228,7 @@ mod tests {
             cap_add: vec!["SYS_PTRACE".to_string()],
             security_opt: vec!["seccomp=unconfined".to_string()],
             userns_mode: Some("keep-id".to_string()),
+            device_cgroup_rules: vec!["c 189:* rmw".to_string()],
         };
         config.labels.insert(
             "devcontainer.local_folder".to_string(),

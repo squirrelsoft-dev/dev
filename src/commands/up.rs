@@ -493,6 +493,7 @@ pub(crate) async fn run_with_runtime(
         cap_add: caps.cap_add,
         security_opt: caps.security_opt,
         userns_mode: resolved_run_args.userns_mode.clone(),
+        device_cgroup_rules: resolved_run_args.device_cgroup_rules.clone(),
     };
 
     if !container_config.mounts.is_empty() {
@@ -594,6 +595,9 @@ fn reject_run_args_unsupported_by_runtime(
     }
     if resolved.userns_mode.is_some() {
         unsupported.push("--userns");
+    }
+    if !resolved.device_cgroup_rules.is_empty() {
+        unsupported.push("--device-cgroup-rule");
     }
     if resolved.privileged {
         unsupported.push("--privileged");

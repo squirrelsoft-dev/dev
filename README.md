@@ -267,6 +267,7 @@ previously every `runArg` was parsed and then dropped.)
 | `--env` | `--env KEY=VALUE`, `--env=KEY=VALUE` | a `KEY=VALUE` env entry |
 | `-e` | `-e KEY=VALUE`, `-eKEY=VALUE` | a `KEY=VALUE` env entry |
 | `--cap-add` | `--cap-add VALUE`, `--cap-add=VALUE` | HostConfig `CapAdd` entries |
+| `--device-cgroup-rule` | `--device-cgroup-rule VALUE`, `--device-cgroup-rule=VALUE` | HostConfig `DeviceCgroupRules` entries |
 | `--security-opt` | `--security-opt VALUE`, `--security-opt=VALUE` | HostConfig `SecurityOpt` entries |
 | `--userns` | `--userns VALUE`, `--userns=VALUE` | HostConfig `UsernsMode`; last value wins |
 | `--privileged` | `--privileged` only | HostConfig `Privileged=true` |
@@ -280,9 +281,14 @@ value-taking two-token forms, the next token must be a non-empty value, not
 another flag.
 
 Apple Containers supports only the environment subset (`--env-file`, `--env`,
-and `-e`). Runtime options such as `--cap-add`, `--security-opt`, `--userns`,
-`--privileged`, and `--init` fail before side effects when `--runtime apple` or
-`defaultRuntime: "apple"` selects Apple.
+and `-e`). Runtime options such as `--cap-add`, `--device-cgroup-rule`,
+`--security-opt`, `--userns`, `--privileged`, and `--init` fail before side
+effects when `--runtime apple` or `defaultRuntime: "apple"` selects Apple.
+
+`--device-cgroup-rule` grants access to a device *class* (`c 189:* rmw` covers
+all USB character devices), so a device that re-enumerates while the container
+runs stays usable. That is the narrow alternative to `--privileged` for USB
+hardware whose minor number changes on replug.
 
 ### The reporter's configuration
 
@@ -356,6 +362,7 @@ first-class devcontainer property where one exists. Common mappings:
 | `--network` | (no equivalent yet — file an issue) |
 | `--add-host` | (no equivalent yet — file an issue) |
 | `--cap-add` | supported directly in `runArgs` |
+| `--device-cgroup-rule` | supported directly in `runArgs` on Docker/Podman |
 | `--security-opt` | supported directly in `runArgs` |
 | `--userns` | supported directly in `runArgs` on Docker/Podman image-based containers |
 | `--privileged` | supported directly in `runArgs` |
