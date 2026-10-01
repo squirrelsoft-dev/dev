@@ -2210,6 +2210,25 @@ mod tests {
     /// One command `exec` was asked to run, and the user it ran as.
     type ExecCall = (Vec<String>, Option<String>, Option<String>);
 
+    // Consume one injected failure without wrapping at zero. A compare/exchange
+    // loop works on older local toolchains as well as Rust 1.99, which deprecated
+    // fetch_update in favor of the newer try_update method.
+    fn consume_failure(counter: &AtomicUsize) -> bool {
+        let mut remaining = counter.load(Ordering::Relaxed);
+        while let Some(next) = remaining.checked_sub(1) {
+            match counter.compare_exchange_weak(
+                remaining,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => remaining = observed,
+            }
+        }
+        false
+    }
+
     /// Stand-in runtime for `run_with_runtime`, modelling a daemon: created
     /// containers land in `containers`, `start_container` marks them running,
     /// and `list_containers` answers label queries out of that same state — so
@@ -2584,9 +2603,7 @@ mod tests {
                     std::future::pending::<()>().await;
                 }
                 if let Some(refusals_left) = refusals_left {
-                    let refusing = refusals_left
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
-                        .is_ok();
+                    let refusing = consume_failure(&refusals_left);
                     if refusing {
                         return Err(DevError::Runtime("exec failed (test-injected)".to_string()));
                     }
@@ -2595,9 +2612,7 @@ mod tests {
                     // own deadline.
                     std::future::pending::<()>().await;
                 }
-                let still_settling = settling
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
-                    .is_ok();
+                let still_settling = consume_failure(&settling);
                 if exec_fails || still_settling {
                     return Err(DevError::Runtime(if command_missing {
                         "OCI runtime exec failed: exec: \"sh\": executable file not found in $PATH"
@@ -2670,9 +2685,7 @@ mod tests {
                     if list_never_answers {
                         std::future::pending::<()>().await;
                     }
-                    let transient = list_errors
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
-                        .is_ok();
+                    let transient = consume_failure(&list_errors);
                     if transient || list_always_fails {
                         return Err(DevError::Runtime(
                             "list_containers failed (test-injected)".to_string(),
@@ -2682,9 +2695,7 @@ mod tests {
                 if !discoverable {
                     return Ok(Vec::new());
                 }
-                let still_settling = settling
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
-                    .is_ok();
+                let still_settling = consume_failure(&settling);
                 let known = containers.lock().unwrap().clone();
                 Ok(known
                     .into_iter()
