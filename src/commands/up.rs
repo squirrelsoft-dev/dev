@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::devcontainer::compose::{compose_recipe_config, materialize_recipe_directory};
@@ -82,20 +82,25 @@ fn register_caddy_routes(workspace: &Path, config: &DevcontainerConfig) {
 ///
 /// The live entry wins on conflict because it carries the custom name /
 /// keepalive that `dev forward` persisted, which a declared-only entry lacks.
-/// Keyed by port in a `BTreeMap`, so the result is sorted by host port to match
-/// the ordering `dev forward` uses before `register_site`.
+/// Declared ports keep their config order: Caddy gives the first entry the
+/// primary workspace hostname. Live entries replace matching ports in place;
+/// additional ad-hoc ports are appended in host-port order.
 fn merge_caddy_ports(
     declared: Vec<crate::caddy::PortEntry>,
-    active: Vec<crate::caddy::PortEntry>,
+    mut active: Vec<crate::caddy::PortEntry>,
 ) -> Vec<crate::caddy::PortEntry> {
-    let mut by_port: BTreeMap<u16, crate::caddy::PortEntry> = BTreeMap::new();
-    for entry in declared {
-        by_port.insert(entry.port, entry);
+    active.sort_by_key(|entry| entry.port);
+    let mut positions = HashMap::new();
+    let mut ports = Vec::new();
+    for entry in declared.into_iter().chain(active) {
+        if let Some(&position) = positions.get(&entry.port) {
+            ports[position] = entry;
+        } else {
+            positions.insert(entry.port, ports.len());
+            ports.push(entry);
+        }
     }
-    for entry in active {
-        by_port.insert(entry.port, entry);
-    }
-    by_port.into_values().collect()
+    ports
 }
 
 /// The Caddy port entries implied by a project's declared `forwardPorts`.
@@ -1868,6 +1873,58 @@ mod tests {
     #[test]
     fn merge_caddy_ports_empty_when_nothing_declared_or_active() {
         assert!(merge_caddy_ports(vec![], vec![]).is_empty());
+    }
+
+    #[test]
+    fn restarted_caddy_fragment_preserves_declared_hostname_mapping() {
+        let config: DevcontainerConfig =
+            serde_json::from_str(r#"{"image":"ubuntu:24.04","forwardPorts":[8080,3000]}"#).unwrap();
+        let declared = caddy_ports_from_config(&config);
+        let (fresh, _) = crate::caddy::render_site_config("app", &declared);
+        let merged = merge_caddy_ports(declared, vec![]);
+        let (restarted, entries) = crate::caddy::render_site_config("app", &merged);
+
+        assert_eq!(restarted, fresh);
+        assert_eq!(entries[0].hostname, "app.test");
+        assert_eq!(entries[0].host_port, 8080);
+        assert_eq!(entries[1].hostname, "app-3000.test");
+        assert_eq!(entries[1].host_port, 3000);
+        assert!(
+            restarted.contains("app.test {\n    tls internal\n    reverse_proxy 127.0.0.1:8080")
+        );
+    }
+
+    #[test]
+    fn restarted_caddy_fragment_keeps_primary_port_and_live_metadata() {
+        let config: DevcontainerConfig =
+            serde_json::from_str(r#"{"image":"ubuntu:24.04","forwardPorts":[8080,3000,8080]}"#)
+                .unwrap();
+        let active = vec![
+            crate::caddy::PortEntry {
+                port: 3000,
+                custom_name: Some("custom.app.test".into()),
+                keepalive: Some("30s".into()),
+            },
+            crate::caddy::PortEntry {
+                port: 2000,
+                custom_name: Some("adhoc.app.test".into()),
+                keepalive: Some("10s".into()),
+            },
+        ];
+        let merged = merge_caddy_ports(caddy_ports_from_config(&config), active);
+        let (fragment, entries) = crate::caddy::render_site_config("app", &merged);
+
+        assert_eq!(
+            merged.iter().map(|p| p.port).collect::<Vec<_>>(),
+            [8080, 3000, 2000]
+        );
+        assert_eq!(entries[0].hostname, "app.test");
+        assert_eq!(entries[0].host_port, 8080);
+        assert_eq!(entries[1].hostname, "custom.app.test");
+        assert_eq!(entries[2].hostname, "adhoc.app.test");
+        assert!(fragment.contains("keepalive 30s"));
+        assert!(fragment.contains("keepalive 10s"));
+        assert_eq!(fragment.matches("127.0.0.1:8080").count(), 1);
     }
 
     #[test]

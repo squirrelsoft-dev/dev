@@ -62,6 +62,13 @@ fn write_site_config(app_name: &str, ports: &[PortEntry]) -> anyhow::Result<Vec<
     let sites_dir = caddy_dir().join("sites");
     std::fs::create_dir_all(&sites_dir)?;
 
+    let (config, entries) = render_site_config(app_name, ports);
+    std::fs::write(site_config_path(app_name), &config)?;
+    Ok(entries)
+}
+
+/// Render the exact fragment written by `register_site`, without side effects.
+pub(crate) fn render_site_config(app_name: &str, ports: &[PortEntry]) -> (String, Vec<SiteEntry>) {
     let mut entries = Vec::new();
     let mut config = String::new();
 
@@ -91,8 +98,7 @@ fn write_site_config(app_name: &str, ports: &[PortEntry]) -> anyhow::Result<Vec<
         });
     }
 
-    std::fs::write(site_config_path(app_name), &config)?;
-    Ok(entries)
+    (config, entries)
 }
 
 /// Remove a project's Caddy config fragment.
